@@ -26,8 +26,8 @@ def parse_collection_url(url: str) -> CollectionInfo:
 
     Supported formats:
         - https://next.nexusmods.com/{game}/collections/{slug}
-        - https://next.nexusmods.com/{game}/collections/{slug}?tab=...
-        - https://www.nexusmods.com/{game}/mods/{id}?tab=collections (not supported, different format)
+        - https://www.nexusmods.com/games/{game}/collections/{slug}
+        - Either format with ?tab=... query params
 
     Returns CollectionInfo with game_domain and slug.
     """
@@ -39,12 +39,13 @@ def parse_collection_url(url: str) -> CollectionInfo:
             f"Invalid domain: {parsed.netloc}. Expected next.nexusmods.com"
         )
 
-    # Parse path: /{game}/collections/{slug}
-    path_match = re.match(r"^/([^/]+)/collections/([^/?]+)", parsed.path)
+    # Parse path: /{game}/collections/{slug} or /games/{game}/collections/{slug}
+    path_match = re.match(r"^/(?:games/)?([^/]+)/collections/([^/?]+)", parsed.path)
     if not path_match:
         raise CollectionParseError(
             f"Invalid collection URL format: {url}\n"
-            "Expected: https://next.nexusmods.com/{game}/collections/{slug}"
+            "Expected: https://next.nexusmods.com/{game}/collections/{slug}\n"
+            "      or: https://www.nexusmods.com/games/{game}/collections/{slug}"
         )
 
     game_domain = path_match.group(1)
