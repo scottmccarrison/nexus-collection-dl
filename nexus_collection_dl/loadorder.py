@@ -107,30 +107,33 @@ class LoadOrderGenerator:
             pass  # Handled below via weighted sort
 
         # 2. modRules from collection manifest
+        # Rules use logicalFileName to identify mods, not modId directly
+        lf_to_id = self.manifest.logical_name_to_mod_id
         for rule in self.manifest.mod_rules:
             rule_type = rule.get("type", "")
-            source_id = rule.get("source", {}).get("modId")
-            target_id = rule.get("target", {}).get("modId")
+            # Rules have "source" and "reference" (not "target")
+            source_lf = rule.get("source", {}).get("logicalFileName", "")
+            ref_lf = rule.get("reference", {}).get("logicalFileName", "")
 
-            if source_id is None or target_id is None:
+            source_id = lf_to_id.get(source_lf)
+            ref_id = lf_to_id.get(ref_lf)
+
+            if source_id is None or ref_id is None:
                 continue
-            source_id = int(source_id)
-            target_id = int(target_id)
-
-            if source_id not in all_mod_ids or target_id not in all_mod_ids:
+            if source_id not in all_mod_ids or ref_id not in all_mod_ids:
                 continue
 
             if rule_type == "before":
-                # source should load before target
-                edges[source_id].add(target_id)
-                in_degree[target_id] = in_degree.get(target_id, 0) + 1
+                # source should load before reference
+                edges[source_id].add(ref_id)
+                in_degree[ref_id] = in_degree.get(ref_id, 0) + 1
             elif rule_type == "after":
-                # source should load after target
-                edges[target_id].add(source_id)
+                # source should load after reference -> reference before source
+                edges[ref_id].add(source_id)
                 in_degree[source_id] = in_degree.get(source_id, 0) + 1
             elif rule_type == "requires":
-                # source requires target -> target before source
-                edges[target_id].add(source_id)
+                # source requires reference -> reference before source
+                edges[ref_id].add(source_id)
                 in_degree[source_id] = in_degree.get(source_id, 0) + 1
 
         # 3. modRequirements from GraphQL
