@@ -79,6 +79,16 @@ nexus-dl status ~/mods/bg3
 
 State is tracked in a `.nexus-state.json` file inside your mods directory.
 
+## Load order
+
+This tool only handles downloading and extracting mods. It does **not** manage load order, because load order is entirely game-specific. You'll need a separate tool for that:
+
+- **Baldur's Gate 3** - [BG3 Mod Manager (bg3mm)](https://github.com/LaughingLeader/BG3ModManager) to set load order in `modsettings.lsx`
+- **Bethesda games** (Skyrim, Starfield, Fallout) - [LOOT](https://loot.github.io/) for automatic load order sorting
+- **Other games** - Check the game's Nexus Mods page for recommended mod managers
+
+After running `nexus-dl sync`, point your load order tool at the output directory and configure from there.
+
 ## Supported archive formats
 
 - ZIP
