@@ -1,5 +1,7 @@
 """Archive extraction for mod files."""
 
+import shutil
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -87,15 +89,44 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
 
 
 def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
-    """Extract a 7z archive."""
+    """Extract a 7z archive. Falls back to system 7z for unsupported codecs (e.g. BCJ2)."""
+    try:
+        extracted = []
+        with py7zr.SevenZipFile(archive_path, "r") as szf:
+            szf.extractall(target_dir)
+            for name in szf.getnames():
+                path = target_dir / name
+                if path.is_file():
+                    extracted.append(path)
+        return extracted
+    except (py7zr.UnsupportedCompressionMethodError, py7zr.Bad7zFile):
+        # py7zr can't handle this codec - try system 7z
+        return _extract_7z_system(archive_path, target_dir)
+
+
+def _extract_7z_system(archive_path: Path, target_dir: Path) -> list[Path]:
+    """Extract a 7z archive using the system 7z command."""
+    sz_bin = shutil.which("7z") or shutil.which("7zz")
+    if not sz_bin:
+        raise ExtractionError(
+            f"py7zr cannot extract {archive_path.name} (unsupported compression). "
+            "Install p7zip-full (apt install p7zip-full) for broader 7z support."
+        )
+
+    result = subprocess.run(
+        [sz_bin, "x", str(archive_path), f"-o{target_dir}", "-y"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise ExtractionError(
+            f"7z extraction failed for {archive_path.name}: {result.stderr.strip()}"
+        )
+
     extracted = []
-    with py7zr.SevenZipFile(archive_path, "r") as szf:
-        szf.extractall(target_dir)
-        # Get list of extracted files
-        for name in szf.getnames():
-            path = target_dir / name
-            if path.is_file():
-                extracted.append(path)
+    for path in target_dir.rglob("*"):
+        if path.is_file():
+            extracted.append(path)
     return extracted
 
 
