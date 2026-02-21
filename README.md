@@ -121,6 +121,31 @@ Redeploying is safe - it removes previously deployed files before creating new o
 
 **SFSE/script extender note:** If the collection includes SFSE, the tool deploys `sfse_loader.exe` to the game root and prints launch instructions. For non-Steam games, set your Steam shortcut TARGET to `sfse_loader.exe`. Do not rename it - SFSE needs the original game executable alongside it.
 
+### Add individual mods
+
+```bash
+# Add a mod by URL (downloads the main file automatically)
+nexus-dl add "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield
+
+# Pick a specific file from the mod
+nexus-dl add "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield --file-id 456
+
+# Skip load order regeneration
+nexus-dl add --no-load-order "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield
+```
+
+Downloads a single mod and registers it as a "manual" mod. Manual mods are protected from removal during `update` - they won't be flagged as "removed from collection" since they were never part of it. Manual mods load after all collection mods (phase 999).
+
+If the tool can't auto-select a file (no main file category), it lists all available files so you can re-run with `--file-id`.
+
+### Register local mods
+
+```bash
+nexus-dl add-local "My Custom Mod" ~/mods/starfield
+```
+
+Registers an already-present mod that you placed in the mods directory manually. Useful for custom patches, merged plugins, or mods from other sources. Like `add`, these are tracked as manual mods and won't be removed by `update`.
+
 ### Remove deployed mods
 
 ```bash
@@ -176,6 +201,8 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 - **sync** - Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
+- **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
+- **add-local** - Registers an already-present mod in the state without downloading anything.
 - **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files.
 - **undeploy** - Removes all deployed files using the tracked manifest, restoring the game directory.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
