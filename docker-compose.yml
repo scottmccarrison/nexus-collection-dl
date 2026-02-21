@@ -1,0 +1,7 @@
+services:
+  nexus-dl:
+    build: .
+    volumes:
+      - ./mods:/mods
+    environment:
+      - NEXUS_API_KEY
