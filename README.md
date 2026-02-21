@@ -1,10 +1,10 @@
 # nexus-collection-dl
 
-A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game — Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
+A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
 
 ## Why?
 
-Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux — whether native or through Proton/Wine — there's no built-in way to download collections from the command line.
+Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux - whether native or through Proton/Wine - there's no built-in way to download collections from the command line.
 
 `nexus-dl` fills that gap. Point it at a collection URL, and it downloads every mod, extracts archives, generates a load order, and tracks versions so you can update later.
 
@@ -16,7 +16,7 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 ## Installation
 
-### Docker (recommended — includes LOOT support)
+### Docker (recommended - includes LOOT support)
 
 ```bash
 git clone https://github.com/scottmccarrison/nexus-collection-dl.git
@@ -41,7 +41,7 @@ cd nexus-collection-dl
 source venv/bin/activate
 ```
 
-If Rust is installed, the setup script automatically builds and installs `libloot` for plugin sorting. If not, the tool still works — it just won't do automatic plugin sorting for Bethesda games.
+If Rust is installed, the setup script automatically builds and installs `libloot` for plugin sorting. If not, the tool still works - it just won't do automatic plugin sorting for Bethesda games.
 
 ### Manual
 
@@ -107,10 +107,10 @@ nexus-dl status ~/mods/starfield
 
 ### All games
 
-**`load-order.txt`** — Mods listed in topological order based on:
-- **Phase grouping** — The collection author's phase assignments (phase 0 loads before phase 1, etc.)
-- **Collection mod rules** — Explicit before/after/requires relationships from `collection.json`
-- **Author-declared dependencies** — `modRequirements` from the Nexus API (the mod author's own dependency list)
+**`load-order.txt`** - Mods listed in topological order based on:
+- **Phase grouping** - The collection author's phase assignments (phase 0 loads before phase 1, etc.)
+- **Collection mod rules** - Explicit before/after/requires relationships from `collection.json`
+- **Author-declared dependencies** - `modRequirements` from the Nexus API (the mod author's own dependency list)
 
 This handles BG3, Cyberpunk, and every other game. Since non-Bethesda games don't have a standardized plugin format (`.pak`, `.archive`, etc.), mod-level ordering is the best we can do.
 
@@ -118,9 +118,9 @@ This handles BG3, Cyberpunk, and every other game. Since non-Bethesda games don'
 
 In addition to `load-order.txt`, Bethesda collections also get:
 
-**`plugins.txt`** — Plugin-level load order for `.esp`/`.esm`/`.esl` files. Two sources:
-1. **Collection metadata** — The collection author's intended plugin order (always available)
-2. **LOOT sorting** — Automatic sorting via [libloot](https://github.com/loot/libloot) using master dependency analysis + community masterlists (when libloot is installed)
+**`plugins.txt`** - Plugin-level load order for `.esp`/`.esm`/`.esl` files. Two sources:
+1. **Collection metadata** - The collection author's intended plugin order (always available)
+2. **LOOT sorting** - Automatic sorting via [libloot](https://github.com/loot/libloot) using master dependency analysis + community masterlists (when libloot is installed)
 
 When libloot is available, LOOT-sorted order takes priority over collection metadata. Enabled/disabled status from the collection is preserved either way.
 
@@ -140,10 +140,10 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 ## How it works
 
-- **sync** — Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
-- **update** — Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
-- **load-order** — Regenerates load order from the cached manifest (no API call needed).
-- **status** — Shows what's installed and whether updates are available.
+- **sync** - Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
+- **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
+- **load-order** - Regenerates load order from the cached manifest (no API call needed).
+- **status** - Shows what's installed and whether updates are available.
 
 State is tracked in a `.nexus-state.json` file inside your mods directory, including the cached collection manifest for offline load order regeneration.
 
