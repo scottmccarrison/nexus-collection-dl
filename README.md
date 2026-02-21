@@ -1,10 +1,10 @@
 # nexus-collection-dl
 
-A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game — Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
+A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game  - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
 
 ## Why?
 
-Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux — whether native or through Proton/Wine — there's no built-in way to download collections from the command line.
+Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux  - whether native or through Proton/Wine  - there's no built-in way to download collections from the command line.
 
 `nexus-dl` fills that gap. Point it at a collection URL, and it downloads every mod, extracts archives, and tracks versions so you can update later.
 
@@ -73,9 +73,9 @@ nexus-dl status ~/mods/bg3
 
 ## How it works
 
-- **sync** — Fetches the collection manifest from the Nexus API, downloads each mod archive, extracts it, and records the installed version.
-- **update** — Re-fetches the manifest and downloads any mods that have newer versions.
-- **status** — Shows what's installed and whether updates are available.
+- **sync**  - Fetches the collection manifest from the Nexus API, downloads each mod archive, extracts it, and records the installed version.
+- **update**  - Re-fetches the manifest and downloads any mods that have newer versions.
+- **status**  - Shows what's installed and whether updates are available.
 
 State is tracked in a `.nexus-state.json` file inside your mods directory.
 
