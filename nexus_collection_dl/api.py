@@ -104,6 +104,7 @@ class NexusAPI:
                 summary
                 latestPublishedRevision {
                     revisionNumber
+                    downloadLink
                     modFiles {
                         fileId
                         optional
@@ -116,6 +117,16 @@ class NexusAPI:
                                 modId
                                 name
                                 pictureUrl
+                                modRequirements {
+                                    nexusRequirements {
+                                        nodes {
+                                            modId
+                                            modName
+                                            notes
+                                        }
+                                        totalCount
+                                    }
+                                }
                             }
                         }
                     }
@@ -139,6 +150,7 @@ class NexusAPI:
             )
 
         revision = collection.get("latestPublishedRevision", {})
+        download_link = revision.get("downloadLink")
         mod_files = revision.get("modFiles", [])
 
         mods = []
@@ -147,6 +159,15 @@ class NexusAPI:
             mod_info = file_info.get("mod", {})
             if not file_info or not mod_info:
                 continue
+
+            # Extract mod requirements
+            req_nodes = (
+                mod_info.get("modRequirements", {})
+                .get("nexusRequirements", {})
+                .get("nodes", [])
+            )
+            requirements = [node["modId"] for node in req_nodes]
+
             mods.append(
                 {
                     "mod_id": mod_info.get("modId"),
@@ -156,6 +177,7 @@ class NexusAPI:
                     "version": file_info.get("version"),
                     "size_bytes": file_info.get("sizeInBytes"),
                     "optional": mf.get("optional", False),
+                    "requirements": requirements,
                 }
             )
 
@@ -166,6 +188,7 @@ class NexusAPI:
             "summary": collection.get("summary"),
             "game_domain": actual_game,
             "revision": revision.get("revisionNumber"),
+            "download_link": download_link,
             "mods": mods,
         }
 

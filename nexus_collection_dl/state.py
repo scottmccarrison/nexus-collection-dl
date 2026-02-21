@@ -26,6 +26,9 @@ class ModState:
         filename: str,
         installed_at: str | None = None,
         optional: bool = False,
+        position: int = 0,
+        phase: int = 0,
+        requirements: list[int] | None = None,
     ):
         self.mod_id = mod_id
         self.name = name
@@ -34,6 +37,9 @@ class ModState:
         self.filename = filename
         self.installed_at = installed_at or datetime.now(timezone.utc).isoformat()
         self.optional = optional
+        self.position = position
+        self.phase = phase
+        self.requirements = requirements
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +49,9 @@ class ModState:
             "filename": self.filename,
             "installed_at": self.installed_at,
             "optional": self.optional,
+            "position": self.position,
+            "phase": self.phase,
+            "requirements": self.requirements,
         }
 
     @classmethod
@@ -55,6 +64,9 @@ class ModState:
             filename=data.get("filename", ""),
             installed_at=data.get("installed_at"),
             optional=data.get("optional", False),
+            position=data.get("position", 0),
+            phase=data.get("phase", 0),
+            requirements=data.get("requirements"),
         )
 
 
@@ -68,6 +80,8 @@ class CollectionState:
         self.collection_name: str = ""
         self.collection_revision: int = 0
         self.game_domain: str = ""
+        self.mod_rules: list = []
+        self.manifest_data: dict | None = None
         self.mods: dict[int, ModState] = {}
 
     def exists(self) -> bool:
@@ -89,6 +103,8 @@ class CollectionState:
         self.collection_name = data.get("collection_name", "")
         self.collection_revision = data.get("collection_revision", 0)
         self.game_domain = data.get("game_domain", "")
+        self.mod_rules = data.get("mod_rules", [])
+        self.manifest_data = data.get("manifest_data")
 
         self.mods = {}
         for mod_id_str, mod_data in data.get("mods", {}).items():
@@ -104,6 +120,8 @@ class CollectionState:
             "collection_name": self.collection_name,
             "collection_revision": self.collection_revision,
             "game_domain": self.game_domain,
+            "mod_rules": self.mod_rules,
+            "manifest_data": self.manifest_data,
             "mods": {str(mod_id): mod.to_dict() for mod_id, mod in self.mods.items()},
         }
 
