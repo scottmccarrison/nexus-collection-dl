@@ -95,6 +95,40 @@ nexus-dl load-order ~/mods/starfield
 
 Regenerates `load-order.txt` (and `plugins.txt` for Bethesda games) from the cached collection manifest without re-downloading anything.
 
+### Deploy to game directory
+
+```bash
+# Auto-detect game path from Steam
+nexus-dl deploy ~/mods/starfield
+
+# First time with a non-Steam game: specify paths manually
+nexus-dl deploy ~/mods/starfield \
+  --game-dir /mnt/games/SteamLibrary/steamapps/common/Starfield \
+  --prefix ~/.steam/debian-installation/steamapps/compatdata/1234567/pfx
+
+# Copy files instead of symlinking
+nexus-dl deploy ~/mods/starfield --copy
+
+# Preview what would be deployed
+nexus-dl deploy ~/mods/starfield --dry-run
+```
+
+Creates symlinks (or copies) from your staging directory into the game's install directory. For Bethesda games on Proton, it also writes `plugins.txt` and `StarfieldCustom.ini` (or equivalent) to the correct Wine prefix paths.
+
+`--game-dir` and `--prefix` are saved after the first deploy, so subsequent runs only need `nexus-dl deploy ~/mods/starfield`.
+
+Redeploying is safe - it removes previously deployed files before creating new ones, so no orphaned symlinks accumulate.
+
+**SFSE/script extender note:** If the collection includes SFSE, the tool deploys `sfse_loader.exe` to the game root and prints launch instructions. For non-Steam games, set your Steam shortcut TARGET to `sfse_loader.exe`. Do not rename it - SFSE needs the original game executable alongside it.
+
+### Remove deployed mods
+
+```bash
+nexus-dl undeploy ~/mods/starfield
+```
+
+Removes all symlinks/copies that were deployed and restores the game directory to its pre-mod state.
+
 ### View status
 
 ```bash
@@ -142,6 +176,8 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 - **sync** - Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
+- **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files.
+- **undeploy** - Removes all deployed files using the tracked manifest, restoring the game directory.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
 

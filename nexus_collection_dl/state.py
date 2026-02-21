@@ -29,6 +29,7 @@ class ModState:
         position: int = 0,
         phase: int = 0,
         requirements: list[int] | None = None,
+        manual: bool = False,
     ):
         self.mod_id = mod_id
         self.name = name
@@ -40,6 +41,7 @@ class ModState:
         self.position = position
         self.phase = phase
         self.requirements = requirements
+        self.manual = manual
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +54,7 @@ class ModState:
             "position": self.position,
             "phase": self.phase,
             "requirements": self.requirements,
+            "manual": self.manual,
         }
 
     @classmethod
@@ -67,6 +70,7 @@ class ModState:
             position=data.get("position", 0),
             phase=data.get("phase", 0),
             requirements=data.get("requirements"),
+            manual=data.get("manual", False),
         )
 
 
@@ -83,6 +87,10 @@ class CollectionState:
         self.mod_rules: list = []
         self.manifest_data: dict | None = None
         self.mods: dict[int, ModState] = {}
+        self.game_dir: str = ""
+        self.proton_prefix: str = ""
+        self.deployed_files: list[dict] = []
+        self.deployed_at: str | None = None
 
     def exists(self) -> bool:
         """Check if state file exists."""
@@ -105,6 +113,10 @@ class CollectionState:
         self.game_domain = data.get("game_domain", "")
         self.mod_rules = data.get("mod_rules", [])
         self.manifest_data = data.get("manifest_data")
+        self.game_dir = data.get("game_dir", "")
+        self.proton_prefix = data.get("proton_prefix", "")
+        self.deployed_files = data.get("deployed_files", [])
+        self.deployed_at = data.get("deployed_at")
 
         self.mods = {}
         for mod_id_str, mod_data in data.get("mods", {}).items():
@@ -123,6 +135,10 @@ class CollectionState:
             "mod_rules": self.mod_rules,
             "manifest_data": self.manifest_data,
             "mods": {str(mod_id): mod.to_dict() for mod_id, mod in self.mods.items()},
+            "game_dir": self.game_dir,
+            "proton_prefix": self.proton_prefix,
+            "deployed_files": self.deployed_files,
+            "deployed_at": self.deployed_at,
         }
 
         with open(self.state_file, "w") as f:
@@ -147,6 +163,7 @@ class CollectionState:
             version=mod_info["version"] or "",
             filename=mod_info["filename"],
             optional=mod_info.get("optional", False),
+            manual=mod_info.get("manual", False),
         )
 
     def remove_mod(self, mod_id: int) -> None:
@@ -187,6 +204,7 @@ class CollectionState:
             else:
                 up_to_date.append(mod)
 
-        to_remove = list(installed_mod_ids - collection_mod_ids)
+        manual_mod_ids = {mid for mid, ms in self.mods.items() if ms.manual}
+        to_remove = list(installed_mod_ids - collection_mod_ids - manual_mod_ids)
 
         return to_install, to_update, up_to_date, to_remove

@@ -209,6 +209,14 @@ class NexusAPI:
 
         return data[0].get("URI")
 
+    def get_mod_files(self, game_domain: str, mod_id: int) -> list[dict[str, Any]]:
+        """List all files for a mod."""
+        self._rate_limit_wait()
+        url = f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}/files.json"
+        response = self.session.get(url)
+        data = self._handle_response(response)
+        return data.get("files", [])
+
     def get_mod_info(self, game_domain: str, mod_id: int) -> dict[str, Any]:
         """Get mod metadata from REST API."""
         self._rate_limit_wait()
