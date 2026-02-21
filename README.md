@@ -159,7 +159,7 @@ nexus-dl track-sync disable ~/mods/starfield
 nexus-dl track-sync push ~/mods/starfield
 ```
 
-When enabled, the "tracked" bell icon on nexusmods.com mirrors your local mod list. After `sync`, `update`, `add`, or `add-local`, tracked mods are automatically updated so browsing the site shows which mods you already have installed.
+When enabled, the "tracked" status on nexusmods.com mirrors your local mod list. After `sync`, `update`, `add`, or `add-local`, tracked mods are automatically updated. This is most useful when viewing an individual mod page before downloading - if it shows "tracking", you know it's already in your local loadout. Note that in the mod browse/list view, the "downloaded" badge takes priority over "tracking" in the Nexus UI, so tracked status is only visible on individual mod pages.
 
 Opt-in only - won't touch your tracked mods unless you explicitly enable it. Disabling preserves whatever's currently tracked on Nexus. Only affects mods for the collection's game domain (your tracked Skyrim mods are safe when syncing a Starfield collection). Local-only mods (from `add-local`) are skipped since they don't have Nexus mod IDs.
 
