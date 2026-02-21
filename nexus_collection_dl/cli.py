@@ -179,6 +179,9 @@ def sync(
         console.print("\n[bold]Generating load order...[/bold]")
         _generate_load_order(collection_data, mods_dir, state, api)
 
+    # Track sync
+    _maybe_sync_tracked(api, state)
+
     console.print(f"\n[green]Successfully synced {len(results)} mods![/green]")
     console.print(f"[dim]State saved to {state.state_file}[/dim]")
 
@@ -314,6 +317,9 @@ def update(
     if not no_load_order:
         console.print("\n[bold]Generating load order...[/bold]")
         _generate_load_order(collection_data, mods_dir, state, api)
+
+    # Track sync
+    _maybe_sync_tracked(api, state)
 
     console.print(f"\n[green]Update complete![/green]")
 
@@ -1015,6 +1021,9 @@ def add(
 
     console.print(f"[green]Added '{mod_name}' as manual mod (phase 999).[/green]")
 
+    # Track sync
+    _maybe_sync_tracked(api, state)
+
     # Regen load order
     if not no_load_order:
         console.print("\n[bold]Regenerating load order...[/bold]")
@@ -1072,10 +1081,133 @@ def add_local(
         f"(ID: {synthetic_id}, phase 999).[/green]"
     )
 
+    # Track sync (need API key to sync)
+    if state.track_sync_enabled:
+        api_key = ctx.obj.get("api_key")
+        if api_key:
+            try:
+                api = NexusAPI(api_key)
+                _maybe_sync_tracked(api, state)
+            except NexusAPIError as e:
+                console.print(f"[yellow]Track sync failed:[/yellow] {e}")
+
     # Regen load order
     if not no_load_order:
         console.print("\n[bold]Regenerating load order...[/bold]")
         _regen_load_order_from_state(mods_dir, state)
+
+
+def _sync_tracked_mods(api: NexusAPI, state: CollectionState) -> tuple[int, int]:
+    """Sync local mod list with Nexus tracked mods. Returns (tracked, untracked) counts."""
+    remote = api.get_tracked_mods()
+    remote_ids = {m["mod_id"] for m in remote if m["domain_name"] == state.game_domain}
+    local_ids = {mid for mid in state.mods if mid > 0}
+
+    to_track = local_ids - remote_ids
+    to_untrack = remote_ids - local_ids
+
+    for mid in to_track:
+        api.track_mod(state.game_domain, mid)
+    for mid in to_untrack:
+        api.untrack_mod(state.game_domain, mid)
+
+    return len(to_track), len(to_untrack)
+
+
+def _maybe_sync_tracked(api: NexusAPI, state: CollectionState) -> None:
+    """Run track sync if enabled, swallowing errors."""
+    if not state.track_sync_enabled:
+        return
+    console.print("[dim]Syncing tracked mods...[/dim]")
+    try:
+        tracked, untracked = _sync_tracked_mods(api, state)
+        if tracked or untracked:
+            console.print(f"[dim]Tracked {tracked}, untracked {untracked} on Nexus.[/dim]")
+    except NexusAPIError as e:
+        console.print(f"[yellow]Track sync failed:[/yellow] {e}")
+
+
+@main.group(name="track-sync")
+def track_sync_group():
+    """Manage Nexus Mods tracked-mod sync."""
+    pass
+
+
+@track_sync_group.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.pass_context
+def enable(ctx: click.Context, mods_dir: Path) -> None:
+    """Enable automatic tracked-mod sync for this collection."""
+    api_key = ctx.obj.get("api_key")
+
+    state = CollectionState(mods_dir)
+    try:
+        state.load()
+    except StateError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        api = NexusAPI(api_key)
+    except NexusAPIError as e:
+        console.print(f"[red]API Error:[/red] {e}")
+        sys.exit(1)
+
+    state.track_sync_enabled = True
+    state.save()
+
+    console.print("[green]Track sync enabled.[/green]")
+    console.print("[dim]Running initial sync...[/dim]")
+    try:
+        tracked, untracked = _sync_tracked_mods(api, state)
+        console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
+    except NexusAPIError as e:
+        console.print(f"[yellow]Initial sync failed:[/yellow] {e}")
+
+
+@track_sync_group.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.pass_context
+def disable(ctx: click.Context, mods_dir: Path) -> None:
+    """Disable automatic tracked-mod sync. Existing tracked mods are unchanged."""
+    state = CollectionState(mods_dir)
+    try:
+        state.load()
+    except StateError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    state.track_sync_enabled = False
+    state.save()
+    console.print("[green]Track sync disabled.[/green] Existing tracked mods on Nexus are unchanged.")
+
+
+@track_sync_group.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.pass_context
+def push(ctx: click.Context, mods_dir: Path) -> None:
+    """One-shot sync of tracked mods (ignores enable/disable state)."""
+    api_key = ctx.obj.get("api_key")
+
+    state = CollectionState(mods_dir)
+    try:
+        state.load()
+    except StateError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        api = NexusAPI(api_key)
+    except NexusAPIError as e:
+        console.print(f"[red]API Error:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        tracked, untracked = _sync_tracked_mods(api, state)
+        console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
+    except NexusAPIError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -146,6 +146,23 @@ nexus-dl add-local "My Custom Mod" ~/mods/starfield
 
 Registers an already-present mod that you placed in the mods directory manually. Useful for custom patches, merged plugins, or mods from other sources. Like `add`, these are tracked as manual mods and won't be removed by `update`.
 
+### Tracked-mod sync
+
+```bash
+# Enable - syncs tracked mods on Nexus to match your local loadout
+nexus-dl track-sync enable ~/mods/starfield
+
+# Disable - stops future syncs, leaves existing tracked mods alone
+nexus-dl track-sync disable ~/mods/starfield
+
+# One-shot manual push (works regardless of enable/disable)
+nexus-dl track-sync push ~/mods/starfield
+```
+
+When enabled, the "tracked" bell icon on nexusmods.com mirrors your local mod list. After `sync`, `update`, `add`, or `add-local`, tracked mods are automatically updated so browsing the site shows which mods you already have installed.
+
+Opt-in only - won't touch your tracked mods unless you explicitly enable it. Disabling preserves whatever's currently tracked on Nexus. Only affects mods for the collection's game domain (your tracked Skyrim mods are safe when syncing a Starfield collection). Local-only mods (from `add-local`) are skipped since they don't have Nexus mod IDs.
+
 ### Remove deployed mods
 
 ```bash
@@ -205,6 +222,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **add-local** - Registers an already-present mod in the state without downloading anything.
 - **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files.
 - **undeploy** - Removes all deployed files using the tracked manifest, restoring the game directory.
+- **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
 
