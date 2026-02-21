@@ -164,7 +164,7 @@ def sync(
     # Generate load order
     if not no_load_order:
         console.print("\n[bold]Generating load order...[/bold]")
-        _generate_load_order(collection_data, mods_dir, state)
+        _generate_load_order(collection_data, mods_dir, state, api)
 
     console.print(f"\n[green]Successfully synced {len(results)} mods![/green]")
     console.print(f"[dim]State saved to {state.state_file}[/dim]")
@@ -300,7 +300,7 @@ def update(
     # Generate load order
     if not no_load_order:
         console.print("\n[bold]Generating load order...[/bold]")
-        _generate_load_order(collection_data, mods_dir, state)
+        _generate_load_order(collection_data, mods_dir, state, api)
 
     console.print(f"\n[green]Update complete![/green]")
 
@@ -405,6 +405,7 @@ def _generate_load_order(
     collection_data: dict,
     mods_dir: Path,
     state: CollectionState,
+    api: NexusAPI | None = None,
 ) -> None:
     """Download manifest and generate load order files."""
     download_link = collection_data.get("download_link")
@@ -412,9 +413,10 @@ def _generate_load_order(
         console.print("[yellow]No download link available — skipping load order.[/yellow]")
         return
 
-    # Download and parse manifest
+    # Download and parse manifest (pass authenticated session for relative API paths)
     try:
-        manifest = download_and_parse_manifest(download_link)
+        session = api.session if api else None
+        manifest = download_and_parse_manifest(download_link, session=session)
     except ManifestError as e:
         console.print(f"[yellow]Could not parse manifest:[/yellow] {e}")
         return
