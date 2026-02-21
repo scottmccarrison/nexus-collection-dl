@@ -91,6 +91,7 @@ class CollectionState:
         self.proton_prefix: str = ""
         self.deployed_files: list[dict] = []
         self.deployed_at: str | None = None
+        self.track_sync_enabled: bool = False
 
     def exists(self) -> bool:
         """Check if state file exists."""
@@ -117,6 +118,7 @@ class CollectionState:
         self.proton_prefix = data.get("proton_prefix", "")
         self.deployed_files = data.get("deployed_files", [])
         self.deployed_at = data.get("deployed_at")
+        self.track_sync_enabled = data.get("track_sync_enabled", False)
 
         self.mods = {}
         for mod_id_str, mod_data in data.get("mods", {}).items():
@@ -139,6 +141,7 @@ class CollectionState:
             "proton_prefix": self.proton_prefix,
             "deployed_files": self.deployed_files,
             "deployed_at": self.deployed_at,
+            "track_sync_enabled": self.track_sync_enabled,
         }
 
         with open(self.state_file, "w") as f:
