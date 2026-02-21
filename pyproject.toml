@@ -16,6 +16,9 @@ dependencies = [
     "rarfile>=4.0",
 ]
 
+[project.optional-dependencies]
+loot = ["loot"]
+
 [project.scripts]
 nexus-dl = "nexus_collection_dl.cli:main"
 
