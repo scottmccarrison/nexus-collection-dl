@@ -1,12 +1,12 @@
 # nexus-collection-dl
 
-A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game  - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
+A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game — Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
 
 ## Why?
 
-Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux  - whether native or through Proton/Wine  - there's no built-in way to download collections from the command line.
+Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux — whether native or through Proton/Wine — there's no built-in way to download collections from the command line.
 
-`nexus-dl` fills that gap. Point it at a collection URL, and it downloads every mod, extracts archives, and tracks versions so you can update later.
+`nexus-dl` fills that gap. Point it at a collection URL, and it downloads every mod, extracts archives, generates a load order, and tracks versions so you can update later.
 
 ## Requirements
 
@@ -16,13 +16,34 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 ## Installation
 
+### Docker (recommended — includes LOOT support)
+
 ```bash
 git clone https://github.com/scottmccarrison/nexus-collection-dl.git
 cd nexus-collection-dl
-pip install -e .
+docker compose build
 ```
 
-Or with a virtual environment:
+```bash
+# Download a collection
+docker compose run --rm nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" /mods
+
+# Or use docker directly
+docker run --rm -e NEXUS_API_KEY -v ./mods:/mods nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" /mods
+```
+
+### Setup script (auto-detects Rust for LOOT)
+
+```bash
+git clone https://github.com/scottmccarrison/nexus-collection-dl.git
+cd nexus-collection-dl
+./setup.sh
+source venv/bin/activate
+```
+
+If Rust is installed, the setup script automatically builds and installs `libloot` for plugin sorting. If not, the tool still works — it just won't do automatic plugin sorting for Bethesda games.
+
+### Manual
 
 ```bash
 git clone https://github.com/scottmccarrison/nexus-collection-dl.git
@@ -46,48 +67,85 @@ export NEXUS_API_KEY="your-api-key-here"
 ### Download a collection
 
 ```bash
-# Baldur's Gate 3
-nexus-dl sync "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
-
-# Starfield
 nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 
+nexus-dl sync "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
+
 # Skip optional mods
-nexus-dl sync --skip-optional "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
+nexus-dl sync --skip-optional "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
+
+# Skip load order generation
+nexus-dl sync --no-load-order "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 ```
 
 ### Check for updates
 
 ```bash
-nexus-dl update ~/mods/bg3
+nexus-dl update ~/mods/starfield
 
 # Preview what would change
-nexus-dl update --dry-run ~/mods/bg3
+nexus-dl update --dry-run ~/mods/starfield
 ```
+
+### Regenerate load order
+
+```bash
+nexus-dl load-order ~/mods/starfield
+```
+
+Regenerates `load-order.txt` (and `plugins.txt` for Bethesda games) from the cached collection manifest without re-downloading anything.
 
 ### View status
 
 ```bash
-nexus-dl status ~/mods/bg3
+nexus-dl status ~/mods/starfield
 ```
-
-## How it works
-
-- **sync**  - Fetches the collection manifest from the Nexus API, downloads each mod archive, extracts it, and records the installed version.
-- **update**  - Re-fetches the manifest and downloads any mods that have newer versions.
-- **status**  - Shows what's installed and whether updates are available.
-
-State is tracked in a `.nexus-state.json` file inside your mods directory.
 
 ## Load order
 
-This tool only handles downloading and extracting mods. It does **not** manage load order, because load order is entirely game-specific. You'll need a separate tool for that:
+`nexus-dl` generates load order files automatically during `sync` and `update`. The approach differs by game type:
 
-- **Baldur's Gate 3** - [BG3 Mod Manager (bg3mm)](https://github.com/LaughingLeader/BG3ModManager) to set load order in `modsettings.lsx`
-- **Bethesda games** (Skyrim, Starfield, Fallout) - [LOOT](https://loot.github.io/) for automatic load order sorting
-- **Other games** - Check the game's Nexus Mods page for recommended mod managers
+### All games
 
-After running `nexus-dl sync`, point your load order tool at the output directory and configure from there.
+**`load-order.txt`** — Mods listed in topological order based on:
+- **Phase grouping** — The collection author's phase assignments (phase 0 loads before phase 1, etc.)
+- **Collection mod rules** — Explicit before/after/requires relationships from `collection.json`
+- **Author-declared dependencies** — `modRequirements` from the Nexus API (the mod author's own dependency list)
+
+This handles BG3, Cyberpunk, and every other game. Since non-Bethesda games don't have a standardized plugin format (`.pak`, `.archive`, etc.), mod-level ordering is the best we can do.
+
+### Bethesda games (Starfield, Skyrim, Fallout, etc.)
+
+In addition to `load-order.txt`, Bethesda collections also get:
+
+**`plugins.txt`** — Plugin-level load order for `.esp`/`.esm`/`.esl` files. Two sources:
+1. **Collection metadata** — The collection author's intended plugin order (always available)
+2. **LOOT sorting** — Automatic sorting via [libloot](https://github.com/loot/libloot) using master dependency analysis + community masterlists (when libloot is installed)
+
+When libloot is available, LOOT-sorted order takes priority over collection metadata. Enabled/disabled status from the collection is preserved either way.
+
+Supported Bethesda games: Starfield, Skyrim SE, Skyrim, Fallout 4, Fallout NV, Fallout 3, Oblivion, Morrowind, Enderal, plus VR variants.
+
+### LOOT integration
+
+LOOT is optional. Without it, `plugins.txt` uses the collection author's plugin order. With it, plugins are sorted by master dependencies using community-maintained masterlists.
+
+To enable LOOT:
+- **Docker**: Included automatically (the image builds libloot)
+- **setup.sh**: Installed automatically if Rust is detected
+- **Manual**: Install Rust, then `pip install maturin && maturin develop --release` in the libloot repo
+- **Pre-built wheel**: Check [GitHub Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases) for manylinux wheels
+
+Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 24 hours.
+
+## How it works
+
+- **sync** — Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
+- **update** — Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
+- **load-order** — Regenerates load order from the cached manifest (no API call needed).
+- **status** — Shows what's installed and whether updates are available.
+
+State is tracked in a `.nexus-state.json` file inside your mods directory, including the cached collection manifest for offline load order regeneration.
 
 ## Supported archive formats
 

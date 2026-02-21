@@ -11,6 +11,15 @@ from .api import NexusAPI, NexusAPIError, NexusPremiumRequired, NexusRateLimited
 from .collection import CollectionParseError, parse_collection_url
 from .downloader import DownloadError, Downloader
 from .extractor import ExtractionError, extract_archive, is_archive, move_file
+from .loadorder import LoadOrderGenerator
+from .loot_sort import (
+    is_bethesda_game,
+    is_loot_available,
+    merge_plugin_orders,
+    sort_plugins_with_loot,
+    write_loot_plugins_txt,
+)
+from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
 from .state import CollectionState, StateError
 
 console = Console()
@@ -33,12 +42,14 @@ def main(ctx: click.Context, api_key: str | None) -> None:
 @click.argument("collection_url")
 @click.argument("mods_dir", type=click.Path(path_type=Path))
 @click.option("--skip-optional", is_flag=True, help="Skip optional mods")
+@click.option("--no-load-order", is_flag=True, help="Skip load order generation")
 @click.pass_context
 def sync(
     ctx: click.Context,
     collection_url: str,
     mods_dir: Path,
     skip_optional: bool,
+    no_load_order: bool,
 ) -> None:
     """
     Download a collection to the specified directory.
@@ -150,6 +161,11 @@ def sync(
     # Save state
     state.save()
 
+    # Generate load order
+    if not no_load_order:
+        console.print("\n[bold]Generating load order...[/bold]")
+        _generate_load_order(collection_data, mods_dir, state)
+
     console.print(f"\n[green]Successfully synced {len(results)} mods![/green]")
     console.print(f"[dim]State saved to {state.state_file}[/dim]")
 
@@ -158,12 +174,14 @@ def sync(
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option("--skip-optional", is_flag=True, help="Skip optional mods")
 @click.option("--dry-run", is_flag=True, help="Show what would be updated without downloading")
+@click.option("--no-load-order", is_flag=True, help="Skip load order generation")
 @click.pass_context
 def update(
     ctx: click.Context,
     mods_dir: Path,
     skip_optional: bool,
     dry_run: bool,
+    no_load_order: bool,
 ) -> None:
     """
     Check for and download updated mods.
@@ -279,6 +297,11 @@ def update(
     state.collection_revision = new_revision
     state.save()
 
+    # Generate load order
+    if not no_load_order:
+        console.print("\n[bold]Generating load order...[/bold]")
+        _generate_load_order(collection_data, mods_dir, state)
+
     console.print(f"\n[green]Update complete![/green]")
 
 
@@ -376,6 +399,151 @@ def status(ctx: click.Context, mods_dir: Path) -> None:
         console.print("\n[bold]Installed mods:[/bold]")
         for mod in state.mods.values():
             console.print(f"  - {mod.name} v{mod.version}")
+
+
+def _generate_load_order(
+    collection_data: dict,
+    mods_dir: Path,
+    state: CollectionState,
+) -> None:
+    """Download manifest and generate load order files."""
+    download_link = collection_data.get("download_link")
+    if not download_link:
+        console.print("[yellow]No download link available — skipping load order.[/yellow]")
+        return
+
+    # Download and parse manifest
+    try:
+        manifest = download_and_parse_manifest(download_link)
+    except ManifestError as e:
+        console.print(f"[yellow]Could not parse manifest:[/yellow] {e}")
+        return
+
+    # Build mod_requirements dict from collection data
+    mod_requirements: dict[int, list[int]] = {}
+    for mod in collection_data.get("mods", []):
+        reqs = mod.get("requirements", [])
+        if reqs:
+            mod_requirements[mod["mod_id"]] = reqs
+
+    game_domain = collection_data["game_domain"]
+
+    # Generate load order
+    generator = LoadOrderGenerator(
+        manifest=manifest,
+        mods=collection_data["mods"],
+        mod_requirements=mod_requirements,
+        game_domain=game_domain,
+    )
+
+    try:
+        written = generator.generate(mods_dir)
+        for path in written:
+            console.print(f"  [green]Wrote[/green] {path.name}")
+    except Exception as e:
+        console.print(f"[yellow]Load order generation failed:[/yellow] {e}")
+        return
+
+    # LOOT sorting for Bethesda games
+    if is_bethesda_game(game_domain) and is_loot_available():
+        console.print("[dim]Running LOOT plugin sort...[/dim]")
+        loot_sorted = sort_plugins_with_loot(game_domain, mods_dir, None)
+        merged = merge_plugin_orders(manifest.plugins, loot_sorted)
+        used_loot = loot_sorted is not None
+        plugins_path = mods_dir / "plugins.txt"
+        write_loot_plugins_txt(merged, plugins_path, game_domain, used_loot)
+        source = "LOOT-sorted" if used_loot else "collection metadata"
+        console.print(f"  [green]Wrote[/green] plugins.txt ({source})")
+    elif is_bethesda_game(game_domain) and not is_loot_available():
+        console.print(
+            "[dim]Install libloot for LOOT-sorted plugin order "
+            "(pip install loot)[/dim]"
+        )
+
+    # Cache manifest in state
+    state.manifest_data = manifest.to_dict()
+    state.mod_rules = manifest.mod_rules
+    state.save()
+
+
+@main.command(name="load-order")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.pass_context
+def load_order(ctx: click.Context, mods_dir: Path) -> None:
+    """Regenerate load order from cached manifest."""
+    state = CollectionState(mods_dir)
+    try:
+        state.load()
+    except StateError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        console.print("Run 'sync' first to download a collection.")
+        sys.exit(1)
+
+    if not state.manifest_data:
+        console.print(
+            "[red]Error:[/red] No cached manifest found. "
+            "Run 'sync' or 'update' first to download the collection manifest."
+        )
+        sys.exit(1)
+
+    console.print(f"[bold]Collection:[/bold] {state.collection_name}")
+    console.print(f"[bold]Game:[/bold] {state.game_domain}")
+
+    # Reconstruct manifest from cached data
+    manifest = CollectionManifest.from_dict(state.manifest_data)
+
+    # Build mod_requirements from state
+    mod_requirements: dict[int, list[int]] = {}
+    for mod_id, mod_state in state.mods.items():
+        if mod_state.requirements:
+            mod_requirements[mod_id] = mod_state.requirements
+
+    # Rebuild mods list from state
+    mods_list = [
+        {
+            "mod_id": mod_id,
+            "mod_name": ms.name,
+            "file_id": ms.file_id,
+            "version": ms.version,
+            "filename": ms.filename,
+            "optional": ms.optional,
+        }
+        for mod_id, ms in state.mods.items()
+    ]
+
+    generator = LoadOrderGenerator(
+        manifest=manifest,
+        mods=mods_list,
+        mod_requirements=mod_requirements,
+        game_domain=state.game_domain,
+    )
+
+    console.print("[bold]Generating load order...[/bold]")
+    try:
+        written = generator.generate(mods_dir)
+        for path in written:
+            console.print(f"  [green]Wrote[/green] {path.name}")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    # LOOT sorting for Bethesda games
+    if is_bethesda_game(state.game_domain) and is_loot_available():
+        console.print("[dim]Running LOOT plugin sort...[/dim]")
+        loot_sorted = sort_plugins_with_loot(state.game_domain, mods_dir, None)
+        merged = merge_plugin_orders(manifest.plugins, loot_sorted)
+        used_loot = loot_sorted is not None
+        plugins_path = mods_dir / "plugins.txt"
+        write_loot_plugins_txt(merged, plugins_path, state.game_domain, used_loot)
+        source = "LOOT-sorted" if used_loot else "collection metadata"
+        console.print(f"  [green]Wrote[/green] plugins.txt ({source})")
+    elif is_bethesda_game(state.game_domain) and not is_loot_available():
+        console.print(
+            "[dim]Install libloot for LOOT-sorted plugin order "
+            "(pip install loot)[/dim]"
+        )
+
+    console.print("[green]Load order regenerated![/green]")
 
 
 if __name__ == "__main__":
