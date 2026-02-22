@@ -14,6 +14,7 @@ dependencies = [
     "rich>=13.0.0",
     "py7zr>=0.20.0",
     "rarfile>=4.0",
+    "flask>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +22,10 @@ loot = ["loot"]
 
 [project.scripts]
 nexus-dl = "nexus_collection_dl.cli:main"
+nexus-dl-web = "nexus_collection_dl.web:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+"nexus_collection_dl.web" = ["templates/*.html", "static/*"]

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - nexus-dl{% endblock %}
+{% block content %}
+<h2>Dashboard</h2>
+
+{% if error %}
+<div class="card card-error">
+    <p>{{ error }}</p>
+</div>
+{% endif %}
+
+{% if status %}
+<div class="dashboard-grid">
+    <!-- Collection info -->
+    <div class="card">
+        <h3>Collection</h3>
+        <dl>
+            <dt>Name</dt>
+            <dd>{{ status.collection_name }}</dd>
+            <dt>Game</dt>
+            <dd>{{ status.game_domain }}</dd>
+            <dt>Installed Revision</dt>
+            <dd>{{ status.installed_revision }}</dd>
+            {% if status.latest_revision is not none %}
+            <dt>Latest Revision</dt>
+            <dd>
+                {{ status.latest_revision }}
+                {% if status.latest_revision != status.installed_revision %}
+                <span class="badge badge-yellow">Update available</span>
+                {% endif %}
+            </dd>
+            {% endif %}
+            <dt>Total Mods</dt>
+            <dd>{{ status.mods | length }}</dd>
+        </dl>
+    </div>
+
+    <!-- Deployment info -->
+    <div class="card">
+        <h3>Deployment</h3>
+        <dl>
+            {% if status.deployed_at %}
+            <dt>Status</dt>
+            <dd><span class="badge badge-green">Deployed</span></dd>
+            <dt>Files</dt>
+            <dd>{{ status.deployed_file_count }}</dd>
+            <dt>Deployed At</dt>
+            <dd>{{ status.deployed_at[:19] }}</dd>
+            <dt>Game Dir</dt>
+            <dd class="text-dim">{{ status.game_dir }}</dd>
+            {% else %}
+            <dt>Status</dt>
+            <dd><span class="badge badge-dim">Not deployed</span></dd>
+            {% endif %}
+            <dt>Track Sync</dt>
+            <dd>
+                {% if status.track_sync_enabled %}
+                <span class="badge badge-blue">Enabled</span>
+                {% else %}
+                <span class="badge badge-dim">Disabled</span>
+                {% endif %}
+            </dd>
+        </dl>
+    </div>
+</div>
+{% endif %}
+
+<!-- Quick actions -->
+<div class="card" x-data="taskStore">
+    <h3>Actions</h3>
+    <div class="actions-grid">
+        <!-- Sync form -->
+        <div class="action-group">
+            <h4>Sync Collection</h4>
+            <form @submit.prevent="startSync">
+                <input type="url" x-model="syncUrl" placeholder="Collection URL" class="input-full" required>
+                <label class="checkbox-label">
+                    <input type="checkbox" x-model="skipOptional"> Skip optional mods
+                </label>
+                <button type="submit" class="btn btn-primary" :disabled="running">Sync</button>
+            </form>
+        </div>
+
+        <!-- Quick buttons -->
+        <div class="action-group">
+            <h4>Quick Actions</h4>
+            <div class="btn-group">
+                <button class="btn btn-primary" @click="startTask('/api/update', {})" :disabled="running">
+                    Update
+                </button>
+                <button class="btn btn-primary" @click="startTask('/api/deploy', {})" :disabled="running">
+                    Deploy
+                </button>
+                <button class="btn btn-danger" @click="startTask('/api/undeploy', {})" :disabled="running">
+                    Undeploy
+                </button>
+            </div>
+            <div class="btn-group" style="margin-top: 0.5rem">
+                <button class="btn btn-secondary" @click="regenLoadOrder()" :disabled="running">
+                    Regen Load Order
+                </button>
+                <button class="btn btn-secondary" @click="trackSync('push')" :disabled="running">
+                    Track Sync Push
+                </button>
+                <button class="btn btn-secondary" @click="trackSync('enable')" :disabled="running">
+                    Enable Track Sync
+                </button>
+                <button class="btn btn-secondary" @click="trackSync('disable')" :disabled="running">
+                    Disable Track Sync
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Progress panel -->
+    <div class="progress-panel" x-show="running || lastResult" x-transition>
+        <template x-if="running">
+            <div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" :style="`width: ${Math.round(progress * 100)}%`"></div>
+                </div>
+                <p class="progress-msg" x-text="message"></p>
+            </div>
+        </template>
+        <template x-if="!running && lastResult">
+            <div class="result-panel">
+                <h4 x-text="lastResult.status === 'completed' ? 'Completed' : 'Failed'"
+                    :class="lastResult.status === 'completed' ? 'text-green' : 'text-red'"></h4>
+                <pre class="result-detail" x-text="formatResult(lastResult)"></pre>
+                <button class="btn btn-secondary" @click="lastResult = null">Dismiss</button>
+            </div>
+        </template>
+    </div>
+</div>
+{% endblock %}

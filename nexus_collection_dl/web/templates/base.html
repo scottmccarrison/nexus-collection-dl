@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}nexus-dl{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    <script src="{{ url_for('static', filename='htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='alpine.min.js') }}" defer></script>
+</head>
+<body x-data="appStore" x-init="init()">
+    <div class="layout">
+        <nav class="sidebar">
+            <div class="logo">
+                <h1>nexus-dl</h1>
+            </div>
+            <ul>
+                <li><a href="/" class="{% if request.path == '/' %}active{% endif %}">Dashboard</a></li>
+                <li><a href="/mods" class="{% if request.path == '/mods' %}active{% endif %}">Mods</a></li>
+            </ul>
+            <div class="sidebar-footer">
+                <span class="mods-dir" title="{{ mods_dir }}">{{ mods_dir }}</span>
+            </div>
+        </nav>
+        <main class="content">
+            {% block content %}{% endblock %}
+        </main>
+    </div>
+
+    <!-- Toast container -->
+    <div class="toast-container" x-show="toast.show" x-transition>
+        <div class="toast" :class="toast.type">
+            <span x-text="toast.msg"></span>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
