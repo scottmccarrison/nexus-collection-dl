@@ -38,9 +38,14 @@ class Downloader:
         target_dir: Path,
         progress: Progress | None = None,
         task_id: TaskID | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> Path:
         """
         Download a mod file to a temporary location.
+
+        Args:
+            on_progress: Optional callback(bytes_downloaded, total_bytes) for
+                         generic progress reporting (used by web UI / service layer).
 
         Returns path to the downloaded file.
         """
@@ -67,12 +72,16 @@ class Downloader:
             if progress and task_id is not None:
                 progress.update(task_id, total=total_size)
 
+            bytes_downloaded = 0
             with open(temp_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
+                        bytes_downloaded += len(chunk)
                         if progress and task_id is not None:
                             progress.update(task_id, advance=len(chunk))
+                        if on_progress:
+                            on_progress(bytes_downloaded, total_size)
 
             # Rename to final filename
             final_path = target_dir / filename
@@ -91,6 +100,7 @@ class Downloader:
         mods: list[dict[str, Any]],
         target_dir: Path,
         on_complete: Callable[[dict[str, Any], Path], None] | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
     ) -> list[tuple[dict[str, Any], Path]]:
         """
         Download multiple mods with a unified progress display.
@@ -100,6 +110,10 @@ class Downloader:
             mods: List of mod info dicts
             target_dir: Directory to download files to
             on_complete: Callback called after each successful download
+            on_progress: Optional callback(bytes_downloaded, total_bytes) for
+                         generic progress (passed through to download_mod).
+                         When provided, the Rich progress bar is still shown for
+                         CLI usage, and the callback fires alongside it.
 
         Returns list of (mod_info, downloaded_path) tuples.
         """
@@ -132,6 +146,7 @@ class Downloader:
                         target_dir=target_dir,
                         progress=progress,
                         task_id=task_id,
+                        on_progress=on_progress,
                     )
                     results.append((mod, downloaded_path))
 

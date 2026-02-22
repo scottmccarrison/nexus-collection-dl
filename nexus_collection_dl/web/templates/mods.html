@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}Mods - nexus-dl{% endblock %}
+{% block content %}
+<h2>Mods</h2>
+
+{% if error %}
+<div class="card card-error">
+    <p>{{ error }}</p>
+</div>
+{% else %}
+
+<!-- Add mod forms -->
+<div class="card" x-data="taskStore">
+    <div class="actions-grid">
+        <div class="action-group">
+            <h4>Add Mod by URL</h4>
+            <form @submit.prevent="addMod">
+                <input type="url" x-model="modUrl" placeholder="https://www.nexusmods.com/starfield/mods/123" class="input-full" required>
+                <input type="number" x-model="fileId" placeholder="File ID (optional)" class="input-sm">
+                <button type="submit" class="btn btn-primary" :disabled="running">Add Mod</button>
+            </form>
+        </div>
+        <div class="action-group">
+            <h4>Register Local Mod</h4>
+            <form @submit.prevent="addLocal">
+                <input type="text" x-model="localName" placeholder="Mod name" class="input-full" required>
+                <button type="submit" class="btn btn-primary" :disabled="running">Register</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-panel" x-show="running" x-transition>
+        <div class="progress-bar-container">
+            <div class="progress-bar" :style="`width: ${Math.round(progress * 100)}%`"></div>
+        </div>
+        <p class="progress-msg" x-text="message"></p>
+    </div>
+</div>
+
+<!-- Mod table -->
+{% if status and status.mods %}
+<div class="card">
+    <h3>Installed Mods ({{ status.mods | length }})</h3>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Version</th>
+                    <th>Status</th>
+                    <th>Phase</th>
+                    <th>Type</th>
+                    <th>Mod ID</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for mod in status.mods | sort(attribute='phase') %}
+                <tr>
+                    <td>{{ mod.name }}</td>
+                    <td>{{ mod.version or '-' }}</td>
+                    <td>
+                        {% if mod.status == 'up_to_date' %}
+                        <span class="badge badge-green">Up to date</span>
+                        {% elif mod.status == 'update_available' %}
+                        <span class="badge badge-yellow">Update</span>
+                        {% elif mod.status == 'not_installed' %}
+                        <span class="badge badge-blue">Not installed</span>
+                        {% elif mod.status == 'removed' %}
+                        <span class="badge badge-red">Removed</span>
+                        {% elif mod.status == 'manual' %}
+                        <span class="badge badge-cyan">Manual</span>
+                        {% elif mod.status == 'installed' %}
+                        <span class="badge badge-green">Installed</span>
+                        {% else %}
+                        <span class="badge badge-dim">{{ mod.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ mod.phase }}</td>
+                    <td>
+                        {% if mod.manual %}
+                        <span class="text-dim">manual</span>
+                        {% elif mod.optional %}
+                        <span class="text-dim">optional</span>
+                        {% else %}
+                        <span class="text-dim">required</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-dim">{{ mod.mod_id }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+{% endif %}
+{% endblock %}
