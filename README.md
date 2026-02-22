@@ -1,6 +1,6 @@
 # nexus-collection-dl
 
-A command-line tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
+A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. Comes with a local web UI and a CLI.
 
 ## Why?
 
@@ -62,7 +62,32 @@ pip install -e .
 export NEXUS_API_KEY="your-api-key-here"
 ```
 
-## Usage
+## Web UI
+
+Launch the local web interface for day-to-day mod management:
+
+```bash
+nexus-dl serve ~/mods/starfield
+
+# Custom port
+nexus-dl serve ~/mods/starfield --port 8080
+```
+
+Opens a dark-themed dashboard at `http://127.0.0.1:5000` with:
+
+- **Dashboard** - collection info, deployment status, quick action buttons (sync, update, deploy, undeploy)
+- **Mods** - full mod table with status badges, add mod by URL, register local mods
+- **Background tasks** - long-running operations (sync, update, deploy) stream progress in real time
+
+There's also a standalone entry point:
+
+```bash
+nexus-dl-web ~/mods/starfield
+```
+
+## CLI Usage
+
+All operations are also available from the command line.
 
 ### Download a collection
 
@@ -216,6 +241,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 ## How it works
 
+- **serve** - Launches a local web UI for managing mods from your browser.
 - **sync** - Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
@@ -225,6 +251,8 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
+
+Both the web UI and CLI share the same service layer, so all operations behave identically regardless of interface.
 
 State is tracked in a `.nexus-state.json` file inside your mods directory, including the cached collection manifest for offline load order regeneration.
 
