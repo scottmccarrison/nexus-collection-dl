@@ -166,8 +166,9 @@ document.addEventListener('alpine:init', () => {
                 this.showToast('Operation completed', 'success');
                 es.close();
                 this.eventSource = null;
-                // Refresh pending downloads list
+                // Refresh pending downloads list and reload dashboard
                 this.refreshPending();
+                setTimeout(() => location.reload(), 1500);
             });
 
             es.addEventListener('error', (e) => {

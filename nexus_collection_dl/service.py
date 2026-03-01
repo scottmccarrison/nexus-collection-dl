@@ -356,12 +356,21 @@ class ModManagerService:
                 state.add_mod(mod_info_dict)
 
             state.save()
+
+            # Cache manifest + generate load order even for free users
+            # (the manifest download is a public URL, doesn't need premium)
+            load_order_files: list[str] = []
+            if not no_load_order:
+                progress("loadorder", 0.8, "Caching manifest and generating load order...")
+                lo_files = self._generate_load_order(collection_data, mods_dir, state)
+                load_order_files = lo_files
+
             progress("done", 1.0, f"Registered {len(pending_downloads)} mods for manual download")
             return SyncResult(
                 mods_downloaded=0,
                 mods_extracted=0,
                 errors=errors,
-                load_order_files=[],
+                load_order_files=load_order_files,
                 pending_downloads=pending_downloads,
             )
 
@@ -891,6 +900,7 @@ class ModManagerService:
 
             mod_state.download_status = "downloaded"
             mod_state.browser_url = ""
+            mod_state.installed_at = datetime.now(timezone.utc).isoformat()
             pct = 0.1 + 0.8 * ((i + 1) / len(pending))
             progress("import", pct, f"Imported {mod_state.name}")
 
@@ -901,6 +911,10 @@ class ModManagerService:
         if matched > 0 and not no_load_order:
             progress("loadorder", 0.95, "Regenerating load order...")
             load_order_files = self._regen_load_order_from_state(mods_dir, state)
+
+        # Sync tracked mods (same as premium sync does after downloading)
+        if matched > 0:
+            self._maybe_sync_tracked(state)
 
         still_pending = len(state.get_pending_mods())
         progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")

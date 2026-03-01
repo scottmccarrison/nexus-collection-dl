@@ -177,6 +177,8 @@ class CollectionState:
             manual=mod_info.get("manual", False),
             download_status=mod_info.get("download_status", "downloaded"),
             browser_url=mod_info.get("browser_url", ""),
+            phase=mod_info.get("phase", 0),
+            requirements=mod_info.get("requirements"),
         )
 
     def get_pending_mods(self) -> list[ModState]:
