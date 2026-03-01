@@ -5,11 +5,11 @@ import os
 from pathlib import Path
 
 
-def create_and_run(api_key: str | None = None, mods_dir: Path | None = None, port: int = 5000):
+def create_and_run(api_key: str | None = None, mods_dir: Path | None = None, port: int = 5000, force_free: bool = False):
     """Create and run the Flask app."""
     from .app import create_app
 
-    app = create_app(api_key=api_key, mods_dir=mods_dir)
+    app = create_app(api_key=api_key, mods_dir=mods_dir, force_free=force_free)
     app.run(host="127.0.0.1", port=port, debug=False)
 
 

@@ -32,6 +32,7 @@ def main(ctx: click.Context, api_key: str | None, free: bool) -> None:
     """Download mod collections from Nexus Mods."""
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
+    ctx.obj["force_free"] = free
     ctx.obj["service"] = ModManagerService(api_key, force_free=free)
 
 
@@ -582,9 +583,12 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     from .web import create_and_run
 
     api_key = ctx.obj["api_key"]
+    force_free = ctx.obj.get("force_free", False)
     console.print(f"[bold]Starting web UI on http://127.0.0.1:{port}[/bold]")
     console.print(f"[dim]Mods directory: {mods_dir}[/dim]")
-    create_and_run(api_key=api_key, mods_dir=mods_dir, port=port)
+    if force_free:
+        console.print(f"[yellow]Free-user mode forced[/yellow]")
+    create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
 
 
 if __name__ == "__main__":

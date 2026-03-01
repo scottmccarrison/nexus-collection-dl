@@ -13,15 +13,16 @@ from ..state import CollectionState, StateError
 from .tasks import TaskManager
 
 
-def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flask:
+def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_free: bool = False) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MODS_DIR"] = mods_dir
     app.config["API_KEY"] = api_key
+    app.config["FORCE_FREE"] = force_free
 
     tasks = TaskManager()
 
     def get_service() -> ModManagerService:
-        return ModManagerService(api_key=app.config["API_KEY"])
+        return ModManagerService(api_key=app.config["API_KEY"], force_free=app.config["FORCE_FREE"])
 
     def get_mods_dir() -> Path:
         return Path(app.config["MODS_DIR"])
