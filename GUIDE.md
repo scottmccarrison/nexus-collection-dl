@@ -12,11 +12,11 @@ It works with any game on Nexus Mods - Baldur's Gate 3, Starfield, Cyberpunk 207
 
 ## What you need before starting
 
-1. **A Nexus Mods Premium account** - The free tier doesn't allow automated downloads through the API. You need Premium to use this tool. (This is a Nexus Mods limitation, not ours.)
+1. **A Nexus Mods account** - Both free and Premium accounts work. Premium lets the tool download files automatically. Free accounts work too - you just download the files yourself through the browser and the tool handles everything else (metadata, extraction, load order). More on this below.
 
 2. **Python 3.10 or newer** - This comes pre-installed on most Linux distributions. We'll check in a moment.
 
-3. **A Nexus Mods API key** - This is a secret code that lets the tool download on your behalf. We'll get this together below.
+3. **A Nexus Mods API key** - This is a secret code that lets the tool talk to Nexus Mods on your behalf. We'll get this together below.
 
 4. **git** - Used to download the tool itself. Also pre-installed on most systems.
 
@@ -172,6 +172,65 @@ Some collections mark certain mods as optional. To skip those:
 ```bash
 nexus-dl sync --skip-optional "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
 ```
+
+## If you have a free account
+
+If you don't have Nexus Mods Premium, the tool still does most of the work for you. The only difference is that you download the actual mod files yourself through the browser (Nexus shows a countdown timer for free downloads). The tool handles everything else: figuring out which mods to get, where to find them, extracting archives, generating load order, and tracking state.
+
+### Step 1: Sync the collection
+
+Run the same sync command as Premium users:
+
+```bash
+nexus-dl sync "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
+```
+
+Instead of downloading files, you'll see a table with the name of each mod, its filename, and a clickable URL:
+
+```
+Pending Downloads (manual)
+Mod                  | Filename              | Size    | URL
+Script Extender      | ScriptExtender-v2.zip | 12.3 MB | https://www.nexusmods.com/baldursgate3/mods/...
+Better UI            | BetterUI-1.5.pak      | 4.1 MB  | https://www.nexusmods.com/baldursgate3/mods/...
+...
+
+Free account detected. Download the files above through your browser, save them to ~/mods/bg3, then run:
+  nexus-dl import ~/mods/bg3
+```
+
+### Step 2: Download the files
+
+Click each URL. Nexus Mods will show its standard free download page with a countdown timer. When the download starts, save the file to your mods directory (`~/mods/bg3` in this example). Keep the original filename - the tool matches files by name.
+
+**Tip:** You don't have to download everything at once. Download a few, run import, download more later - the tool tracks what's done and what's still pending.
+
+### Step 3: Import
+
+Once you've downloaded some or all of the files:
+
+```bash
+nexus-dl import ~/mods/bg3
+```
+
+This scans the mods directory for files matching the pending downloads, extracts archives, updates the state, and regenerates load order. If some files are still missing, it tells you which ones.
+
+### Step 4: Deploy
+
+Once all mods are imported (or whenever you're ready), deploy as usual:
+
+```bash
+nexus-dl deploy ~/mods/bg3
+```
+
+Everything from this point on works identically to Premium - status, updates, undeploy, etc.
+
+### Checking what's still pending
+
+```bash
+nexus-dl status ~/mods/bg3
+```
+
+Mods you haven't downloaded yet show as "Pending download" in yellow.
 
 ## Checking status
 
