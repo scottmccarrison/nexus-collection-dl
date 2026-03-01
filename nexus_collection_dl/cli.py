@@ -21,12 +21,18 @@ console = Console()
     envvar="NEXUS_API_KEY",
     help="Nexus Mods API key (or set NEXUS_API_KEY env var)",
 )
+@click.option(
+    "--free",
+    is_flag=True,
+    hidden=True,
+    help="Force free-user mode (for testing)",
+)
 @click.pass_context
-def main(ctx: click.Context, api_key: str | None) -> None:
+def main(ctx: click.Context, api_key: str | None, free: bool) -> None:
     """Download mod collections from Nexus Mods."""
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
-    ctx.obj["service"] = ModManagerService(api_key)
+    ctx.obj["service"] = ModManagerService(api_key, force_free=free)
 
 
 def _cli_progress(event: str, pct: float, msg: str) -> None:

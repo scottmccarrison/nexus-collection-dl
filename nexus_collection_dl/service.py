@@ -142,9 +142,16 @@ def _noop_progress(event: str, pct: float, msg: str) -> None:
 class ModManagerService:
     """Business logic for managing Nexus Mods collections."""
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, force_free: bool = False):
         self._api_key = api_key
         self._api: NexusAPI | None = None
+        self._force_free = force_free
+
+    def _check_premium(self, user_info: dict) -> bool:
+        """Check if user has premium, respecting force_free override."""
+        if self._force_free:
+            return False
+        return user_info.get("is_premium", False)
 
     @property
     def api(self) -> NexusAPI:
@@ -295,7 +302,7 @@ class ModManagerService:
         # Check premium status
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        is_premium = user_info.get("is_premium", False)
+        is_premium = self._check_premium(user_info)
 
         # Fetch collection
         progress("fetch", 0.05, "Fetching collection data...")
@@ -333,7 +340,7 @@ class ModManagerService:
                 if existing and existing.download_status == "downloaded":
                     continue
                 browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
-                size_bytes = mod.get("size_bytes", 0) or mod.get("size", 0) or 0
+                size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
                 pending = PendingDownload(
                     mod_id=mod_id,
                     mod_name=mod["mod_name"],
@@ -429,7 +436,7 @@ class ModManagerService:
 
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        is_premium = user_info.get("is_premium", False)
+        is_premium = self._check_premium(user_info)
 
         collection_info = parse_collection_url(state.collection_url)
 
@@ -484,7 +491,7 @@ class ModManagerService:
                     if existing and existing.download_status == "downloaded":
                         continue
                     browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
-                    size_bytes = mod.get("size_bytes", 0) or mod.get("size", 0) or 0
+                    size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
                     pending_downloads.append(PendingDownload(
                         mod_id=mod_id,
                         mod_name=mod["mod_name"],
@@ -549,7 +556,7 @@ class ModManagerService:
 
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        is_premium = user_info.get("is_premium", False)
+        is_premium = self._check_premium(user_info)
 
         progress("fetch", 0.1, "Fetching mod info...")
         nexus_mod = self.api.get_mod_info(mod_info.game_domain, mod_info.mod_id)
@@ -580,7 +587,7 @@ class ModManagerService:
             "file_id": selected_file_id,
             "filename": selected.get("file_name", selected_name),
             "version": selected_version,
-            "size_bytes": selected.get("size_in_bytes") or selected.get("size", 0),
+            "size_bytes": int(selected.get("size_in_bytes") or selected.get("size", 0) or 0),
             "optional": False,
             "requirements": [],
         }
