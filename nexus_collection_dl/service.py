@@ -254,6 +254,7 @@ class ModManagerService:
         mods_dir: Path,
         skip_optional: bool = False,
         no_load_order: bool = False,
+        no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> SyncResult:
         """Download an entire collection."""
@@ -316,7 +317,7 @@ class ModManagerService:
         extracted = 0
         for i, (mod_info, file_path) in enumerate(results):
             try:
-                if is_archive(file_path):
+                if not no_extract and is_archive(file_path):
                     extract_archive(file_path, mods_dir)
                     file_path.unlink()
                     extracted += 1
@@ -352,6 +353,7 @@ class ModManagerService:
         mods_dir: Path,
         skip_optional: bool = False,
         no_load_order: bool = False,
+        no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> UpdateResult:
         """Check for and download updates."""
@@ -401,7 +403,7 @@ class ModManagerService:
             progress("extract", 0.75, "Extracting archives...")
             for mod_info, file_path in results:
                 try:
-                    if is_archive(file_path):
+                    if not no_extract and is_archive(file_path):
                         extract_archive(file_path, mods_dir)
                         file_path.unlink()
                     state.add_mod(mod_info)
@@ -438,6 +440,7 @@ class ModManagerService:
         mods_dir: Path,
         file_id: int | None = None,
         no_load_order: bool = False,
+        no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> AddResult:
         """Add a single mod by Nexus URL."""
@@ -521,7 +524,7 @@ class ModManagerService:
         progress("extract", 0.85, "Extracting...")
         for _mod, file_path in results:
             try:
-                if is_archive(file_path):
+                if not no_extract and is_archive(file_path):
                     extract_archive(file_path, mods_dir)
                     file_path.unlink()
             except ExtractionError as e:

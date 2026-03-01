@@ -74,6 +74,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
         data = request.get_json(silent=True) or {}
         collection_url = data.get("collection_url", "")
         skip_optional = data.get("skip_optional", False)
+        no_extract = data.get("no_extract", False)
 
         if not collection_url:
             return jsonify({"error": "collection_url is required"}), 400
@@ -89,6 +90,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
             return svc.sync(
                 collection_url, mods_path,
                 skip_optional=skip_optional,
+                no_extract=no_extract,
                 on_progress=progress_cb,
             )
 
@@ -99,6 +101,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
     def api_update():
         data = request.get_json(silent=True) or {}
         skip_optional = data.get("skip_optional", False)
+        no_extract = data.get("no_extract", False)
 
         task_id = tasks.create("update")
         svc = get_service()
@@ -108,7 +111,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
             tasks.update_progress(task_id, pct, msg)
 
         def run():
-            return svc.update(mods_path, skip_optional=skip_optional, on_progress=progress_cb)
+            return svc.update(mods_path, skip_optional=skip_optional, no_extract=no_extract, on_progress=progress_cb)
 
         tasks.run_in_background(task_id, run)
         return jsonify({"task_id": task_id}), 202
@@ -118,6 +121,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
         data = request.get_json(silent=True) or {}
         mod_url = data.get("mod_url", "")
         file_id = data.get("file_id")
+        no_extract = data.get("no_extract", False)
 
         if not mod_url:
             return jsonify({"error": "mod_url is required"}), 400
@@ -133,7 +137,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
             tasks.update_progress(task_id, pct, msg)
 
         def run():
-            return svc.add_mod(mod_url, mods_path, file_id=file_id, on_progress=progress_cb)
+            return svc.add_mod(mod_url, mods_path, file_id=file_id, no_extract=no_extract, on_progress=progress_cb)
 
         tasks.run_in_background(task_id, run)
         return jsonify({"task_id": task_id}), 202
