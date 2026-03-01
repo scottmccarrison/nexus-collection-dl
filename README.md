@@ -218,12 +218,12 @@ Both free and Premium Nexus Mods accounts work with `nexus-dl`. The difference i
 
 **Premium** accounts can download files directly through the API, so `sync`, `update`, and `add` handle everything automatically.
 
-**Free** accounts can't use the Nexus download API (this is a Nexus Mods restriction, not ours), but every other API endpoint works fine - collection metadata, mod info, file listings, tracked mods. The tool uses these free endpoints to do everything except the actual file download.
+**Free** accounts can't use the Nexus download API (this is a Nexus Mods restriction, not ours), but every other API endpoint works fine - collection metadata, mod info, file listings, tracked mods. The tool uses these free endpoints to do everything except the actual file download. Once files are local, the experience is identical: extraction, load order, deployment, status tracking, and updates all work the same way.
 
 ### Free account workflow
 
 ```bash
-# 1. Sync the collection - fetches metadata and prints download links
+# 1. Sync the collection - fetches metadata, caches manifest, prints download links
 nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 
 # 2. You'll see a table like:
@@ -287,7 +287,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 ## How it works
 
 - **serve** - Launches a local web UI for managing mods from your browser.
-- **sync** - Fetches the collection from the Nexus API, downloads each mod (Premium) or prints browser download links (free), extracts archives, parses the collection manifest, and generates load order files.
+- **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod, extracts archives, generates load order. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
 - **add-local** - Registers an already-present mod in the state without downloading anything.

@@ -175,7 +175,7 @@ nexus-dl sync --skip-optional "https://next.nexusmods.com/baldursgate3/collectio
 
 ## If you have a free account
 
-If you don't have Nexus Mods Premium, the tool still does most of the work for you. The only difference is that you download the actual mod files yourself through the browser (Nexus shows a countdown timer for free downloads). The tool handles everything else: figuring out which mods to get, where to find them, extracting archives, generating load order, and tracking state.
+If you don't have Nexus Mods Premium, the tool does everything except the actual file download. You download the mod files yourself through the browser (Nexus shows a countdown timer for free downloads), and the tool handles the rest: figuring out which mods to get, where to find them, extracting archives, generating load order, tracking state, and deployment. Once files are local, everything works identically to Premium.
 
 ### Step 1: Sync the collection
 
@@ -185,7 +185,7 @@ Run the same sync command as Premium users:
 nexus-dl sync "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
 ```
 
-Instead of downloading files, you'll see a table with the name of each mod, its filename, and a clickable URL:
+The tool fetches the collection metadata, caches the manifest for load order generation, and shows you a table with each mod's name, filename, and a clickable URL:
 
 ```
 Pending Downloads (manual)
@@ -222,7 +222,7 @@ Once all mods are imported (or whenever you're ready), deploy as usual:
 nexus-dl deploy ~/mods/bg3
 ```
 
-Everything from this point on works identically to Premium - status, updates, undeploy, etc.
+Everything works identically to Premium from here on - status, updates, undeploy, tracked mods, etc.
 
 ### Checking what's still pending
 
