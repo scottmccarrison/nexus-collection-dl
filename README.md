@@ -13,7 +13,7 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 ## Requirements
 
 - Python 3.10+
-- Nexus Mods **Premium** membership (required for API download links)
+- Nexus Mods account (free or Premium - see [Free vs Premium](#free-vs-premium-accounts) below)
 - `unrar` system package (only if the collection includes RAR archives)
 
 ## Installation
@@ -198,11 +198,54 @@ nexus-dl undeploy ~/mods/starfield
 
 Removes all symlinks/copies that were deployed and restores the game directory to its pre-mod state.
 
+### Import manually downloaded files
+
+```bash
+nexus-dl import ~/mods/starfield
+```
+
+Matches files you downloaded through the browser to pending mods, extracts archives, and regenerates load order. See [Free vs Premium](#free-vs-premium-accounts) below for the full workflow.
+
 ### View status
 
 ```bash
 nexus-dl status ~/mods/starfield
 ```
+
+## Free vs Premium accounts
+
+Both free and Premium Nexus Mods accounts work with `nexus-dl`. The difference is how mod files get downloaded.
+
+**Premium** accounts can download files directly through the API, so `sync`, `update`, and `add` handle everything automatically.
+
+**Free** accounts can't use the Nexus download API (this is a Nexus Mods restriction, not ours), but every other API endpoint works fine - collection metadata, mod info, file listings, tracked mods. The tool uses these free endpoints to do everything except the actual file download. Once files are local, the experience is identical: extraction, load order, deployment, status tracking, and updates all work the same way.
+
+### Free account workflow
+
+```bash
+# 1. Sync the collection - fetches metadata, caches manifest, prints download links
+nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
+
+# 2. You'll see a table like:
+#    Mod               | Filename              | Size    | URL
+#    Starfield SE      | StarfieldSE-1.2.zip   | 45.2 MB | https://www.nexusmods.com/...
+#    Better Textures   | BetterTex-v3.7z       | 120 MB  | https://www.nexusmods.com/...
+#    ...
+
+# 3. Click each URL, download through Nexus (free countdown timer), save files to ~/mods/starfield
+
+# 4. Import the downloaded files
+nexus-dl import ~/mods/starfield
+
+# 5. Deploy as usual
+nexus-dl deploy ~/mods/starfield
+```
+
+The `import` command matches downloaded files by filename (case-insensitive), extracts archives, updates the state, and regenerates load order. If some files are missing, it reports which mods are still pending.
+
+Re-running `sync` or `update` as a free user won't regress mods you've already imported - only new or changed mods show as pending.
+
+The web UI also supports this workflow: the dashboard shows a "Pending Downloads" card with clickable links, and an "Import Downloads" button.
 
 ## Load order
 
@@ -244,10 +287,11 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 ## How it works
 
 - **serve** - Launches a local web UI for managing mods from your browser.
-- **sync** - Fetches the collection from the Nexus API, downloads each mod, extracts archives, parses the collection manifest, and generates load order files.
+- **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod, extracts archives, generates load order. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
 - **add-local** - Registers an already-present mod in the state without downloading anything.
+- **import** - Matches manually downloaded files to pending mods, extracts archives, and regenerates load order. Used with free accounts after downloading files through the browser.
 - **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files.
 - **undeploy** - Removes all deployed files using the tracked manifest, restoring the game directory.
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.

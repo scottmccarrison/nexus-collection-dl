@@ -9,7 +9,7 @@ from rich.table import Table
 
 from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
-from .service import ModManagerService, _select_mod_file
+from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
 
 console = Console()
@@ -21,17 +21,56 @@ console = Console()
     envvar="NEXUS_API_KEY",
     help="Nexus Mods API key (or set NEXUS_API_KEY env var)",
 )
+@click.option(
+    "--free",
+    is_flag=True,
+    hidden=True,
+    help="Force free-user mode (for testing)",
+)
 @click.pass_context
-def main(ctx: click.Context, api_key: str | None) -> None:
+def main(ctx: click.Context, api_key: str | None, free: bool) -> None:
     """Download mod collections from Nexus Mods."""
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
-    ctx.obj["service"] = ModManagerService(api_key)
+    ctx.obj["force_free"] = free
+    ctx.obj["service"] = ModManagerService(api_key, force_free=free)
 
 
 def _cli_progress(event: str, pct: float, msg: str) -> None:
     """Print progress messages to Rich console."""
     console.print(f"[dim]{msg}[/dim]")
+
+
+def _print_pending_downloads(pending: list[PendingDownload], mods_dir: Path) -> None:
+    """Print a table of pending downloads with browser URLs."""
+    table = Table(title="Pending Downloads (manual)")
+    table.add_column("Mod", style="cyan")
+    table.add_column("Filename", style="green")
+    table.add_column("Size", style="dim")
+    table.add_column("URL")
+
+    for p in pending:
+        size_str = _format_size(p.size_bytes) if p.size_bytes else "-"
+        table.add_row(p.mod_name[:40], p.filename, size_str, p.browser_url)
+
+    console.print(table)
+    console.print(
+        f"\n[yellow]Free account detected.[/yellow] Download the files above through your browser, "
+        f"save them to [cyan]{mods_dir}[/cyan], then run:"
+    )
+    console.print(f"  [bold]nexus-dl import {mods_dir}[/bold]\n")
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
 @main.command()
@@ -72,15 +111,18 @@ def sync(
         for err in result.errors:
             console.print(f"[red]Error:[/red] {err}")
 
-    console.print(
-        f"\n[green]Successfully synced {result.mods_downloaded} mods "
-        f"({result.mods_extracted} extracted)![/green]"
-    )
-    if result.load_order_files:
-        for f in result.load_order_files:
-            console.print(f"  [green]Wrote[/green] {f}")
-    if result.tracked or result.untracked:
-        console.print(f"[dim]Tracked {result.tracked}, untracked {result.untracked} on Nexus.[/dim]")
+    if result.pending_downloads:
+        _print_pending_downloads(result.pending_downloads, mods_dir)
+    else:
+        console.print(
+            f"\n[green]Successfully synced {result.mods_downloaded} mods "
+            f"({result.mods_extracted} extracted)![/green]"
+        )
+        if result.load_order_files:
+            for f in result.load_order_files:
+                console.print(f"  [green]Wrote[/green] {f}")
+        if result.tracked or result.untracked:
+            console.print(f"[dim]Tracked {result.tracked}, untracked {result.untracked} on Nexus.[/dim]")
 
 
 @main.command()
@@ -158,15 +200,17 @@ def update(
         console.print("[green]Everything is up to date![/green]")
         return
 
-    if result.to_install:
-        console.print(f"\n[bold]Installed:[/bold] {len(result.to_install)} new mods")
-    if result.to_update:
-        console.print(f"[bold]Updated:[/bold] {len(result.to_update)} mods")
-    if result.errors:
-        for err in result.errors:
-            console.print(f"[red]Error:[/red] {err}")
-
-    console.print(f"\n[green]Update complete![/green]")
+    if result.pending_downloads:
+        _print_pending_downloads(result.pending_downloads, mods_dir)
+    else:
+        if result.to_install:
+            console.print(f"\n[bold]Installed:[/bold] {len(result.to_install)} new mods")
+        if result.to_update:
+            console.print(f"[bold]Updated:[/bold] {len(result.to_update)} mods")
+        if result.errors:
+            for err in result.errors:
+                console.print(f"[red]Error:[/red] {err}")
+        console.print(f"\n[green]Update complete![/green]")
 
 
 @main.command()
@@ -209,6 +253,7 @@ def status(ctx: click.Context, mods_dir: Path) -> None:
         "removed": "[red]Removed from collection[/red]",
         "installed": "[green]Installed[/green]",
         "manual": "[cyan]Manual[/cyan]",
+        "pending_download": "[yellow]Pending download[/yellow]",
     }
 
     for mod in result.mods:
@@ -393,7 +438,14 @@ def add(
         console.print(f"[red]Error:[/red] {result.error}")
         sys.exit(1)
 
-    console.print(f"[green]Added '{result.mod_name}' as manual mod (phase 999).[/green]")
+    if result.pending_download:
+        p = result.pending_download
+        console.print(f"[yellow]Free account - download manually:[/yellow]")
+        console.print(f"  [cyan]{p.mod_name}[/cyan]: {p.browser_url}")
+        console.print(f"\nSave to [cyan]{mods_dir}[/cyan], then run:")
+        console.print(f"  [bold]nexus-dl import {mods_dir}[/bold]")
+    else:
+        console.print(f"[green]Added '{result.mod_name}' as manual mod (phase 999).[/green]")
 
 
 @main.command(name="add-local")
@@ -424,6 +476,53 @@ def add_local(
         f"[green]Registered '{name}' as manual mod "
         f"(ID: {synthetic_id}, phase 999).[/green]"
     )
+
+
+@main.command(name="import")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
+@click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
+@click.pass_context
+def import_cmd(
+    ctx: click.Context,
+    mods_dir: Path,
+    no_load_order: bool,
+    no_extract: bool,
+) -> None:
+    """
+    Import manually downloaded files for pending mods.
+
+    MODS_DIR: Directory containing previously synced mods and downloaded files
+    """
+    svc = ctx.obj["service"]
+    try:
+        result = svc.import_downloads(
+            mods_dir,
+            no_load_order=no_load_order,
+            no_extract=no_extract,
+            on_progress=_cli_progress,
+        )
+    except StateError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        sys.exit(1)
+
+    if result.errors:
+        for err in result.errors:
+            console.print(f"[red]Error:[/red] {err}")
+
+    if result.matched == 0 and result.still_pending > 0:
+        console.print(f"[yellow]No matching files found.[/yellow] {result.still_pending} mods still pending.")
+        console.print("Make sure downloaded files are in the mods directory with their original filenames.")
+    else:
+        console.print(
+            f"\n[green]Imported {result.matched} mods "
+            f"({result.extracted} extracted).[/green]"
+        )
+        if result.still_pending > 0:
+            console.print(f"[yellow]{result.still_pending} mods still pending download.[/yellow]")
+        if result.load_order_files:
+            for f in result.load_order_files:
+                console.print(f"  [green]Wrote[/green] {f}")
 
 
 @main.group(name="track-sync")
@@ -484,9 +583,12 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     from .web import create_and_run
 
     api_key = ctx.obj["api_key"]
+    force_free = ctx.obj.get("force_free", False)
     console.print(f"[bold]Starting web UI on http://127.0.0.1:{port}[/bold]")
     console.print(f"[dim]Mods directory: {mods_dir}[/dim]")
-    create_and_run(api_key=api_key, mods_dir=mods_dir, port=port)
+    if force_free:
+        console.print(f"[yellow]Free-user mode forced[/yellow]")
+    create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
 
 
 if __name__ == "__main__":

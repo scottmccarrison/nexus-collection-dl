@@ -9,19 +9,20 @@ from flask import Flask, Response, jsonify, render_template, request
 from ..api import NexusAPIError
 from ..collection import CollectionParseError, ModParseError
 from ..service import ModManagerService
-from ..state import StateError
+from ..state import CollectionState, StateError
 from .tasks import TaskManager
 
 
-def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flask:
+def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_free: bool = False) -> Flask:
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config["MODS_DIR"] = mods_dir
     app.config["API_KEY"] = api_key
+    app.config["FORCE_FREE"] = force_free
 
     tasks = TaskManager()
 
     def get_service() -> ModManagerService:
-        return ModManagerService(api_key=app.config["API_KEY"])
+        return ModManagerService(api_key=app.config["API_KEY"], force_free=app.config["FORCE_FREE"])
 
     def get_mods_dir() -> Path:
         return Path(app.config["MODS_DIR"])
@@ -155,6 +156,44 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None) -> Flas
             return jsonify({"mod_id": mod_id, "name": name})
         except StateError as e:
             return jsonify({"error": str(e)}), 400
+
+    @app.route("/api/pending")
+    def api_pending():
+        svc = get_service()
+        try:
+            state = CollectionState(get_mods_dir())
+            state.load()
+            pending = state.get_pending_mods()
+            game_domain = state.game_domain
+            return jsonify({
+                "pending": [
+                    {
+                        "mod_id": ms.mod_id,
+                        "name": ms.name,
+                        "filename": ms.filename,
+                        "file_id": ms.file_id,
+                        "browser_url": ms.browser_url or f"https://www.nexusmods.com/{game_domain}/mods/{ms.mod_id}?tab=files&file_id={ms.file_id}",
+                    }
+                    for ms in pending
+                ]
+            })
+        except StateError:
+            return jsonify({"pending": []})
+
+    @app.route("/api/import", methods=["POST"])
+    def api_import():
+        task_id = tasks.create("import")
+        svc = get_service()
+        mods_path = get_mods_dir()
+
+        def progress_cb(event: str, pct: float, msg: str):
+            tasks.update_progress(task_id, pct, msg)
+
+        def run():
+            return svc.import_downloads(mods_path, on_progress=progress_cb)
+
+        tasks.run_in_background(task_id, run)
+        return jsonify({"task_id": task_id}), 202
 
     @app.route("/api/deploy", methods=["POST"])
     def api_deploy():

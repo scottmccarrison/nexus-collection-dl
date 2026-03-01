@@ -30,6 +30,8 @@ class ModState:
         phase: int = 0,
         requirements: list[int] | None = None,
         manual: bool = False,
+        download_status: str = "downloaded",
+        browser_url: str = "",
     ):
         self.mod_id = mod_id
         self.name = name
@@ -42,6 +44,8 @@ class ModState:
         self.phase = phase
         self.requirements = requirements
         self.manual = manual
+        self.download_status = download_status
+        self.browser_url = browser_url
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +59,8 @@ class ModState:
             "phase": self.phase,
             "requirements": self.requirements,
             "manual": self.manual,
+            "download_status": self.download_status,
+            "browser_url": self.browser_url,
         }
 
     @classmethod
@@ -71,6 +77,8 @@ class ModState:
             phase=data.get("phase", 0),
             requirements=data.get("requirements"),
             manual=data.get("manual", False),
+            download_status=data.get("download_status", "downloaded"),
+            browser_url=data.get("browser_url", ""),
         )
 
 
@@ -167,7 +175,15 @@ class CollectionState:
             filename=mod_info["filename"],
             optional=mod_info.get("optional", False),
             manual=mod_info.get("manual", False),
+            download_status=mod_info.get("download_status", "downloaded"),
+            browser_url=mod_info.get("browser_url", ""),
+            phase=mod_info.get("phase", 0),
+            requirements=mod_info.get("requirements"),
         )
+
+    def get_pending_mods(self) -> list[ModState]:
+        """Return mods with pending_download status."""
+        return [ms for ms in self.mods.values() if ms.download_status == "pending_download"]
 
     def remove_mod(self, mod_id: int) -> None:
         """Remove a mod from the state."""

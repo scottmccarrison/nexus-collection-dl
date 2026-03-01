@@ -62,6 +62,25 @@ class StatusResult:
 
 
 @dataclass
+class PendingDownload:
+    mod_id: int
+    mod_name: str
+    file_id: int
+    filename: str
+    size_bytes: int
+    browser_url: str
+
+
+@dataclass
+class ImportResult:
+    matched: int
+    extracted: int
+    still_pending: int
+    errors: list[str]
+    load_order_files: list[str]
+
+
+@dataclass
 class SyncResult:
     mods_downloaded: int
     mods_extracted: int
@@ -69,6 +88,7 @@ class SyncResult:
     load_order_files: list[str]
     tracked: int = 0
     untracked: int = 0
+    pending_downloads: list[PendingDownload] = field(default_factory=list)
 
 
 @dataclass
@@ -83,6 +103,7 @@ class UpdateResult:
     load_order_files: list[str]
     tracked: int = 0
     untracked: int = 0
+    pending_downloads: list[PendingDownload] = field(default_factory=list)
 
 
 @dataclass
@@ -102,6 +123,7 @@ class AddResult:
     file_name: str
     success: bool
     error: str = ""
+    pending_download: PendingDownload | None = None
 
 
 @dataclass
@@ -120,9 +142,16 @@ def _noop_progress(event: str, pct: float, msg: str) -> None:
 class ModManagerService:
     """Business logic for managing Nexus Mods collections."""
 
-    def __init__(self, api_key: str | None = None):
+    def __init__(self, api_key: str | None = None, force_free: bool = False):
         self._api_key = api_key
         self._api: NexusAPI | None = None
+        self._force_free = force_free
+
+    def _check_premium(self, user_info: dict) -> bool:
+        """Check if user has premium, respecting force_free override."""
+        if self._force_free:
+            return False
+        return user_info.get("is_premium", False)
 
     @property
     def api(self) -> NexusAPI:
@@ -156,6 +185,10 @@ class ModManagerService:
 
             for mod in up_to_date:
                 installed = state.get_mod(mod["mod_id"])
+                if installed and installed.download_status == "pending_download":
+                    mod_status = "pending_download"
+                else:
+                    mod_status = "up_to_date"
                 mod_statuses.append(ModStatus(
                     mod_id=mod["mod_id"],
                     name=mod["mod_name"],
@@ -164,7 +197,7 @@ class ModManagerService:
                     optional=mod.get("optional", False),
                     manual=False,
                     phase=installed.phase if installed else 0,
-                    status="up_to_date",
+                    status=mod_status,
                 ))
 
             for mod in to_update:
@@ -209,6 +242,7 @@ class ModManagerService:
         except (NexusAPIError, CollectionParseError):
             # Offline/no API - just show installed mods
             for mod_id, ms in state.mods.items():
+                status = "pending_download" if ms.download_status == "pending_download" else "installed"
                 mod_statuses.append(ModStatus(
                     mod_id=mod_id,
                     name=ms.name,
@@ -217,7 +251,7 @@ class ModManagerService:
                     optional=ms.optional,
                     manual=ms.manual,
                     phase=ms.phase,
-                    status="installed",
+                    status=status,
                 ))
 
         # Add manual mods that aren't already in the list
@@ -265,11 +299,10 @@ class ModManagerService:
         # Parse URL
         collection_info = parse_collection_url(collection_url)
 
-        # Validate premium
+        # Check premium status
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        if not user_info.get("is_premium", False):
-            raise NexusPremiumRequired("Premium membership required for direct downloads.")
+        is_premium = self._check_premium(user_info)
 
         # Fetch collection
         progress("fetch", 0.05, "Fetching collection data...")
@@ -295,7 +328,53 @@ class ModManagerService:
             game_domain=collection_data["game_domain"],
         )
 
-        # Download mods
+        if not is_premium:
+            # Free user: register mods as pending_download
+            progress("pending", 0.5, "Building pending download list...")
+            pending_downloads: list[PendingDownload] = []
+            game_domain = collection_data["game_domain"]
+            for mod in mods:
+                mod_id = mod["mod_id"]
+                # Don't regress already-downloaded mods
+                existing = state.get_mod(mod_id)
+                if existing and existing.download_status == "downloaded":
+                    continue
+                browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
+                size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
+                pending = PendingDownload(
+                    mod_id=mod_id,
+                    mod_name=mod["mod_name"],
+                    file_id=mod["file_id"],
+                    filename=mod.get("filename", ""),
+                    size_bytes=size_bytes,
+                    browser_url=browser_url,
+                )
+                pending_downloads.append(pending)
+                mod_info_dict = dict(mod)
+                mod_info_dict["download_status"] = "pending_download"
+                mod_info_dict["browser_url"] = browser_url
+                state.add_mod(mod_info_dict)
+
+            state.save()
+
+            # Cache manifest + generate load order even for free users
+            # (the manifest download is a public URL, doesn't need premium)
+            load_order_files: list[str] = []
+            if not no_load_order:
+                progress("loadorder", 0.8, "Caching manifest and generating load order...")
+                lo_files = self._generate_load_order(collection_data, mods_dir, state)
+                load_order_files = lo_files
+
+            progress("done", 1.0, f"Registered {len(pending_downloads)} mods for manual download")
+            return SyncResult(
+                mods_downloaded=0,
+                mods_extracted=0,
+                errors=errors,
+                load_order_files=load_order_files,
+                pending_downloads=pending_downloads,
+            )
+
+        # Premium user: download directly
         total_mods = len(mods)
         downloader = Downloader(self.api)
 
@@ -366,7 +445,7 @@ class ModManagerService:
 
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        is_premium = user_info.get("is_premium", False)
+        is_premium = self._check_premium(user_info)
 
         collection_info = parse_collection_url(state.collection_url)
 
@@ -383,33 +462,57 @@ class ModManagerService:
         to_install, to_update, up_to_date, to_remove = state.compare_with_collection(mods)
 
         downloaded = 0
-        if (to_install or to_update) and is_premium:
+        pending_downloads: list[PendingDownload] = []
+        if to_install or to_update:
             mods_to_download = to_install + to_update
-            downloader = Downloader(self.api)
+            if is_premium:
+                downloader = Downloader(self.api)
 
-            def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
-                if total_bytes > 0:
-                    pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                    progress("download", pct, f"Downloading...")
+                def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                    if total_bytes > 0:
+                        pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
+                        progress("download", pct, f"Downloading...")
 
-            progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
-            results = downloader.download_mods(
-                game_domain=collection_data["game_domain"],
-                mods=mods_to_download,
-                target_dir=mods_dir,
-                on_progress=on_download_progress,
-            )
+                progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
+                results = downloader.download_mods(
+                    game_domain=collection_data["game_domain"],
+                    mods=mods_to_download,
+                    target_dir=mods_dir,
+                    on_progress=on_download_progress,
+                )
 
-            progress("extract", 0.75, "Extracting archives...")
-            for mod_info, file_path in results:
-                try:
-                    if not no_extract and is_archive(file_path):
-                        extract_archive(file_path, mods_dir)
-                        file_path.unlink()
-                    state.add_mod(mod_info)
-                    downloaded += 1
-                except ExtractionError as e:
-                    errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                progress("extract", 0.75, "Extracting archives...")
+                for mod_info, file_path in results:
+                    try:
+                        if not no_extract and is_archive(file_path):
+                            extract_archive(file_path, mods_dir)
+                            file_path.unlink()
+                        state.add_mod(mod_info)
+                        downloaded += 1
+                    except ExtractionError as e:
+                        errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+            else:
+                # Free user: register as pending
+                game_domain = collection_data["game_domain"]
+                for mod in mods_to_download:
+                    mod_id = mod["mod_id"]
+                    existing = state.get_mod(mod_id)
+                    if existing and existing.download_status == "downloaded":
+                        continue
+                    browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
+                    size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
+                    pending_downloads.append(PendingDownload(
+                        mod_id=mod_id,
+                        mod_name=mod["mod_name"],
+                        file_id=mod["file_id"],
+                        filename=mod.get("filename", ""),
+                        size_bytes=size_bytes,
+                        browser_url=browser_url,
+                    ))
+                    mod_info_dict = dict(mod)
+                    mod_info_dict["download_status"] = "pending_download"
+                    mod_info_dict["browser_url"] = browser_url
+                    state.add_mod(mod_info_dict)
 
         state.collection_revision = new_revision
         state.save()
@@ -432,6 +535,7 @@ class ModManagerService:
             load_order_files=load_order_files,
             tracked=tracked,
             untracked=untracked,
+            pending_downloads=pending_downloads,
         )
 
     def add_mod(
@@ -461,11 +565,7 @@ class ModManagerService:
 
         progress("init", 0.0, "Validating API key...")
         user_info = self.api.validate_key()
-        if not user_info.get("is_premium", False):
-            return AddResult(
-                mod_name="", mod_id=mod_info.mod_id, file_name="",
-                success=False, error="Premium membership required"
-            )
+        is_premium = self._check_premium(user_info)
 
         progress("fetch", 0.1, "Fetching mod info...")
         nexus_mod = self.api.get_mod_info(mod_info.game_domain, mod_info.mod_id)
@@ -496,10 +596,34 @@ class ModManagerService:
             "file_id": selected_file_id,
             "filename": selected.get("file_name", selected_name),
             "version": selected_version,
-            "size_bytes": selected.get("size_in_bytes") or selected.get("size", 0),
+            "size_bytes": int(selected.get("size_in_bytes") or selected.get("size", 0) or 0),
             "optional": False,
             "requirements": [],
         }
+
+        if not is_premium:
+            # Free user: register as pending download
+            browser_url = f"https://www.nexusmods.com/{mod_info.game_domain}/mods/{mod_info.mod_id}?tab=files&file_id={selected_file_id}"
+            download_info["manual"] = True
+            download_info["download_status"] = "pending_download"
+            download_info["browser_url"] = browser_url
+            state.add_mod(download_info)
+            state.mods[mod_info.mod_id].phase = 999
+            state.save()
+
+            pending = PendingDownload(
+                mod_id=mod_info.mod_id,
+                mod_name=mod_name,
+                file_id=selected_file_id,
+                filename=download_info["filename"],
+                size_bytes=download_info["size_bytes"],
+                browser_url=browser_url,
+            )
+            progress("done", 1.0, f"Registered {mod_name} for manual download")
+            return AddResult(
+                mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
+                success=True, pending_download=pending,
+            )
 
         def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
             if total_bytes > 0:
@@ -731,6 +855,77 @@ class ModManagerService:
         state = CollectionState(mods_dir)
         state.load()
         return self._sync_tracked_mods(state)
+
+    def import_downloads(
+        self,
+        mods_dir: Path,
+        no_load_order: bool = False,
+        no_extract: bool = False,
+        on_progress: ProgressCallback | None = None,
+    ) -> ImportResult:
+        """Match manually downloaded files to pending mods, extract, and update state."""
+        progress = on_progress or _noop_progress
+        errors: list[str] = []
+
+        state = CollectionState(mods_dir)
+        state.load()
+
+        pending = state.get_pending_mods()
+        if not pending:
+            return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
+
+        # Build filename lookup (case-insensitive)
+        files_on_disk = {f.name.lower(): f for f in mods_dir.iterdir() if f.is_file()}
+
+        matched = 0
+        extracted = 0
+        progress("import", 0.1, f"Scanning for {len(pending)} pending downloads...")
+
+        for i, mod_state in enumerate(pending):
+            filename_lower = mod_state.filename.lower()
+            if filename_lower not in files_on_disk:
+                continue
+
+            file_path = files_on_disk[filename_lower]
+            matched += 1
+
+            try:
+                if not no_extract and is_archive(file_path):
+                    extract_archive(file_path, mods_dir)
+                    file_path.unlink()
+                    extracted += 1
+            except ExtractionError as e:
+                errors.append(f"Extraction error for {mod_state.name}: {e}")
+                continue
+
+            mod_state.download_status = "downloaded"
+            mod_state.browser_url = ""
+            mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+            pct = 0.1 + 0.8 * ((i + 1) / len(pending))
+            progress("import", pct, f"Imported {mod_state.name}")
+
+        state.save()
+
+        # Regenerate load order if any mods were matched
+        load_order_files: list[str] = []
+        if matched > 0 and not no_load_order:
+            progress("loadorder", 0.95, "Regenerating load order...")
+            load_order_files = self._regen_load_order_from_state(mods_dir, state)
+
+        # Sync tracked mods (same as premium sync does after downloading)
+        if matched > 0:
+            self._maybe_sync_tracked(state)
+
+        still_pending = len(state.get_pending_mods())
+        progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")
+
+        return ImportResult(
+            matched=matched,
+            extracted=extracted,
+            still_pending=still_pending,
+            errors=errors,
+            load_order_files=load_order_files,
+        )
 
     # -- internal helpers --
 

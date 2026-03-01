@@ -17,6 +17,24 @@ document.addEventListener('alpine:init', () => {
         }
     }));
 
+    /* Pending downloads store */
+    Alpine.data('pendingStore', () => ({
+        pendingMods: [],
+
+        init() {
+            this.fetchPending();
+        },
+
+        fetchPending() {
+            fetch('/api/pending')
+            .then(r => r.json())
+            .then(data => {
+                this.pendingMods = data.pending || [];
+            })
+            .catch(() => { this.pendingMods = []; });
+        }
+    }));
+
     /* Task store - handles background task execution + SSE progress */
     Alpine.data('taskStore', () => ({
         running: false,
@@ -148,6 +166,9 @@ document.addEventListener('alpine:init', () => {
                 this.showToast('Operation completed', 'success');
                 es.close();
                 this.eventSource = null;
+                // Refresh pending downloads list and reload dashboard
+                this.refreshPending();
+                setTimeout(() => location.reload(), 1500);
             });
 
             es.addEventListener('error', (e) => {
@@ -187,6 +208,16 @@ document.addEventListener('alpine:init', () => {
             .catch(() => {
                 this.running = false;
                 this.showToast('Lost connection to server', 'error');
+            });
+        },
+
+        refreshPending() {
+            // Trigger a refresh on any pendingStore instances
+            document.querySelectorAll('[x-data="pendingStore"]').forEach(el => {
+                if (el._x_dataStack) {
+                    const store = el._x_dataStack[0];
+                    if (store && store.fetchPending) store.fetchPending();
+                }
             });
         },
 
