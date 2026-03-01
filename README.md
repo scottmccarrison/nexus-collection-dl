@@ -8,6 +8,8 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 `nexus-dl` fills that gap. Point it at a collection URL, and it downloads every mod, extracts archives, generates a load order, and tracks versions so you can update later.
 
+**New to the command line?** Check out the [Beginner's Guide](GUIDE.md) for a full walkthrough.
+
 ## Requirements
 
 - Python 3.10+
