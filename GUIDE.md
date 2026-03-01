@@ -242,27 +242,43 @@ nexus-dl undeploy ~/mods/bg3
 
 ## Using the web UI
 
-If you prefer a visual interface over typing commands, the tool includes a local web dashboard:
+If you do not want to memorize terminal commands, the web UI is probably the better option for day-to-day mod management. The CLI is faster for one-off operations and scripting, but the web UI lets you do almost everything from a browser with real-time progress feedback.
+
+To start it:
 
 ```bash
 nexus-dl serve ~/mods/bg3
 ```
 
-This starts a local web server. Open your browser and go to:
-
-```
-http://127.0.0.1:5000
-```
-
-From the dashboard you can sync collections, update mods, deploy, and manage your mod list - all by clicking buttons instead of typing commands.
-
-To use a different port:
+Then open your browser to `http://127.0.0.1:5000`. To use a different port:
 
 ```bash
 nexus-dl serve ~/mods/bg3 --port 8080
 ```
 
-Press `Ctrl + C` in the terminal to stop the web server when you're done.
+### What you get
+
+The web UI has two pages:
+
+**Dashboard** - Shows your collection at a glance: collection name, game, installed revision, how many mods, whether updates are available, and deployment status. From here you can sync a collection (paste the URL into a text box), update, deploy, undeploy, regenerate the load order, and manage tracked-mod sync. All with buttons instead of commands.
+
+**Mods** - Lists every installed mod with status badges (up to date, update available, removed from collection, manual, etc.), version numbers, and load phases. You can add a mod by URL or register a local mod from this page.
+
+### Real-time progress
+
+Long-running operations (syncing a big collection, downloading updates) stream progress to the browser in real time. You will see a progress bar and status messages as each mod downloads. This is one area where the web UI is nicer than the CLI, which just prints log lines.
+
+### CLI vs. web UI
+
+Both interfaces share the same code underneath, so the results are identical. The main differences:
+
+- The CLI has `--dry-run` for deploy and update (preview without acting). The web UI does not.
+- The CLI has `--no-load-order` and `--prefix` flags for more granular control.
+- The web UI shows progress bars and visual status badges. The CLI prints text.
+
+If you are just getting started, the web UI is the easier path. You only need the terminal to run `nexus-dl serve` and then everything else happens in the browser.
+
+Press `Ctrl + C` in the terminal to stop the web server when you are done.
 
 ## The --no-extract flag
 
