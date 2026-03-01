@@ -1,0 +1,80 @@
+name: Bug Report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. Please fill out the sections below so we can reproduce the issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+      placeholder: "When I run `nexus-dl sync ...`, it fails with ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What commands or actions trigger the bug?
+      placeholder: |
+        1. Run `nexus-dl sync "https://..." ~/mods/starfield`
+        2. Wait for downloads to complete
+        3. See error in terminal
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: nexus-dl version
+      description: "Run `nexus-dl --version` or `pip show nexus-collection-dl`"
+      placeholder: "0.1.0"
+
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Installation method
+      options:
+        - Docker
+        - setup.sh
+        - Manual (pip install)
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Ubuntu 24.04 / Fedora 41 / macOS 15"
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+
+  - type: dropdown
+    id: account-type
+    attributes:
+      label: Nexus Mods account type
+      options:
+        - Premium
+        - Free
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste any error messages or tracebacks here.
+      render: shell
