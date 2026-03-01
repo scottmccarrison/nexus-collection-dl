@@ -39,6 +39,7 @@ def _cli_progress(event: str, pct: float, msg: str) -> None:
 @click.argument("mods_dir", type=click.Path(path_type=Path))
 @click.option("--skip-optional", is_flag=True, help="Skip optional mods")
 @click.option("--no-load-order", is_flag=True, help="Skip load order generation")
+@click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
 @click.pass_context
 def sync(
     ctx: click.Context,
@@ -46,6 +47,7 @@ def sync(
     mods_dir: Path,
     skip_optional: bool,
     no_load_order: bool,
+    no_extract: bool,
 ) -> None:
     """
     Download a collection to the specified directory.
@@ -59,6 +61,7 @@ def sync(
             collection_url, mods_dir,
             skip_optional=skip_optional,
             no_load_order=no_load_order,
+            no_extract=no_extract,
             on_progress=_cli_progress,
         )
     except (NexusAPIError, CollectionParseError, StateError) as e:
@@ -85,6 +88,7 @@ def sync(
 @click.option("--skip-optional", is_flag=True, help="Skip optional mods")
 @click.option("--dry-run", is_flag=True, help="Show what would be updated without downloading")
 @click.option("--no-load-order", is_flag=True, help="Skip load order generation")
+@click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -92,6 +96,7 @@ def update(
     skip_optional: bool,
     dry_run: bool,
     no_load_order: bool,
+    no_extract: bool,
 ) -> None:
     """
     Check for and download updated mods.
@@ -142,6 +147,7 @@ def update(
             mods_dir,
             skip_optional=skip_optional,
             no_load_order=no_load_order,
+            no_extract=no_extract,
             on_progress=_cli_progress,
         )
     except (NexusAPIError, CollectionParseError, StateError) as e:
@@ -354,6 +360,7 @@ def undeploy(ctx: click.Context, mods_dir: Path) -> None:
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option("--file-id", type=int, default=None, help="Specific file ID to download")
 @click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
+@click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
 @click.pass_context
 def add(
     ctx: click.Context,
@@ -361,6 +368,7 @@ def add(
     mods_dir: Path,
     file_id: int | None,
     no_load_order: bool,
+    no_extract: bool,
 ) -> None:
     """
     Add a single mod by URL.
@@ -374,6 +382,7 @@ def add(
             mod_url, mods_dir,
             file_id=file_id,
             no_load_order=no_load_order,
+            no_extract=no_extract,
             on_progress=_cli_progress,
         )
     except (NexusAPIError, ModParseError, StateError) as e:
