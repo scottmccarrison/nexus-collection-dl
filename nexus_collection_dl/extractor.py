@@ -50,9 +50,26 @@ def detect_archive_type(filepath: Path) -> str | None:
     return None
 
 
+def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
+    """Move all files from staging directory to target, preserving structure."""
+    moved_files = []
+    for src in staging_dir.rglob("*"):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(staging_dir)
+        dest = target_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dest))
+        moved_files.append(dest)
+    return moved_files
+
+
 def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
     """
     Extract an archive to the target directory.
+
+    Uses a staging directory to avoid conflicts when the archive contains
+    a top-level folder matching the archive filename.
 
     Returns list of extracted file paths.
     """
@@ -61,18 +78,33 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         raise ExtractionError(f"Unknown archive type: {archive_path}")
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = target_dir / f".extracting_{archive_path.stem}"
 
     try:
+        # Clean up any leftover staging dir from a previous failed run
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        staging_dir.mkdir()
+
         if archive_type == "zip":
-            return _extract_zip(archive_path, target_dir)
+            extracted = _extract_zip(archive_path, staging_dir)
         elif archive_type == "7z":
-            return _extract_7z(archive_path, target_dir)
+            extracted = _extract_7z(archive_path, staging_dir)
         elif archive_type == "rar":
-            return _extract_rar(archive_path, target_dir)
+            extracted = _extract_rar(archive_path, staging_dir)
+        else:
+            extracted = []
+
+        # Move extracted files from staging to target
+        final_files = _move_staging_contents(staging_dir, target_dir)
+        return final_files
+
     except Exception as e:
         raise ExtractionError(f"Failed to extract {archive_path}: {e}")
-
-    return []
+    finally:
+        # Always clean up staging dir
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
 
 
 def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
