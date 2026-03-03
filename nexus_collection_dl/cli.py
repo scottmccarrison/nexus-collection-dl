@@ -27,13 +27,23 @@ console = Console()
     hidden=True,
     help="Force free-user mode (for testing)",
 )
+@click.option(
+    "--skip-update-check",
+    is_flag=True,
+    hidden=True,
+    help="Skip automatic version check",
+)
 @click.pass_context
-def main(ctx: click.Context, api_key: str | None, free: bool) -> None:
+def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check: bool) -> None:
     """Download mod collections from Nexus Mods."""
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
     ctx.obj["force_free"] = free
     ctx.obj["service"] = ModManagerService(api_key, force_free=free)
+
+    if not skip_update_check:
+        from .updater import check_and_prompt_update
+        check_and_prompt_update(console)
 
 
 def _cli_progress(event: str, pct: float, msg: str) -> None:
