@@ -307,6 +307,8 @@ class ModManagerService:
 
         # Parse URL
         collection_info = parse_collection_url(collection_url)
+        mods_dir = mods_dir / collection_info.slug
+        mods_dir.mkdir(parents=True, exist_ok=True)
 
         # Check premium status
         progress("init", 0.0, "Validating API key...")

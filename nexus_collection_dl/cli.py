@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .api import NexusAPIError
-from .collection import CollectionParseError, ModParseError
+from .collection import CollectionParseError, ModParseError, parse_collection_url
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
 
@@ -108,6 +108,9 @@ def sync(
     except (NexusAPIError, CollectionParseError, StateError) as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
+
+    resolved_dir = mods_dir / parse_collection_url(collection_url).slug
+    console.print(f"[dim]Collection directory: {resolved_dir}[/dim]")
 
     if result.errors:
         for err in result.errors:
