@@ -181,11 +181,22 @@ class NexusAPI:
                 }
             )
 
+        # Deduplicate by mod_id, keeping the last occurrence so the
+        # collection's intended load order wins when the same mod appears
+        # multiple times (patches, updates, revised entries).
+        seen: dict[int, int] = {}
+        for i, mod in enumerate(mods):
+            seen[mod["mod_id"]] = i
+        unique_indices = set(seen.values())
+        dupes_removed = len(mods) - len(unique_indices)
+        mods = [m for i, m in enumerate(mods) if i in unique_indices]
+
         return {
             "id": collection.get("id"),
             "slug": collection.get("slug"),
             "name": collection.get("name"),
             "summary": collection.get("summary"),
+            "duplicates_removed": dupes_removed,
             "game_domain": actual_game,
             "revision": revision.get("revisionNumber"),
             "download_link": download_link,
