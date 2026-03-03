@@ -118,6 +118,7 @@ class Downloader:
         Returns list of (mod_info, downloaded_path) tuples.
         """
         results = []
+        total_mods = len(mods)
 
         with Progress(
             TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
@@ -127,15 +128,19 @@ class Downloader:
             TransferSpeedColumn(),
             TimeRemainingColumn(),
         ) as progress:
-            for mod in mods:
+            for i, mod in enumerate(mods, 1):
                 filename = mod["filename"]
                 # Ensure size is an int (API may return string)
                 size_bytes = mod.get("size_bytes") or 0
                 if isinstance(size_bytes, str):
                     size_bytes = int(size_bytes) if size_bytes.isdigit() else 0
+
+                progress.console.print(
+                    f"[dim]({i}/{total_mods})[/dim] {filename}"
+                )
                 task_id = progress.add_task(
                     "download",
-                    filename=filename[:40],  # Truncate long names
+                    filename=filename[:40],
                     total=size_bytes,
                 )
 
@@ -148,14 +153,15 @@ class Downloader:
                         task_id=task_id,
                         on_progress=on_progress,
                     )
+                    progress.remove_task(task_id)
                     results.append((mod, downloaded_path))
 
                     if on_complete:
                         on_complete(mod, downloaded_path)
 
                 except DownloadError as e:
+                    progress.remove_task(task_id)
                     progress.console.print(f"[red]Error:[/red] {e}")
-                    # Continue with other downloads
 
         return results
 
