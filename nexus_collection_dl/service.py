@@ -349,7 +349,7 @@ class ModManagerService:
                 mod_id = mod["mod_id"]
                 # Don't regress already-downloaded mods
                 existing = state.get_mod(mod_id)
-                if existing and existing.download_status == "downloaded":
+                if existing and existing.download_status == "downloaded" and existing.file_id == mod["file_id"]:
                     continue
                 browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
                 size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
@@ -387,21 +387,38 @@ class ModManagerService:
             )
 
         # Premium user: download directly
-        total_mods = len(mods)
+        # Skip mods already downloaded with matching file_id
+        if state.mods:
+            to_install, to_update, up_to_date, _ = state.compare_with_collection(mods)
+            mods_to_download = to_install + to_update
+            skipped = len(up_to_date)
+            if skipped:
+                progress("download", 0.1, f"Skipping {skipped} already-downloaded mods")
+            # Re-register up-to-date mods in state so they stay tracked
+            for mod in up_to_date:
+                state.add_mod(mod)
+        else:
+            mods_to_download = mods
+            skipped = 0
+
+        total_mods = len(mods_to_download)
         downloader = Downloader(self.api)
 
-        def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
-            if total_bytes > 0:
-                pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                progress("download", pct, f"Downloading... ({bytes_dl}/{total_bytes} bytes)")
+        if not mods_to_download:
+            results = []
+        else:
+            def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                if total_bytes > 0:
+                    pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
+                    progress("download", pct, f"Downloading... ({bytes_dl}/{total_bytes} bytes)")
 
-        progress("download", 0.1, f"Downloading {total_mods} mods...")
-        results = downloader.download_mods(
-            game_domain=collection_data["game_domain"],
-            mods=mods,
-            target_dir=mods_dir,
-            on_progress=on_download_progress,
-        )
+            progress("download", 0.1, f"Downloading {total_mods} mods...")
+            results = downloader.download_mods(
+                game_domain=collection_data["game_domain"],
+                mods=mods_to_download,
+                target_dir=mods_dir,
+                on_progress=on_download_progress,
+            )
 
         # Extract archives
         progress("extract", 0.75, "Extracting archives...")
@@ -428,7 +445,8 @@ class ModManagerService:
 
         # Track sync
         tracked, untracked = self._maybe_sync_tracked(state)
-        progress("done", 1.0, f"Synced {len(results)} mods successfully")
+        skip_msg = f", {skipped} skipped" if skipped else ""
+        progress("done", 1.0, f"Synced {len(results)} mods successfully{skip_msg}")
 
         return SyncResult(
             mods_downloaded=len(results),
