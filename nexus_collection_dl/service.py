@@ -311,6 +311,9 @@ class ModManagerService:
         )
 
         mods = collection_data["mods"]
+        dupes = collection_data.get("duplicates_removed", 0)
+        if dupes:
+            progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
         if skip_optional:
             mods = [m for m in mods if not m.get("optional", False)]
 
@@ -456,6 +459,9 @@ class ModManagerService:
 
         new_revision = collection_data["revision"]
         mods = collection_data["mods"]
+        dupes = collection_data.get("duplicates_removed", 0)
+        if dupes:
+            progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
         if skip_optional:
             mods = [m for m in mods if not m.get("optional", False)]
 
