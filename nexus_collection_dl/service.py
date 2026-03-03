@@ -1,5 +1,6 @@
 """Service layer - business logic extracted from CLI for programmatic use."""
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +29,7 @@ from .loot_sort import (
 )
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
 from .state import CollectionState, StateError
-from .steam import find_game_dir, find_proton_prefix
+from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
 
 # progress callback: (event_type, percentage 0-1, message)
@@ -107,6 +108,13 @@ class UpdateResult:
 
 
 @dataclass
+class DeployWarning:
+    code: str
+    message: str
+    severity: str  # "error" or "warning"
+
+
+@dataclass
 class DeployResult:
     deployed_count: int
     conflicts: list[str]
@@ -114,6 +122,7 @@ class DeployResult:
     game_dir: str
     has_sfse: bool
     skipped: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -726,6 +735,85 @@ class ModManagerService:
             for f in files
         ]
 
+    def pre_deploy_checks(
+        self, state: "CollectionState", game_dir: Path, mods_dir: Path, method: str
+    ) -> list["DeployWarning"]:
+        """Run pre-deployment validation checks."""
+        warnings: list[DeployWarning] = []
+
+        # 1. Proton prefix missing
+        if find_proton_prefix(state.game_domain) is None and not state.proton_prefix:
+            warnings.append(DeployWarning(
+                "no_prefix", "Proton prefix not found - plugins.txt and INI won't be written", "warning"
+            ))
+
+        # 2. No mods extracted
+        mod_files = [f for f in mods_dir.iterdir() if f.is_file() or f.is_dir()]
+        # Filter out state file
+        mod_files = [f for f in mod_files if f.name != ".nexus-state.json"]
+        if not mod_files:
+            warnings.append(DeployWarning(
+                "no_mods", "No mods found in mods directory", "error"
+            ))
+
+        # 3. Game dir not writable
+        if not os.access(game_dir, os.W_OK):
+            warnings.append(DeployWarning(
+                "not_writable", f"Game directory is not writable: {game_dir}", "error"
+            ))
+
+        # 4. Symlinks not supported (only check if using symlink method)
+        if method == "symlink":
+            test_link = game_dir / ".nexus_symlink_test"
+            try:
+                test_link.symlink_to(mods_dir)
+                test_link.unlink()
+            except OSError:
+                warnings.append(DeployWarning(
+                    "no_symlinks",
+                    "Filesystem does not support symlinks - use --copy instead",
+                    "error",
+                ))
+
+        # 5. Pending downloads
+        pending = state.get_pending_mods()
+        if pending:
+            warnings.append(DeployWarning(
+                "pending_downloads",
+                f"{len(pending)} mod(s) still pending download",
+                "warning",
+            ))
+
+        # 6. Game not in auto-detect
+        if state.game_domain not in STEAM_APP_IDS and not state.game_dir:
+            warnings.append(DeployWarning(
+                "unknown_game",
+                f"Game '{state.game_domain}' not in auto-detect list - game dir must be set manually",
+                "error",
+            ))
+
+        # 7. Stale deployment
+        if state.deployed_at and state.game_dir:
+            game_path = Path(state.game_dir)
+            # Check common game executables
+            for exe_name in ["Starfield.exe", "SkyrimSE.exe", "Fallout4.exe"]:
+                exe = game_path / exe_name
+                if exe.exists():
+                    import datetime
+                    exe_mtime = datetime.datetime.fromtimestamp(
+                        exe.stat().st_mtime, tz=datetime.timezone.utc
+                    )
+                    deployed = datetime.datetime.fromisoformat(state.deployed_at)
+                    if exe_mtime > deployed:
+                        warnings.append(DeployWarning(
+                            "stale_deploy",
+                            "Game executable was modified after last deployment - consider redeploying",
+                            "warning",
+                        ))
+                    break
+
+        return warnings
+
     def deploy(
         self,
         mods_dir: Path,
@@ -748,10 +836,23 @@ class ModManagerService:
             progress("detect", 0.05, "Detecting game directory from Steam...")
             game_dir = find_game_dir(game_domain)
             if game_dir is None:
-                return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False)
+                return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False, warnings=[])
 
         if not game_dir.exists():
-            return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False)
+            return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=[])
+
+        # Pre-deploy validation
+        method = "copy" if use_copy else "symlink"
+        check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method)
+        deploy_warnings = [w.message for w in check_warnings]
+
+        # Block on errors
+        errors_found = [w for w in check_warnings if w.severity == "error"]
+        if errors_found:
+            return DeployResult(
+                0, [], [w.message for w in errors_found], str(game_dir), False,
+                warnings=deploy_warnings,
+            )
 
         # Resolve Proton prefix
         if prefix is None and state.proton_prefix:
@@ -776,10 +877,9 @@ class ModManagerService:
         plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
 
         if plan.total_files == 0:
-            return DeployResult(0, [], [], str(game_dir), False, skipped=len(plan.skipped))
+            return DeployResult(0, [], [], str(game_dir), False, skipped=len(plan.skipped), warnings=deploy_warnings)
 
         # Deploy
-        method = "copy" if use_copy else "symlink"
         progress("deploy", 0.3, f"Deploying {plan.total_files} files via {method}...")
         result = deploy_files(plan, game_dir, method=method, dry_run=False)
 
@@ -814,6 +914,7 @@ class ModManagerService:
             game_dir=str(game_dir),
             has_sfse=has_sfse,
             skipped=len(result.skipped),
+            warnings=deploy_warnings,
         )
 
     def undeploy(self, mods_dir: Path) -> int:

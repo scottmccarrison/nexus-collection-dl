@@ -374,6 +374,10 @@ def deploy(
         if len(result.conflicts) > 10:
             console.print(f"  ... and {len(result.conflicts) - 10} more")
 
+    if result.warnings:
+        for w in result.warnings:
+            console.print(f"  [yellow]Warning:[/yellow] {w}")
+
     console.print(
         f"\n[green]Deployed {result.deployed_count} files "
         f"({len(result.conflicts)} conflicts, {len(result.errors)} errors)[/green]"
