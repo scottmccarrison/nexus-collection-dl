@@ -335,7 +335,13 @@ def deploy(
             console.print("[red]Error:[/red] Could not find game directory.")
             sys.exit(1)
 
-        plan = classify_files(mods_dir, state.game_domain)
+        # Load manifest choices for FOMOD filtering
+        manifest_choices = {}
+        if state.manifest_data:
+            from .manifest import CollectionManifest
+            manifest = CollectionManifest.from_dict(state.manifest_data)
+            manifest_choices = manifest.mod_choices
+        plan = classify_files(mods_dir, state.game_domain, mod_choices=manifest_choices)
         console.print(f"  Game root files: {len(plan.game_root_files)}")
         console.print(f"  Data files: {len(plan.data_files)}")
         console.print(f"  Skipped: {len(plan.skipped)}")
