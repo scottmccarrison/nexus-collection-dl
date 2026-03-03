@@ -25,6 +25,7 @@ class CollectionManifest:
         plugin_rules: list[dict[str, Any]],
         mod_phases: dict[int, int],  # mod_id -> phase
         logical_name_to_mod_id: dict[str, int] | None = None,
+        mod_choices: dict[int, dict] | None = None,
     ):
         self.mod_rules = mod_rules
         self.plugins = plugins
@@ -32,6 +33,7 @@ class CollectionManifest:
         self.mod_phases = mod_phases
         # Maps logicalFilename -> modId for resolving mod rules
         self.logical_name_to_mod_id = logical_name_to_mod_id or {}
+        self.mod_choices = mod_choices or {}
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize for state storage."""
@@ -41,6 +43,7 @@ class CollectionManifest:
             "plugin_rules": self.plugin_rules,
             "mod_phases": {str(k): v for k, v in self.mod_phases.items()},
             "logical_name_to_mod_id": self.logical_name_to_mod_id,
+            "mod_choices": {str(k): v for k, v in self.mod_choices.items()},
         }
 
     @classmethod
@@ -55,6 +58,7 @@ class CollectionManifest:
                 k: int(v)
                 for k, v in data.get("logical_name_to_mod_id", {}).items()
             },
+            mod_choices={int(k): v for k, v in data.get("mod_choices", {}).items()},
         )
 
 
@@ -152,6 +156,7 @@ def _parse_collection_json(data: dict[str, Any]) -> CollectionManifest:
     # Build mod_id -> phase mapping and logicalFilename -> modId lookup
     mod_phases: dict[int, int] = {}
     logical_name_to_mod_id: dict[str, int] = {}
+    mod_choices: dict[int, dict] = {}
     for mod_entry in data.get("mods", []):
         source = mod_entry.get("source", {})
         mod_id = source.get("modId")
@@ -162,6 +167,10 @@ def _parse_collection_json(data: dict[str, Any]) -> CollectionManifest:
             logical = source.get("logicalFilename", "")
             if logical:
                 logical_name_to_mod_id[logical] = int(mod_id)
+
+        choices = mod_entry.get("choices")
+        if choices and mod_id is not None:
+            mod_choices[int(mod_id)] = choices
 
     # Plugin load order: prefer "loadOrder" (has actual ESM/ESP entries with
     # enabled status) over "plugins" (often empty)
@@ -186,4 +195,5 @@ def _parse_collection_json(data: dict[str, Any]) -> CollectionManifest:
         plugin_rules=plugin_rules,
         mod_phases=mod_phases,
         logical_name_to_mod_id=logical_name_to_mod_id,
+        mod_choices=mod_choices,
     )

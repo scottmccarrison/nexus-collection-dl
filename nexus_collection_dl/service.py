@@ -768,7 +768,12 @@ class ModManagerService:
 
         # Classify files
         progress("classify", 0.2, "Classifying files...")
-        plan = classify_files(mods_dir, game_domain)
+        # Load manifest choices for FOMOD filtering
+        manifest_choices = {}
+        if state.manifest_data:
+            manifest = CollectionManifest.from_dict(state.manifest_data)
+            manifest_choices = manifest.mod_choices
+        plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
 
         if plan.total_files == 0:
             return DeployResult(0, [], [], str(game_dir), False, skipped=len(plan.skipped))

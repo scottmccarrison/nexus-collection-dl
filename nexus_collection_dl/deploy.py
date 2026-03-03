@@ -203,8 +203,11 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     return ("data", rel_path)
 
 
-def classify_files(mods_dir: Path, game_domain: str) -> DeploymentPlan:
+def classify_files(mods_dir: Path, game_domain: str, mod_choices: dict[int, dict] | None = None) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment."""
+    from .fomod import build_fomod_skip_set
+    fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
+
     plan = DeploymentPlan()
 
     for file_path in sorted(mods_dir.rglob("*")):
@@ -217,6 +220,11 @@ def classify_files(mods_dir: Path, game_domain: str) -> DeploymentPlan:
         # Skip hidden/tool files at root
         if parts[0].startswith("."):
             plan.skipped.append((rel, "hidden file"))
+            continue
+
+        # Skip unselected FOMOD option folders
+        if parts[0] in fomod_skip:
+            plan.skipped.append((rel, "unselected FOMOD option"))
             continue
 
         # Strip wrapper directories (numbered options, SFSE version dirs)
