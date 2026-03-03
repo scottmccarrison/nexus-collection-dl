@@ -88,7 +88,7 @@ Verify it worked:
 nexus-dl --help
 ```
 
-You should see a list of commands like `sync`, `update`, `deploy`, etc.
+You should see a list of commands like `sync`, `update`, `deploy`, etc. The tool also checks for newer versions automatically - if an update is available, you'll see a notice when you run any command.
 
 ## Getting your API key
 
@@ -163,7 +163,9 @@ What this does:
 - Generates a load order so mods load in the right sequence
 - Saves everything to `~/mods/bg3` (a "mods" folder in your home directory)
 
-This can take a while depending on how many mods are in the collection. You'll see progress as each mod downloads.
+Each collection gets its own named subfolder inside the mods directory, so you can sync multiple collections for the same game without them mixing together.
+
+This can take a while depending on how many mods are in the collection. You'll see progress as each mod downloads. If you need to stop partway through, that's fine - re-running `sync` picks up where you left off, skipping mods that were already downloaded.
 
 ### Skipping optional mods
 
@@ -172,6 +174,10 @@ Some collections mark certain mods as optional. To skip those:
 ```bash
 nexus-dl sync --skip-optional "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
 ```
+
+### File conflicts
+
+After sync (and deploy), the tool checks for file conflicts - cases where two or more mods include the same file. If any are found, you'll see a summary listing which files overlap and which mods are involved. This is informational - the tool still works, but it helps you understand when one mod's files are being overwritten by another.
 
 ## If you have a free account
 
