@@ -38,6 +38,8 @@ def main(ctx: click.Context, api_key: str | None, free: bool) -> None:
 
 def _cli_progress(event: str, pct: float, msg: str) -> None:
     """Print progress messages to Rich console."""
+    if event == "download":
+        return  # Rich progress bar in downloader.py handles this
     console.print(f"[dim]{msg}[/dim]")
 
 
