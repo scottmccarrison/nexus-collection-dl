@@ -432,12 +432,11 @@ class ModManagerService:
                     file_path.unlink()
                     extracted += 1
                 state.add_mod(mod_info)
+                state.save()
                 pct = 0.75 + 0.15 * ((i + 1) / len(results))
                 progress("extract", pct, f"Extracted {mod_info['mod_name']}")
             except ExtractionError as e:
                 errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
-
-        state.save()
 
         # Generate load order
         if not no_load_order:
