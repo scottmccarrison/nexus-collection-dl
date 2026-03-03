@@ -137,6 +137,13 @@ def sync(
         if result.tracked or result.untracked:
             console.print(f"[dim]Tracked {result.tracked}, untracked {result.untracked} on Nexus.[/dim]")
 
+    if result.conflicts:
+        console.print(f"\n[yellow]{len(result.conflicts)} file conflict(s) (last mod wins):[/yellow]")
+        for c in result.conflicts[:20]:
+            console.print(f"  [dim]{c.file_path}:[/dim] [bold]{c.winner}[/bold] overwrote {c.loser}")
+        if len(result.conflicts) > 20:
+            console.print(f"  [dim]... and {len(result.conflicts) - 20} more[/dim]")
+
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))

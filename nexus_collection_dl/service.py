@@ -90,6 +90,13 @@ class ImportResult:
 
 
 @dataclass
+class FileConflict:
+    file_path: str
+    winner: str
+    loser: str
+
+
+@dataclass
 class SyncResult:
     mods_downloaded: int
     mods_extracted: int
@@ -99,6 +106,7 @@ class SyncResult:
     untracked: int = 0
     pending_downloads: list[PendingDownload] = field(default_factory=list)
     collection_dir: Path | None = None
+    conflicts: list[FileConflict] = field(default_factory=list)
 
 
 @dataclass
@@ -438,12 +446,26 @@ class ModManagerService:
         # Extract archives
         progress("extract", 0.75, "Extracting archives...")
         extracted = 0
+        file_owners: dict[str, str] = {}
+        conflicts: list[FileConflict] = []
         for i, (mod_info, file_path) in enumerate(results):
             try:
                 if not no_extract and is_archive(file_path):
-                    extract_archive(file_path, mods_dir)
+                    final_files = extract_archive(file_path, mods_dir)
+                    for ef in final_files:
+                        rel = str(ef.relative_to(mods_dir))
+                        prev_owner = file_owners.get(rel)
+                        if prev_owner:
+                            conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
+                        file_owners[rel] = mod_info["mod_name"]
                     file_path.unlink()
                     extracted += 1
+                else:
+                    rel = str(file_path.relative_to(mods_dir))
+                    prev_owner = file_owners.get(rel)
+                    if prev_owner:
+                        conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
+                    file_owners[rel] = mod_info["mod_name"]
                 state.add_mod(mod_info)
                 state.save()
                 pct = 0.75 + 0.15 * ((i + 1) / len(results))
@@ -470,6 +492,7 @@ class ModManagerService:
             tracked=tracked,
             untracked=untracked,
             collection_dir=mods_dir,
+            conflicts=conflicts,
         )
 
     def update(
