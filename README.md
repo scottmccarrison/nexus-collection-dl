@@ -64,6 +64,8 @@ pip install -e .
 export NEXUS_API_KEY="your-api-key-here"
 ```
 
+The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
+
 ## Web UI
 
 Launch the local web interface for day-to-day mod management:
@@ -103,7 +105,16 @@ nexus-dl sync --skip-optional "https://next.nexusmods.com/starfield/collections/
 
 # Skip load order generation
 nexus-dl sync --no-load-order "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
+
+# Keep archives intact (for external mod managers like Stardrop)
+nexus-dl sync --no-extract "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 ```
+
+Each collection gets its own named subfolder inside the mods directory (e.g., `~/mods/starfield/My Collection Name/`), so multiple collections for the same game stay organized.
+
+Re-running `sync` is resumable - already-downloaded mods are skipped, so you can safely abort and pick up where you left off.
+
+After sync and deploy, the tool reports **file conflicts** - cases where multiple mods wrote to the same file path. This helps you spot overlapping mods and decide on load order priority.
 
 ### Check for updates
 
@@ -112,6 +123,9 @@ nexus-dl update ~/mods/starfield
 
 # Preview what would change
 nexus-dl update --dry-run ~/mods/starfield
+
+# Keep archives intact during update
+nexus-dl update --no-extract ~/mods/starfield
 ```
 
 ### Regenerate load order
@@ -159,6 +173,9 @@ nexus-dl add "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield --f
 
 # Skip load order regeneration
 nexus-dl add --no-load-order "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield
+
+# Keep the archive intact
+nexus-dl add --no-extract "https://www.nexusmods.com/starfield/mods/123" ~/mods/starfield
 ```
 
 Downloads a single mod and registers it as a "manual" mod. Manual mods are protected from removal during `update` - they won't be flagged as "removed from collection" since they were never part of it. Manual mods load after all collection mods (phase 999).
@@ -202,6 +219,9 @@ Removes all symlinks/copies that were deployed and restores the game directory t
 
 ```bash
 nexus-dl import ~/mods/starfield
+
+# Keep archives intact
+nexus-dl import --no-extract ~/mods/starfield
 ```
 
 Matches files you downloaded through the browser to pending mods, extracts archives, and regenerates load order. See [Free vs Premium](#free-vs-premium-accounts) below for the full workflow.
@@ -287,7 +307,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 ## How it works
 
 - **serve** - Launches a local web UI for managing mods from your browser.
-- **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod, extracts archives, generates load order. Free: prints browser download links for manual download.
+- **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod (skipping any already downloaded), extracts archives into per-collection subdirectories, generates load order, and reports file conflicts. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
 - **add-local** - Registers an already-present mod in the state without downloading anything.

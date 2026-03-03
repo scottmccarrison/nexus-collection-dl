@@ -11,6 +11,8 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
+from .version_check import check_for_update
+from . import __version__
 
 console = Console()
 
@@ -36,6 +38,12 @@ console = Console()
 @click.pass_context
 def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check: bool) -> None:
     """Download mod collections from Nexus Mods."""
+    update_msg = check_for_update()
+    if update_msg:
+        console.print(f"[yellow]{update_msg}[/yellow]")
+    else:
+        console.print(f"[dim]nexus-dl v{__version__}[/dim]")
+
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
     ctx.obj["force_free"] = free
@@ -119,6 +127,9 @@ def sync(
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    if result.collection_dir:
+        console.print(f"[dim]Collection directory: {result.collection_dir}[/dim]")
+
     if result.errors:
         for err in result.errors:
             console.print(f"[red]Error:[/red] {err}")
@@ -135,6 +146,13 @@ def sync(
                 console.print(f"  [green]Wrote[/green] {f}")
         if result.tracked or result.untracked:
             console.print(f"[dim]Tracked {result.tracked}, untracked {result.untracked} on Nexus.[/dim]")
+
+    if result.conflicts:
+        console.print(f"\n[yellow]{len(result.conflicts)} file conflict(s) (last mod wins):[/yellow]")
+        for c in result.conflicts[:20]:
+            console.print(f"  [dim]{c.file_path}:[/dim] [bold]{c.winner}[/bold] overwrote {c.loser}")
+        if len(result.conflicts) > 20:
+            console.print(f"  [dim]... and {len(result.conflicts) - 20} more[/dim]")
 
 
 @main.command()
