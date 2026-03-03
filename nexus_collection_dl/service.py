@@ -1,6 +1,7 @@
 """Service layer - business logic extracted from CLI for programmatic use."""
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,13 @@ from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
 # progress callback: (event_type, percentage 0-1, message)
 ProgressCallback = Callable[[str, float, str], None]
+
+
+def _sanitize_dirname(name: str) -> str:
+    """Turn a collection name into a safe directory name."""
+    name = re.sub(r'[<>:"/\\|?*]', "", name)
+    name = name.strip(". ")
+    return name or "collection"
 
 
 @dataclass
@@ -90,6 +98,7 @@ class SyncResult:
     tracked: int = 0
     untracked: int = 0
     pending_downloads: list[PendingDownload] = field(default_factory=list)
+    collection_dir: Path | None = None
 
 
 @dataclass
@@ -307,8 +316,6 @@ class ModManagerService:
 
         # Parse URL
         collection_info = parse_collection_url(collection_url)
-        mods_dir = mods_dir / collection_info.slug
-        mods_dir.mkdir(parents=True, exist_ok=True)
 
         # Check premium status
         progress("init", 0.0, "Validating API key...")
@@ -321,6 +328,11 @@ class ModManagerService:
             collection_info.game_domain, collection_info.slug
         )
 
+        # Resolve mods_dir to a per-collection subdirectory
+        dir_name = _sanitize_dirname(collection_data["name"])
+        mods_dir = mods_dir / dir_name
+        mods_dir.mkdir(parents=True, exist_ok=True)
+
         mods = collection_data["mods"]
         dupes = collection_data.get("duplicates_removed", 0)
         if dupes:
@@ -329,7 +341,7 @@ class ModManagerService:
             mods = [m for m in mods if not m.get("optional", False)]
 
         if not mods:
-            return SyncResult(0, 0, [], [])
+            return SyncResult(0, 0, [], [], collection_dir=mods_dir)
 
         # Initialize state
         state = CollectionState(mods_dir)
@@ -386,6 +398,7 @@ class ModManagerService:
                 errors=errors,
                 load_order_files=load_order_files,
                 pending_downloads=pending_downloads,
+                collection_dir=mods_dir,
             )
 
         # Premium user: download directly
@@ -456,6 +469,7 @@ class ModManagerService:
             load_order_files=load_order_files,
             tracked=tracked,
             untracked=untracked,
+            collection_dir=mods_dir,
         )
 
     def update(
