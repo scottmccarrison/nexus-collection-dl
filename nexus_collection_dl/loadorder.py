@@ -13,7 +13,13 @@ class LoadOrderError(Exception):
 
 
 class LoadOrderGenerator:
-    """Generates mod and plugin load order from collection metadata."""
+    """Generates mod and plugin load order from collection metadata.
+
+    Now file-aware: a single Nexus mod (mod_id) can contribute multiple files
+    to the collection (e.g. core pak + texture pak + compatibility patch).
+    The load order tracks both mod_id (for phase/dependency ordering) and
+    file_id (for exact file identification and download tracking).
+    """
 
     # Bethesda game domains that support ESP/ESM plugins
     BETHESDA_GAMES = {
@@ -42,15 +48,38 @@ class LoadOrderGenerator:
         """
         Args:
             manifest: Parsed collection manifest
-            mods: List of mod info dicts (from GraphQL, must have mod_id and mod_name)
-            mod_requirements: Map of mod_id -> list of required mod_ids (from GraphQL modRequirements)
+            mods: List of mod file info dicts from GraphQL.
+                  Each entry has: mod_id, file_id, mod_name, filename, optional, etc.
+                  There may be MULTIPLE entries with the same mod_id (multi-file mods).
+            mod_requirements: Map of mod_id -> list of required mod_ids
             game_domain: Game domain name (e.g., 'starfield', 'baldursgate3')
         """
         self.manifest = manifest
-        self.mods = {m["mod_id"]: m for m in mods}
-        self.mod_requirements = mod_requirements
         self.game_domain = game_domain.lower()
         self.is_bethesda = self.game_domain in self.BETHESDA_GAMES
+
+        # Index all files by file_id (primary key)
+        self.files_by_file_id: dict[int, dict[str, Any]] = {
+            m["file_id"]: m for m in mods
+        }
+
+        # Index files by mod_id (one mod may have multiple files)
+        self.files_by_mod_id: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for m in mods:
+            self.files_by_mod_id[m["mod_id"]].append(m)
+
+        # For dependency resolution we operate at mod_id level
+        # (dependencies are between mods, not individual files)
+        self.mod_requirements = mod_requirements
+
+        # Unique mod_ids in this collection (for topo sort)
+        self.all_mod_ids: set[int] = set(self.files_by_mod_id.keys())
+
+        # Convenience: mod_name by mod_id (use first file's name)
+        self.mod_name_by_id: dict[int, str] = {
+            mid: files[0].get("mod_name", f"Unknown [{mid}]")
+            for mid, files in self.files_by_mod_id.items()
+        }
 
     def generate(self, output_dir: Path) -> list[Path]:
         """
@@ -60,13 +89,15 @@ class LoadOrderGenerator:
         """
         written = []
 
-        # Generate mod load order (all games)
-        mod_order = self._sort_mods()
+        # Sort mods by phase + dependencies (returns ordered list of mod_ids)
+        ordered_mod_ids = self._sort_mods()
+
+        # Write load order (one line per FILE, grouped by mod)
         load_order_path = output_dir / "load-order.txt"
-        self._write_load_order(mod_order, load_order_path)
+        self._write_load_order(ordered_mod_ids, load_order_path)
         written.append(load_order_path)
 
-        # Generate plugins.txt for Bethesda games (from collection metadata)
+        # Generate plugins.txt for Bethesda games
         if self.is_bethesda and self.manifest.plugins:
             plugins_path = output_dir / "plugins.txt"
             self._write_plugins(plugins_path)
@@ -78,84 +109,69 @@ class LoadOrderGenerator:
         """
         Topological sort of mods by phase + dependencies.
 
-        Uses:
-        1. Phase grouping (phase 0 mods before phase 1, etc.)
-        2. modRules from collection (before/after edges)
-        3. modRequirements from GraphQL (author dependencies)
-        """
-        # Collect all mod IDs in this collection
-        all_mod_ids = set(self.mods.keys())
+        Operates at mod_id level (dependencies are between mods, not files).
+        Returns ordered list of mod_ids.
 
-        # Build adjacency list: edges[a] = [b] means a must come before b
+        Uses:
+        1. Phase grouping from manifest (phase 0 before phase 1, etc.)
+        2. modRules from collection manifest (before/after/requires edges)
+        3. modRequirements from GraphQL (author-declared dependencies)
+        """
+        all_mod_ids = self.all_mod_ids
+
+        # Build adjacency list: edges[a] = {b} means mod a must load before mod b
         edges: dict[int, set[int]] = defaultdict(set)
         in_degree: dict[int, int] = {mid: 0 for mid in all_mod_ids}
 
-        # 1. Phase ordering: create edges from lower phase to higher phase mods
-        phase_groups: dict[int, list[int]] = defaultdict(list)
-        for mod_id in all_mod_ids:
-            phase = self.manifest.mod_phases.get(mod_id, 0)
-            phase_groups[phase].append(mod_id)
+        def _add_edge(before_id: int, after_id: int) -> None:
+            """Add a before→after ordering edge, avoiding duplicates."""
+            if before_id == after_id:
+                return
+            if before_id not in all_mod_ids or after_id not in all_mod_ids:
+                return
+            if after_id not in edges[before_id]:
+                edges[before_id].add(after_id)
+                in_degree[after_id] = in_degree.get(after_id, 0) + 1
 
-        sorted_phases = sorted(phase_groups.keys())
-        for i in range(len(sorted_phases) - 1):
-            current_phase = sorted_phases[i]
-            next_phase = sorted_phases[i + 1]
-            # Any mod in current phase must come before any mod in next phase
-            # We only add edge from last mod in current to first in next (lightweight)
-            # Actually, for correctness with topo sort, we need proper phase barriers.
-            # Use a simpler approach: assign phase weight and sort by it, then topo within.
-            pass  # Handled below via weighted sort
-
-        # 2. modRules from collection manifest
-        # Rules use logicalFileName to identify mods, not modId directly
+        # 1. modRules from collection manifest
+        # Rules use logicalFileName to identify files, which maps to mod_ids
         lf_to_id = self.manifest.logical_name_to_mod_id
         for rule in self.manifest.mod_rules:
             rule_type = rule.get("type", "")
-            # Rules have "source" and "reference" (not "target")
             source_lf = rule.get("source", {}).get("logicalFileName", "")
             ref_lf = rule.get("reference", {}).get("logicalFileName", "")
 
-            source_id = lf_to_id.get(source_lf)
-            ref_id = lf_to_id.get(ref_lf)
+            source_mod_id = lf_to_id.get(source_lf)
+            ref_mod_id = lf_to_id.get(ref_lf)
 
-            if source_id is None or ref_id is None:
-                continue
-            if source_id not in all_mod_ids or ref_id not in all_mod_ids:
+            if source_mod_id is None or ref_mod_id is None:
                 continue
 
             if rule_type == "before":
-                # source should load before reference
-                edges[source_id].add(ref_id)
-                in_degree[ref_id] = in_degree.get(ref_id, 0) + 1
+                # source loads before reference
+                _add_edge(source_mod_id, ref_mod_id)
             elif rule_type == "after":
-                # source should load after reference -> reference before source
-                edges[ref_id].add(source_id)
-                in_degree[source_id] = in_degree.get(source_id, 0) + 1
+                # source loads after reference
+                _add_edge(ref_mod_id, source_mod_id)
             elif rule_type == "requires":
-                # source requires reference -> reference before source
-                edges[ref_id].add(source_id)
-                in_degree[source_id] = in_degree.get(source_id, 0) + 1
+                # source requires reference → reference loads first
+                _add_edge(ref_mod_id, source_mod_id)
 
-        # 3. modRequirements from GraphQL
+        # 2. modRequirements from GraphQL (author-declared dependencies)
         for mod_id, req_ids in self.mod_requirements.items():
-            if mod_id not in all_mod_ids:
-                continue
             for req_id in req_ids:
-                if req_id not in all_mod_ids:
-                    continue
-                # Required mod should come before dependent
-                if req_id not in edges or mod_id not in edges[req_id]:
-                    edges[req_id].add(mod_id)
-                    in_degree[mod_id] = in_degree.get(mod_id, 0) + 1
+                # Required mod loads before dependent mod
+                _add_edge(req_id, mod_id)
 
-        # Kahn's algorithm with phase-aware priority
-        # Mods with lower phase get priority, then by name for stability
+        # 3. Kahn's algorithm with phase-aware priority queue
+        # Lower phase = higher priority. Within same phase, sort by name for stability.
         import heapq
-        queue: list[tuple[int, str, int]] = []  # (phase, name, mod_id)
+        queue: list[tuple[int, str, int]] = []  # (phase, name_lower, mod_id)
+
         for mod_id in all_mod_ids:
             if in_degree.get(mod_id, 0) == 0:
                 phase = self.manifest.mod_phases.get(mod_id, 0)
-                name = self.mods.get(mod_id, {}).get("mod_name", "")
+                name = self.mod_name_by_id.get(mod_id, "")
                 heapq.heappush(queue, (phase, name.lower(), mod_id))
 
         result: list[int] = []
@@ -170,41 +186,60 @@ class LoadOrderGenerator:
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
                     phase = self.manifest.mod_phases.get(neighbor, 0)
-                    name = self.mods.get(neighbor, {}).get("mod_name", "")
+                    name = self.mod_name_by_id.get(neighbor, "")
                     heapq.heappush(queue, (phase, name.lower(), neighbor))
 
         if visited < len(all_mod_ids):
-            # Cycle detected — add remaining mods in phase/name order
+            # Cycle detected — append remaining mods in phase/name order
             remaining = all_mod_ids - set(result)
             for mod_id in sorted(
                 remaining,
                 key=lambda m: (
                     self.manifest.mod_phases.get(m, 0),
-                    self.mods.get(m, {}).get("mod_name", "").lower(),
+                    self.mod_name_by_id.get(m, "").lower(),
                 ),
             ):
                 result.append(mod_id)
 
         return result
 
-    def _write_load_order(self, mod_order: list[int], path: Path) -> None:
-        """Write mod load order file."""
+    def _write_load_order(self, ordered_mod_ids: list[int], path: Path) -> None:
+        """
+        Write mod load order file.
+
+        For multi-file mods, all files from that mod appear together in order,
+        since they share the same phase and dependencies.
+
+        Format:
+            N. [mod_id:file_id] mod_name - file_name
+        """
+        # Count total files for header
+        total_files = sum(
+            len(self.files_by_mod_id.get(mid, []))
+            for mid in ordered_mod_ids
+        )
+
         lines = [
             "# Mod Load Order",
-            f"# Generated by nexus-collection-dl",
+            "# Generated by nexus-collection-dl",
             f"# Game: {self.game_domain}",
-            f"# Total mods: {len(mod_order)}",
+            f"# Total mods: {len(ordered_mod_ids)}",
+            f"# Total files: {total_files}",
             "#",
             "# Mods are listed in load order (first = loaded first).",
+            "# Multi-file mods list each file on a separate line.",
+            "# Format: N. [mod_id:file_id] Mod Name - File Name",
             "# Phase groups are separated by blank lines.",
             "",
         ]
 
         current_phase = None
-        for i, mod_id in enumerate(mod_order, 1):
+        entry_num = 0
+
+        for mod_id in ordered_mod_ids:
             phase = self.manifest.mod_phases.get(mod_id, 0)
-            mod = self.mods.get(mod_id, {})
-            name = mod.get("mod_name", f"Unknown (ID: {mod_id})")
+            mod_name = self.mod_name_by_id.get(mod_id, f"Unknown [{mod_id}]")
+            files = self.files_by_mod_id.get(mod_id, [])
 
             if phase != current_phase:
                 if current_phase is not None:
@@ -212,7 +247,27 @@ class LoadOrderGenerator:
                 lines.append(f"# --- Phase {phase} ---")
                 current_phase = phase
 
-            lines.append(f"{i:4d}. [{mod_id}] {name}")
+            if len(files) == 1:
+                # Single file mod — simple format
+                entry_num += 1
+                f = files[0]
+                file_id = f.get("file_id", 0)
+                file_name = f.get("filename", "")
+                opt = " [optional]" if f.get("optional") else ""
+                lines.append(
+                    f"{entry_num:4d}. [{mod_id}:{file_id}] {mod_name}{opt}"
+                )
+            else:
+                # Multi-file mod — show mod header then each file
+                lines.append(f"       # {mod_name} ({len(files)} files)")
+                for f in files:
+                    entry_num += 1
+                    file_id = f.get("file_id", 0)
+                    file_name = f.get("filename", "")
+                    opt = " [optional]" if f.get("optional") else ""
+                    lines.append(
+                        f"{entry_num:4d}. [{mod_id}:{file_id}] {mod_name} - {file_name}{opt}"
+                    )
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines) + "\n")
@@ -221,7 +276,7 @@ class LoadOrderGenerator:
         """Write plugins.txt for Bethesda games from collection metadata."""
         lines = [
             "# Plugin Load Order (from collection metadata)",
-            f"# Generated by nexus-collection-dl",
+            "# Generated by nexus-collection-dl",
             f"# Game: {self.game_domain}",
             "#",
             "# This is the collection author's intended plugin order.",
@@ -239,3 +294,22 @@ class LoadOrderGenerator:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(lines) + "\n")
+
+    def get_ordered_files(self) -> list[dict[str, Any]]:
+        """
+        Return all mod files in load order as a flat list.
+
+        Useful for generating modsettings.lsx or other game-specific
+        configuration files that need the exact ordered file list.
+
+        Returns list of file dicts, each with:
+            mod_id, file_id, mod_name, filename, optional, phase
+        """
+        ordered_mod_ids = self._sort_mods()
+        result = []
+        for mod_id in ordered_mod_ids:
+            files = self.files_by_mod_id.get(mod_id, [])
+            phase = self.manifest.mod_phases.get(mod_id, 0)
+            for f in files:
+                result.append({**f, "phase": phase})
+        return result

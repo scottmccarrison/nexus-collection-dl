@@ -11,6 +11,7 @@ STEAM_APP_IDS = {
     "fallout4": "377160",
     "falloutnewvegas": "22380",
     "fallout3": "22300",
+    "baldursgate3": "1086940",
     "oblivion": "22330",
     "morrowind": "22320",
     "enderal": "933480",
