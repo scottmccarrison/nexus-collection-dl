@@ -1,3 +1,9 @@
-# Force LF line endings on shell scripts so they work when cloned on Windows
-# with core.autocrlf=true. CRLF in a shebang causes: env: 'bash\r': No such file or directory
-*.sh text eol=lf
+# Force LF line endings on text source files. CRLF in shell shebangs causes
+# env: 'bash\r': No such file or directory; CRLF in Python sources produces
+# noisy diffs and breaks tooling on Linux/macOS contributors.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
