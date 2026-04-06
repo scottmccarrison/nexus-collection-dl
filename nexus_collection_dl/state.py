@@ -10,18 +10,21 @@ STATE_FILENAME = ".nexus-state.json"
 
 class StateError(Exception):
     """Raised when state file operations fail."""
-
     pass
 
 
 class ModState:
-    """Represents the installed state of a mod."""
+    """Represents the installed state of a single mod FILE.
+
+    NOTE: A single Nexus mod (mod_id) can have multiple files in a collection.
+    State is keyed by file_id, not mod_id, to support this correctly.
+    """
 
     def __init__(
         self,
+        file_id: int,
         mod_id: int,
         name: str,
-        file_id: int,
         version: str,
         filename: str,
         installed_at: str | None = None,
@@ -33,9 +36,9 @@ class ModState:
         download_status: str = "downloaded",
         browser_url: str = "",
     ):
+        self.file_id = file_id
         self.mod_id = mod_id
         self.name = name
-        self.file_id = file_id
         self.version = version
         self.filename = filename
         self.installed_at = installed_at or datetime.now(timezone.utc).isoformat()
@@ -49,8 +52,8 @@ class ModState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "mod_id": self.mod_id,
             "name": self.name,
-            "file_id": self.file_id,
             "version": self.version,
             "filename": self.filename,
             "installed_at": self.installed_at,
@@ -64,11 +67,11 @@ class ModState:
         }
 
     @classmethod
-    def from_dict(cls, mod_id: int, data: dict[str, Any]) -> "ModState":
+    def from_dict(cls, file_id: int, data: dict[str, Any]) -> "ModState":
         return cls(
-            mod_id=mod_id,
+            file_id=file_id,
+            mod_id=data.get("mod_id", 0),
             name=data.get("name", ""),
-            file_id=data.get("file_id", 0),
             version=data.get("version", ""),
             filename=data.get("filename", ""),
             installed_at=data.get("installed_at"),
@@ -94,6 +97,8 @@ class CollectionState:
         self.game_domain: str = ""
         self.mod_rules: list = []
         self.manifest_data: dict | None = None
+        # Key: file_id (int) -> ModState
+        # Using file_id as key ensures all files from multi-file mods are tracked.
         self.mods: dict[int, ModState] = {}
         self.game_dir: str = ""
         self.proton_prefix: str = ""
@@ -129,9 +134,9 @@ class CollectionState:
         self.track_sync_enabled = data.get("track_sync_enabled", False)
 
         self.mods = {}
-        for mod_id_str, mod_data in data.get("mods", {}).items():
-            mod_id = int(mod_id_str)
-            self.mods[mod_id] = ModState.from_dict(mod_id, mod_data)
+        for file_id_str, mod_data in data.get("mods", {}).items():
+            file_id = int(file_id_str)
+            self.mods[file_id] = ModState.from_dict(file_id, mod_data)
 
     def save(self) -> None:
         """Save state to file."""
@@ -144,7 +149,8 @@ class CollectionState:
             "game_domain": self.game_domain,
             "mod_rules": self.mod_rules,
             "manifest_data": self.manifest_data,
-            "mods": {str(mod_id): mod.to_dict() for mod_id, mod in self.mods.items()},
+            # Key by file_id so each file from a multi-file mod is tracked
+            "mods": {str(file_id): mod.to_dict() for file_id, mod in self.mods.items()},
             "game_dir": self.game_dir,
             "proton_prefix": self.proton_prefix,
             "deployed_files": self.deployed_files,
@@ -165,12 +171,12 @@ class CollectionState:
         self.game_domain = game_domain
 
     def add_mod(self, mod_info: dict[str, Any]) -> None:
-        """Add or update a mod in the state."""
-        mod_id = mod_info["mod_id"]
-        self.mods[mod_id] = ModState(
-            mod_id=mod_id,
+        """Add or update a mod file in the state (keyed by file_id)."""
+        file_id = mod_info["file_id"]
+        self.mods[file_id] = ModState(
+            file_id=file_id,
+            mod_id=mod_info["mod_id"],
             name=mod_info["mod_name"],
-            file_id=mod_info["file_id"],
             version=mod_info["version"] or "",
             filename=mod_info["filename"],
             optional=mod_info.get("optional", False),
@@ -185,45 +191,78 @@ class CollectionState:
         """Return mods with pending_download status."""
         return [ms for ms in self.mods.values() if ms.download_status == "pending_download"]
 
+    def remove_mod_file(self, file_id: int) -> None:
+        """Remove a specific file from the state."""
+        self.mods.pop(file_id, None)
+
     def remove_mod(self, mod_id: int) -> None:
-        """Remove a mod from the state."""
-        self.mods.pop(mod_id, None)
+        """Remove ALL files for a given mod_id from the state."""
+        to_remove = [fid for fid, ms in self.mods.items() if ms.mod_id == mod_id]
+        for fid in to_remove:
+            del self.mods[fid]
 
     def get_mod(self, mod_id: int) -> ModState | None:
-        """Get mod state by ID."""
-        return self.mods.get(mod_id)
+        """Get first mod state by mod_id (for backwards compat)."""
+        for ms in self.mods.values():
+            if ms.mod_id == mod_id:
+                return ms
+        return None
+
+    def get_file(self, file_id: int) -> ModState | None:
+        """Get mod state by file_id."""
+        return self.mods.get(file_id)
+
+    def get_downloaded_file_ids(self) -> set[int]:
+        """Return set of all downloaded file_ids."""
+        return {fid for fid, ms in self.mods.items()
+                if ms.download_status == "downloaded"}
+
+    def get_downloaded_mod_ids(self) -> set[int]:
+        """Return set of mod_ids that have at least one downloaded file."""
+        return {ms.mod_id for ms in self.mods.values()
+                if ms.download_status == "downloaded"}
 
     def compare_with_collection(
         self, collection_mods: list[dict[str, Any]]
     ) -> tuple[list[dict], list[dict], list[dict], list[int]]:
         """
-        Compare installed mods with collection.
+        Compare installed mod FILES with collection.
+
+        Since state is now keyed by file_id, we compare file_ids directly.
+        A mod with a new file_id = update available.
 
         Returns:
-            - to_install: mods in collection but not installed
-            - to_update: mods with different file_id (new version)
-            - up_to_date: mods that match
-            - to_remove: mod IDs installed but not in collection
+            - to_install: files in collection but not installed
+            - to_update: files with matching mod_id but different file_id
+            - up_to_date: files that match exactly
+            - to_remove: file_ids installed but not in collection (excluding manual)
         """
+        collection_file_ids = {m["file_id"] for m in collection_mods}
         collection_mod_ids = {m["mod_id"] for m in collection_mods}
-        installed_mod_ids = set(self.mods.keys())
+        installed_file_ids = set(self.mods.keys())
 
         to_install = []
         to_update = []
         up_to_date = []
 
-        for mod in collection_mods:
-            mod_id = mod["mod_id"]
-            installed = self.mods.get(mod_id)
+        # Build mod_id -> installed file_ids mapping
+        mod_id_to_installed_files: dict[int, list[int]] = {}
+        for fid, ms in self.mods.items():
+            mod_id_to_installed_files.setdefault(ms.mod_id, []).append(fid)
 
-            if installed is None:
-                to_install.append(mod)
-            elif installed.file_id != mod["file_id"]:
+        for mod in collection_mods:
+            file_id = mod["file_id"]
+            mod_id = mod["mod_id"]
+
+            if file_id in installed_file_ids:
+                up_to_date.append(mod)
+            elif mod_id in mod_id_to_installed_files:
+                # Same mod but different file — update available
                 to_update.append(mod)
             else:
-                up_to_date.append(mod)
+                to_install.append(mod)
 
-        manual_mod_ids = {mid for mid, ms in self.mods.items() if ms.manual}
-        to_remove = list(installed_mod_ids - collection_mod_ids - manual_mod_ids)
+        manual_file_ids = {fid for fid, ms in self.mods.items() if ms.manual}
+        to_remove = list(installed_file_ids - collection_file_ids - manual_file_ids)
 
         return to_install, to_update, up_to_date, to_remove

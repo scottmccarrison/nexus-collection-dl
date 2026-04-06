@@ -12,13 +12,11 @@ REST_BASE_URL = "https://api.nexusmods.com/v1"
 
 class NexusAPIError(Exception):
     """Base exception for Nexus API errors."""
-
     pass
 
 
 class NexusPremiumRequired(NexusAPIError):
     """Raised when Premium membership is required for an operation."""
-
     pass
 
 
@@ -88,12 +86,16 @@ class NexusAPI:
 
     def get_collection_mods(self, game_domain: str, slug: str) -> dict[str, Any]:
         """
-        Get collection metadata and mod list from the latest revision.
+        Get collection metadata and ALL mod files from the latest revision.
+
+        IMPORTANT: A collection can include multiple files from the same mod
+        (e.g. a core pak + texture pack + compatibility patch, all from mod_id 18726).
+        We return ALL files, keyed by file_id not mod_id, to avoid dropping any.
 
         Returns dict with:
             - name: collection name
             - revision: revision number
-            - mods: list of mod info dicts
+            - mods: list of mod file info dicts (one entry per FILE, not per mod)
         """
         query = """
         query GetCollection($slug: String!) {
@@ -154,11 +156,22 @@ class NexusAPI:
         mod_files = revision.get("modFiles", [])
 
         mods = []
+        seen_file_ids: set[int] = set()
+
         for mf in mod_files:
             file_info = mf.get("file", {})
             mod_info = file_info.get("mod", {})
             if not file_info or not mod_info:
                 continue
+
+            file_id = file_info.get("fileId")
+            if file_id is None:
+                continue
+
+            # Skip truly duplicate file_ids (shouldn't happen but be safe)
+            if file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
 
             # Extract mod requirements
             req_nodes = (
@@ -172,7 +185,7 @@ class NexusAPI:
                 {
                     "mod_id": mod_info.get("modId"),
                     "mod_name": mod_info.get("name"),
-                    "file_id": file_info.get("fileId"),
+                    "file_id": file_id,
                     "filename": file_info.get("name"),
                     "version": file_info.get("version"),
                     "size_bytes": file_info.get("sizeInBytes"),
@@ -181,22 +194,11 @@ class NexusAPI:
                 }
             )
 
-        # Deduplicate by mod_id, keeping the last occurrence so the
-        # collection's intended load order wins when the same mod appears
-        # multiple times (patches, updates, revised entries).
-        seen: dict[int, int] = {}
-        for i, mod in enumerate(mods):
-            seen[mod["mod_id"]] = i
-        unique_indices = set(seen.values())
-        dupes_removed = len(mods) - len(unique_indices)
-        mods = [m for i, m in enumerate(mods) if i in unique_indices]
-
         return {
             "id": collection.get("id"),
             "slug": collection.get("slug"),
             "name": collection.get("name"),
             "summary": collection.get("summary"),
-            "duplicates_removed": dupes_removed,
             "game_domain": actual_game,
             "revision": revision.get("revisionNumber"),
             "download_link": download_link,
@@ -214,7 +216,6 @@ class NexusAPI:
         response = self.session.get(url)
         data = self._handle_response(response)
 
-        # Response is a list of CDN options, pick the first one
         if not data or not isinstance(data, list):
             raise NexusAPIError(f"Unexpected download link response: {data}")
 

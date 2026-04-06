@@ -9,7 +9,29 @@ from pathlib import Path
 # Bethesda plugin/archive extensions
 BETHESDA_EXTENSIONS = {".esm", ".esp", ".esl", ".ba2"}
 
-# Known asset directories that belong under Data/
+# BG3 pak file extension
+BG3_PAK_EXTENSION = ".pak"
+
+# BG3 virtual texture extensions (go to Data/ directly, not in pak)
+BG3_VIRTUAL_TEXTURE_EXTENSIONS = {".gts", ".gtp"}
+
+# BG3 loose file extensions that go into Data/ structure
+BG3_LOOSE_EXTENSIONS = {
+    ".dds", ".DDS",  # textures
+    ".gr2", ".GR2",  # Granny2 animations/models
+    ".lsf", ".lsx",  # Larian save formats
+    ".cur",          # cursors
+    ".ttf", ".otf",  # fonts
+    ".xaml",         # UI
+}
+
+# BG3 native mod paths - go to game bin/ not Data/
+BG3_NATIVE_MOD_PATHS = {
+    "bin",
+    "nativemods",
+}
+
+# Known asset directories that belong under Data/ (Bethesda)
 ASSET_DIRS = {
     "geometries",
     "textures",
@@ -42,11 +64,13 @@ SKIP_PATTERNS = {
     "load-order.txt",
     "plugins.txt",
     "__folder_managed_by_vortex",
+    "__macosx",
 }
 
-SKIP_EXTENSIONS = {".txt", ".md", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".log"}
+SKIP_EXTENSIONS = {".txt", ".md", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".log",
+                   ".url", ".lnk", ".json"}
 
-# Starfield INI settings for mod support
+# Starfield/Skyrim/Fallout INI settings for mod support
 GAME_INI_SETTINGS = {
     "starfield": {
         "filename": "StarfieldCustom.ini",
@@ -137,35 +161,101 @@ class DeployResult:
     errors: list[str] = field(default_factory=list)
 
 
+def _is_bg3_game(game_domain: str) -> bool:
+    """Check if this is a Baldur's Gate 3 deployment."""
+    return game_domain.lower() in ("baldursgate3", "baldurs_gate_3", "bg3")
+
+
 def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     """
     Classify a single file and return (target_base, relative_dest) or None to skip.
 
-    target_base is "root" for game root or "data" for Data/ directory.
+    target_base values:
+        "root"    - game installation root (e.g. bin/)
+        "data"    - game Data/ directory
+        "staging" - stays in mod staging dir (e.g. .pak files for BG3)
+
+    For BG3:
+        .pak files stay in the staging/collection directory and are symlinked to Data/
+        bin/ and NativeMods/ go to the game's bin/ directory
+        Loose files (DDS, GR2, etc.) with a Data/ prefix go to game Data/
+        Virtual textures (.gts, .gtp) go to game Data/
     """
     parts = rel_path.parts
     name = rel_path.name
     name_lower = name.lower()
     suffix_lower = rel_path.suffix.lower()
+    lower_parts = [p.lower() for p in parts]
 
-    # Skip metadata/docs
-    if name_lower in SKIP_PATTERNS or name_lower.startswith("readme"):
+    # Skip metadata/docs/junk
+    if name_lower in {p.lower() for p in SKIP_PATTERNS}:
+        return None
+    if name_lower.startswith("readme"):
         return None
     if suffix_lower in SKIP_EXTENSIONS and suffix_lower not in BETHESDA_EXTENSIONS:
         return None
     if any(p.lower() in SKIP_PATTERNS for p in parts):
         return None
+    # Skip Mac OS metadata folders
+    if "__macosx" in lower_parts:
+        return None
 
-    # SFSE root files (sfse_loader.exe, sfse_*.dll) - deploy to game root
+    # ── BG3-specific handling ──────────────────────────────────────────────────
+    if _is_bg3_game(game_domain):
+        # .pak files stay in the staging directory.
+        # nexus-dl's deploy step symlinks all .pak files from staging → Data/
+        if suffix_lower == ".pak":
+            return ("staging", Path(name))
+
+        # bin/ and NativeMods/ → game root bin/
+        if lower_parts[0] in BG3_NATIVE_MOD_PATHS:
+            return ("root", Path("bin") / Path(*parts[1:]))
+
+        # Explicit Data/ prefix → strip it and deploy to game Data/
+        if lower_parts[0] == "data" and len(parts) > 1:
+            remainder = Path(*parts[1:])
+            return ("data", remainder)
+
+        # Generated/ prefix → deploy to game Data/Generated/
+        if lower_parts[0] == "generated" and len(parts) > 1:
+            return ("data", rel_path)
+
+        # Virtual textures → Data/ root
+        if suffix_lower in BG3_VIRTUAL_TEXTURE_EXTENSIONS:
+            return ("data", Path(name))
+
+        # Loose DDS/GR2/etc at root level → Data/ root
+        if len(parts) == 1 and suffix_lower.lower() in {e.lower() for e in BG3_LOOSE_EXTENSIONS}:
+            return ("data", Path(name))
+
+        # Subfolder containing Data/ structure (e.g. "ModName/Data/Public/...")
+        if "data" in lower_parts:
+            data_idx = lower_parts.index("data")
+            if data_idx < len(parts) - 1:
+                remainder = Path(*parts[data_idx + 1:])
+                return ("data", remainder)
+
+        # DLL files at root → game bin/ (native mods)
+        if len(parts) == 1 and suffix_lower == ".dll":
+            return ("root", Path("bin") / "NativeMods" / name)
+
+        # TOML/INI configs for native mods at root → game bin/NativeMods/
+        if len(parts) == 1 and suffix_lower in (".toml", ".ini"):
+            return ("root", Path("bin") / "NativeMods" / name)
+
+        # Everything else for BG3 → skip (loose files without clear destination)
+        return None
+
+    # ── Non-BG3 (Bethesda) handling ───────────────────────────────────────────
+
+    # SFSE root files
     if name_lower.startswith("sfse_") and suffix_lower in (".exe", ".dll"):
         return ("root", Path(name))
 
     # Handle SFSE/Plugins/ at various depths
-    lower_parts = [p.lower() for p in parts]
     if "sfse" in lower_parts:
         sfse_idx = lower_parts.index("sfse")
         remainder = Path(*parts[sfse_idx:])
-        # Strip leading "data/" if present
         if lower_parts[0] == "data" and sfse_idx == 1:
             return ("data", remainder)
         elif sfse_idx == 0:
@@ -184,26 +274,27 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     if lower_parts[0] in ASSET_DIRS:
         return ("data", rel_path)
 
-    # Any other file - try to deploy under Data/
-    # This catches things like Meshes/, Textures/ nested inside subdirs
+    # Asset dirs nested inside subdirs
     for i, part_lower in enumerate(lower_parts):
         if part_lower in ASSET_DIRS:
             return ("data", Path(*parts[i:]))
 
-    # If it's a DLL at root, might be an SFSE plugin or ASI loader
+    # DLL at root → game root
     if len(parts) == 1 and suffix_lower == ".dll":
         return ("root", Path(name))
 
-    # INI files at root - could be game config
+    # INI files at root
     if len(parts) == 1 and suffix_lower == ".ini":
         return ("root", Path(name))
 
-    # Unknown file - deploy under Data/ as fallback for anything with
-    # a game-relevant extension, skip otherwise
     return ("data", rel_path)
 
 
-def classify_files(mods_dir: Path, game_domain: str, mod_choices: dict[int, dict] | None = None) -> DeploymentPlan:
+def classify_files(
+    mods_dir: Path,
+    game_domain: str,
+    mod_choices: dict[int, dict] | None = None,
+) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment."""
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
@@ -243,11 +334,15 @@ def classify_files(mods_dir: Path, game_domain: str, mod_choices: dict[int, dict
         result = classify_file(effective_rel, game_domain)
 
         if result is None:
-            plan.skipped.append((rel, "metadata/docs"))
+            plan.skipped.append((rel, "skipped"))
             continue
 
         target_base, dest_rel = result
-        if target_base == "root":
+
+        if target_base == "staging":
+            # For BG3 paks: they stay in place, deploy will symlink them to Data/
+            plan.data_files.append((file_path, dest_rel))
+        elif target_base == "root":
             plan.game_root_files.append((file_path, dest_rel))
         else:
             plan.data_files.append((file_path, dest_rel))
@@ -281,7 +376,7 @@ def deploy(
     result = DeployResult()
     data_dir = game_dir / "Data"
 
-    # Deploy game root files (SFSE, root DLLs)
+    # Deploy game root files (native mods, SFSE, root DLLs)
     for src, dest_rel in plan.game_root_files:
         dest = game_dir / dest_rel
         if dry_run:
@@ -293,12 +388,11 @@ def deploy(
         except OSError as e:
             result.errors.append(f"{dest_rel}: {e}")
 
-    # Deploy Data/ files
+    # Deploy Data/ files (includes BG3 .pak symlinks)
     seen_dests: dict[Path, Path] = {}
     for src, dest_rel in plan.data_files:
         dest = data_dir / dest_rel
 
-        # Track conflicts (multiple sources -> same dest)
         if dest in seen_dests:
             result.conflicts.append(
                 f"{dest_rel}: overwritten by {src.name} (was {seen_dests[dest].name})"
@@ -326,7 +420,6 @@ def undeploy(deployed_files: list[dict]) -> int:
             try:
                 dest.unlink()
                 removed += 1
-                # Clean up empty parent dirs up to Data/ or game root
                 _cleanup_empty_parents(dest.parent)
             except OSError:
                 pass
@@ -363,12 +456,10 @@ def write_game_ini(ini_path: Path, game_domain: str) -> bool:
 
     ini_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Read existing content if present
     existing_lines = []
     if ini_path.exists():
         existing_lines = ini_path.read_text().splitlines()
 
-    # Parse existing sections
     existing_sections: dict[str, dict[str, str]] = {}
     current_section = ""
     for line in existing_lines:
@@ -380,13 +471,11 @@ def write_game_ini(ini_path: Path, game_domain: str) -> bool:
             key, _, value = stripped.partition("=")
             existing_sections[current_section][key.strip()] = value.strip()
 
-    # Merge our required settings
     for section, keys in settings["sections"].items():
         existing_sections.setdefault(section, {})
         for key, value in keys.items():
             existing_sections[section][key] = value
 
-    # Write back
     lines = []
     for section, keys in existing_sections.items():
         lines.append(f"[{section}]")

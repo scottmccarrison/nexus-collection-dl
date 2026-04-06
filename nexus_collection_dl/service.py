@@ -251,14 +251,14 @@ class ModManagerService:
                     status="not_installed",
                 ))
 
-            for mod_id in to_remove:
-                installed = state.get_mod(mod_id)
+            for file_id in to_remove:
+                installed = state.get_file(file_id)
                 if installed:
                     mod_statuses.append(ModStatus(
-                        mod_id=mod_id,
+                        mod_id=installed.mod_id,
                         name=installed.name,
                         version=installed.version,
-                        file_id=installed.file_id,
+                        file_id=file_id,
                         optional=installed.optional,
                         manual=installed.manual,
                         phase=installed.phase,
@@ -267,13 +267,13 @@ class ModManagerService:
 
         except (NexusAPIError, CollectionParseError):
             # Offline/no API - just show installed mods
-            for mod_id, ms in state.mods.items():
+            for file_id, ms in state.mods.items():
                 status = "pending_download" if ms.download_status == "pending_download" else "installed"
                 mod_statuses.append(ModStatus(
-                    mod_id=mod_id,
+                    mod_id=ms.mod_id,
                     name=ms.name,
                     version=ms.version,
-                    file_id=ms.file_id,
+                    file_id=file_id,
                     optional=ms.optional,
                     manual=ms.manual,
                     phase=ms.phase,
@@ -281,14 +281,14 @@ class ModManagerService:
                 ))
 
         # Add manual mods that aren't already in the list
-        listed_ids = {m.mod_id for m in mod_statuses}
-        for mod_id, ms in state.mods.items():
-            if mod_id not in listed_ids and ms.manual:
+        listed_file_ids = {m.file_id for m in mod_statuses}
+        for file_id, ms in state.mods.items():
+            if file_id not in listed_file_ids and ms.manual:
                 mod_statuses.append(ModStatus(
-                    mod_id=mod_id,
+                    mod_id=ms.mod_id,
                     name=ms.name,
                     version=ms.version,
-                    file_id=ms.file_id,
+                    file_id=file_id,
                     optional=ms.optional,
                     manual=True,
                     phase=ms.phase,
@@ -369,9 +369,9 @@ class ModManagerService:
             game_domain = collection_data["game_domain"]
             for mod in mods:
                 mod_id = mod["mod_id"]
-                # Don't regress already-downloaded mods
-                existing = state.get_mod(mod_id)
-                if existing and existing.download_status == "downloaded" and existing.file_id == mod["file_id"]:
+                # Don't regress already-downloaded files (check by file_id)
+                existing = state.get_file(mod["file_id"])
+                if existing and existing.download_status == "downloaded":
                     continue
                 browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
                 size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
@@ -567,7 +567,7 @@ class ModManagerService:
                 game_domain = collection_data["game_domain"]
                 for mod in mods_to_download:
                     mod_id = mod["mod_id"]
-                    existing = state.get_mod(mod_id)
+                    existing = state.get_file(mod["file_id"])
                     if existing and existing.download_status == "downloaded":
                         continue
                     browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
@@ -1157,26 +1157,26 @@ class ModManagerService:
 
         manifest = CollectionManifest.from_dict(state.manifest_data)
 
-        # Inject phase 999 for manual mods
-        for mod_id, ms in state.mods.items():
+        # Inject phase 999 for manual mods (keyed by mod_id in manifest)
+        for file_id, ms in state.mods.items():
             if ms.manual:
-                manifest.mod_phases[mod_id] = 999
+                manifest.mod_phases[ms.mod_id] = 999
 
         mod_requirements: dict[int, list[int]] = {}
-        for mod_id, mod_state in state.mods.items():
+        for file_id, mod_state in state.mods.items():
             if mod_state.requirements:
-                mod_requirements[mod_id] = mod_state.requirements
+                mod_requirements[mod_state.mod_id] = mod_state.requirements
 
         mods_list = [
             {
-                "mod_id": mod_id,
+                "mod_id": ms.mod_id,
                 "mod_name": ms.name,
-                "file_id": ms.file_id,
+                "file_id": file_id,
                 "version": ms.version,
                 "filename": ms.filename,
                 "optional": ms.optional,
             }
-            for mod_id, ms in state.mods.items()
+            for file_id, ms in state.mods.items()
         ]
 
         generator = LoadOrderGenerator(
