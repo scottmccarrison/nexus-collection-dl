@@ -2,6 +2,8 @@
 
 import os
 import re
+import hashlib
+from tqdm import tqdm
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1051,26 +1053,74 @@ class ModManagerService:
                 files_on_disk[f.name.lower()] = f
                 files_on_disk[f.stem.lower()] = f
 
+        def _logical_name_regex(logical_name: str) -> re.Pattern:
+            # Match all words from the logical name in the filename stem, order-independent
+            words = [re.escape(w) for w in logical_name.split() if len(w) > 2]
+            return re.compile(r"(?i)" + "".join(f"(?=.*{w})" for w in words))
+
+        def _md5(path: Path) -> str:
+            h = hashlib.md5()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+
+        disk_md5s: dict[str, Path] = {}
+        for path in files_on_disk.values():
+            try:
+                disk_md5s[_md5(path)] = path
+            except OSError:
+                pass
+
+        # Build logicalFileName -> fileMD5 lookup from manifest mod_rules
+        logical_to_md5: dict[str, str] = {}
+        if state.manifest_data:
+            for rule in state.manifest_data.get("mod_rules", []):
+                for side in ("source", "reference"):
+                    entry = rule.get(side, {})
+                    lf = entry.get("logicalFileName", "")
+                    md5 = entry.get("fileMD5", "")
+                    if lf and md5:
+                        logical_to_md5[lf] = md5
+
         matched = 0
         extracted = 0
         progress("import", 0.1, f"Scanning for {len(pending)} pending downloads...")
 
-        for i, mod_state in enumerate(pending):
+        for i, mod_state in enumerate(tqdm(pending, desc="Processing mods")):
             filename_lower = mod_state.filename.lower()
+            file_path = None
+
+            #MD5 match
+            if file_path is None:
+                expected_md5 = logical_to_md5.get(mod_state.filename)
+                if expected_md5:
+                    file_path = disk_md5s.get(expected_md5)
 
             # Exact match (premium downloads, already correctly named)
-            if filename_lower in files_on_disk:
-                file_path = files_on_disk[filename_lower]
-            else:
+            file_path = files_on_disk.get(filename_lower)
+
+            #stem matching
+            if file_path is None:
                 # Browser downloads append "-modid-version-timestamp" to the logical name.
                 # Match any disk file whose stem starts with the logical name + "-".
                 file_path = next(
                     (p for stem, p in files_on_disk.items()
-                     if stem.startswith(filename_lower + "-")),
+                    if stem.startswith(filename_lower + "-")),
                     None,
                 )
-                if file_path is None:
-                    continue
+
+            #Regex matching words in logical name fallback
+            if file_path is None:
+                pattern = _logical_name_regex(mod_state.filename)
+                file_path = next(
+                    (p for stem, p in files_on_disk.items()
+                    if pattern.search(stem)),
+                    None,
+                )
+
+            if file_path is None:
+                continue
 
             matched += 1
 

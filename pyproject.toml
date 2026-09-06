@@ -16,6 +16,7 @@ dependencies = [
     "rarfile>=4.0",
     "flask>=3.0.0",
     "packaging>=21.0",
+    "tqdm>=4.70.0",
 ]
 
 [project.optional-dependencies]
