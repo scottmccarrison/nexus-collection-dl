@@ -1042,8 +1042,14 @@ class ModManagerService:
         if not pending:
             return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
 
-        # Build filename lookup (case-insensitive)
-        files_on_disk = {f.name.lower(): f for f in mods_dir.iterdir() if f.is_file()}
+        # Build filename lookup (case-insensitive).
+        # Keyed by both full filename and stem to match browser-downloaded files
+        # where Nexus appends "-modid-version-timestamp" to the logical name.
+        files_on_disk: dict[str, Path] = {}
+        for f in mods_dir.iterdir():
+            if f.is_file():
+                files_on_disk[f.name.lower()] = f
+                files_on_disk[f.stem.lower()] = f
 
         matched = 0
         extracted = 0
@@ -1051,10 +1057,21 @@ class ModManagerService:
 
         for i, mod_state in enumerate(pending):
             filename_lower = mod_state.filename.lower()
-            if filename_lower not in files_on_disk:
-                continue
 
-            file_path = files_on_disk[filename_lower]
+            # Exact match (premium downloads, already correctly named)
+            if filename_lower in files_on_disk:
+                file_path = files_on_disk[filename_lower]
+            else:
+                # Browser downloads append "-modid-version-timestamp" to the logical name.
+                # Match any disk file whose stem starts with the logical name + "-".
+                file_path = next(
+                    (p for stem, p in files_on_disk.items()
+                     if stem.startswith(filename_lower + "-")),
+                    None,
+                )
+                if file_path is None:
+                    continue
+
             matched += 1
 
             try:
@@ -1073,6 +1090,7 @@ class ModManagerService:
             progress("import", pct, f"Imported {mod_state.name}")
 
         state.save()
+
 
         # Regenerate load order if any mods were matched
         load_order_files: list[str] = []
