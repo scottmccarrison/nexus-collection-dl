@@ -20,6 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 loot = ["loot"]
+dev = ["pytest>=8.0"]
 
 [project.scripts]
 nexus-dl = "nexus_collection_dl.cli:main"
@@ -30,3 +31,7 @@ where = ["."]
 
 [tool.setuptools.package-data]
 "nexus_collection_dl.web" = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
