@@ -14,6 +14,30 @@ class ExtractionError(Exception):
     pass
 
 
+def sniff_archive_magic(filepath: Path) -> str | None:
+    """Detect archive type by magic bytes alone.
+
+    Returns 'zip', '7z', 'rar', or None when the content does not start with
+    a known archive signature (or the file cannot be read). Unlike
+    detect_archive_type this never falls back to the filename extension, so
+    callers can tell real archive content from an error page or truncated
+    download saved under an archive name.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            header = f.read(8)
+    except (OSError, IOError):
+        return None
+
+    if header[:2] == b"PK":
+        return "zip"
+    if header[:6] == b"7z\xbc\xaf'\x1c":
+        return "7z"
+    if header[:4] == b"Rar!":
+        return "rar"
+    return None
+
+
 def detect_archive_type(filepath: Path) -> str | None:
     """
     Detect archive type by magic bytes, then fall back to extension.
@@ -21,18 +45,9 @@ def detect_archive_type(filepath: Path) -> str | None:
     Returns: 'zip', '7z', 'rar', or None if not an archive.
     """
     # Try magic bytes first (most reliable — extension can be wrong or missing)
-    try:
-        with open(filepath, "rb") as f:
-            header = f.read(8)
-
-        if header[:2] == b"PK":
-            return "zip"
-        if header[:6] == b"7z\xbc\xaf'\x1c":
-            return "7z"
-        if header[:4] == b"Rar!":
-            return "rar"
-    except (OSError, IOError):
-        pass
+    magic = sniff_archive_magic(filepath)
+    if magic:
+        return magic
 
     # Fall back to extension
     suffix = filepath.suffix.lower()

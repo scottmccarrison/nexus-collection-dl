@@ -6,6 +6,7 @@ network calls, or secrets are involved.
 """
 
 import hashlib
+import json
 import zipfile
 from pathlib import Path
 
@@ -157,13 +158,11 @@ def test_real_zip_extraction_end_to_end(tmp_path, svc):
     assert not archive.exists()
 
 
-def test_exact_filename_beats_hash_match(tmp_path, svc, extract_recorder):
-    """Exact known archive filename wins; a hash hit must not clobber it."""
-    exact = _make_zip(tmp_path / "Foo.zip", payload=b"not-the-manifest-content")
-    _make_zip(tmp_path / "mislabeled.bin", payload=b"manifest-content")
-    manifest = _manifest_with_md5(
-        1234, 10, "Foo.zip", _md5(tmp_path / "mislabeled.bin")
-    )
+def test_stale_same_name_rejected_for_verified_alternative(tmp_path, svc, extract_recorder):
+    """A stale same-named archive must lose to a hash-verified file."""
+    stale = _make_zip(tmp_path / "Foo.zip", payload=b"old-version-content")
+    correct = _make_zip(tmp_path / "renamed-correct.bin", payload=b"new-version-content")
+    manifest = _manifest_with_md5(1234, 10, "Foo.zip", _md5(correct))
     _write_state(tmp_path, [{
         "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
         "filename": "Foo.zip", "version": "1.0",
@@ -172,7 +171,48 @@ def test_exact_filename_beats_hash_match(tmp_path, svc, extract_recorder):
     result = svc.import_downloads(tmp_path, no_load_order=True)
 
     assert result.matched == 1
-    assert extract_recorder == [(exact, tmp_path)]
+    assert result.errors == []
+    assert extract_recorder == [(correct, tmp_path)]
+    assert stale.exists()  # stale file untouched, still on disk
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
+
+
+def test_same_name_all_hash_mismatch_stays_pending(tmp_path, svc, extract_recorder):
+    """A same-named file with wrong content is rejected, never accepted."""
+    stale = _make_zip(tmp_path / "Foo.zip", payload=b"stale-content")
+    manifest = _manifest_with_md5(1234, 10, "Foo.zip", "a" * 32)  # matches nothing
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo.zip", "version": "1.0",
+    }], manifest_data=manifest)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 0
+    assert result.still_pending == 1
+    assert any("Content hash mismatch" in e for e in result.errors)
+    assert stale.exists()
+    assert extract_recorder == []
+    assert _reload(tmp_path).mods[10].download_status == "pending_download"
+
+
+def test_exact_name_preferred_among_verified(tmp_path, svc, extract_recorder):
+    """Among verified (byte-identical) candidates the exact filename wins."""
+    data = _make_zip(tmp_path / "src.zip", payload=b"shared-content").read_bytes()
+    (tmp_path / "Foo.zip").write_bytes(data)
+    (tmp_path / "aaa-copies.bin").write_bytes(data)  # sorts before Foo.zip
+    (tmp_path / "src.zip").unlink()
+    manifest = _manifest_with_md5(1234, 10, "Foo.zip", _md5(tmp_path / "Foo.zip"))
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo.zip", "version": "1.0",
+    }], manifest_data=manifest)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert extract_recorder == [(tmp_path / "Foo.zip", tmp_path)]
+    assert (tmp_path / "aaa-copies.bin").exists()  # duplicate left alone
 
 
 def test_hash_match_when_file_renamed(tmp_path, svc, extract_recorder):
@@ -571,3 +611,289 @@ def test_progress_callback_reused_and_no_tqdm(tmp_path, svc, extract_recorder):
     assert all(0.0 <= p <= 1.0 for p in percentages)
     # tqdm must be gone: progress goes through the existing callback only
     assert not hasattr(service_module, "tqdm")
+
+
+# -- hash-collision safety across manifest rules --
+
+
+def test_colliding_logical_names_resolved_by_identity(tmp_path, svc, extract_recorder):
+    """Two rules sharing a logicalFileName: identity picks the right hash."""
+    file_a = _make_zip(tmp_path / "a-download.bin", payload=b"content-a")
+    file_b = _make_zip(tmp_path / "b-download.bin", payload=b"content-b")
+    manifest = {"mod_rules": [
+        {"source": {"modId": 111, "fileID": 11,
+                    "logicalFileName": "Shared Name.zip", "fileMD5": _md5(file_a)}},
+        {"source": {"modId": 222, "fileID": 22,
+                    "logicalFileName": "Shared Name.zip", "fileMD5": _md5(file_b)}},
+    ]}
+    _write_state(tmp_path, [
+        {"file_id": 11, "mod_id": 111, "mod_name": "Mod A", "filename": "Mod A",
+         "version": "1.0"},
+        {"file_id": 22, "mod_id": 222, "mod_name": "Mod B", "filename": "Mod B",
+         "version": "1.0"},
+    ], manifest_data=manifest)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 2
+    assert {c[0] for c in extract_recorder} == {file_a, file_b}
+
+
+def test_colliding_logical_names_without_identity_not_hashed(
+    tmp_path, svc, extract_recorder, md5_counter
+):
+    """An ambiguous name->hash mapping is dropped, never guessed at."""
+    _make_zip(tmp_path / "a-download.bin", payload=b"content-a")
+    _make_zip(tmp_path / "b-download.bin", payload=b"content-b")
+    decoy = _make_zip(tmp_path / "Shared Name.zip", payload=b"content-c")
+    manifest = {"mod_rules": [
+        {"source": {"logicalFileName": "Shared Name.zip", "fileMD5": "a" * 32}},
+        {"source": {"logicalFileName": "Shared Name.zip", "fileMD5": "b" * 32}},
+    ]}
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Shared",
+        "filename": "Shared Name.zip", "version": "1.0",
+    }], manifest_data=manifest)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    # No usable expected hash: the exact-name file is accepted by name, and
+    # nothing is hashed against the colliding (dropped) entries
+    assert result.matched == 1
+    assert extract_recorder == [(decoy, tmp_path)]
+    assert md5_counter == []
+
+
+# -- crash and cleanup resilience --
+
+
+def test_unlink_failure_preserves_imported_state(monkeypatch, tmp_path, svc, extract_recorder):
+    """A cleanup failure after extraction must not lose the persisted import."""
+    archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo", "version": "1.0",
+    }])
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self, *args, **kwargs):
+        if self.name == archive.name:
+            raise OSError(28, "No space left on device")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert result.extracted == 1
+    assert any("Could not remove" in e for e in result.errors)
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
+    assert archive.exists()
+
+    # A repeated import must not re-consume the leftover archive
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    second = svc.import_downloads(tmp_path, no_load_order=True)
+    assert second.matched == 0
+    assert second.errors == []
+    assert archive.exists()
+
+
+def test_state_persisted_before_midrun_crash(monkeypatch, tmp_path, svc):
+    """An unexpected crash mid-run must not lose earlier imported items."""
+    first = _make_zip(tmp_path / "A-1-1-0-1699999999.zip")
+    second = _make_zip(tmp_path / "B-2-1-0-1699999999.zip")
+    _write_state(tmp_path, [
+        {"file_id": 1, "mod_id": 1, "mod_name": "A", "filename": "A", "version": "1.0"},
+        {"file_id": 2, "mod_id": 2, "mod_name": "B", "filename": "B", "version": "1.0"},
+    ])
+    real_extract = service_module.extract_archive
+
+    def crashing_extract(archive_path, target_dir):
+        if Path(archive_path).name == second.name:
+            raise RuntimeError("unexpected crash")
+        return real_extract(archive_path, target_dir)
+
+    monkeypatch.setattr(service_module, "extract_archive", crashing_extract)
+
+    with pytest.raises(RuntimeError):
+        svc.import_downloads(tmp_path, no_load_order=True)
+
+    state = _reload(tmp_path)
+    assert state.mods[1].download_status == "downloaded"  # progress survived
+    assert state.mods[2].download_status == "pending_download"
+    assert not first.exists()
+    assert second.exists()
+
+
+# -- browser suffix with both filename forms --
+
+
+def test_suffix_match_with_extension_bearing_filename(tmp_path, svc, extract_recorder):
+    """'Foo.zip' as filename must still match 'Foo-1234-1-0-ts.zip' on disk."""
+    archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo.zip", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert extract_recorder == [(archive, tmp_path)]
+
+
+def test_full_archive_name_matches_other_extension(tmp_path, svc, extract_recorder):
+    """A known full archive name matches the same stem under another extension."""
+    archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.7z")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo-1234-1-0-1699999999.zip", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert extract_recorder == [(archive, tmp_path)]
+
+
+# -- internal files and content validation --
+
+
+def test_generated_files_never_match(tmp_path, svc, extract_recorder, md5_counter):
+    """Generated load-order/plugins output is never a match candidate."""
+    (tmp_path / "plugins.txt").write_text("*Foo.esp\n")
+    (tmp_path / "load-order.txt").write_text("1234\n")
+    manifest = _manifest_with_md5(1234, 10, "plugins.txt", "c" * 32)
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Plugins",
+        "filename": "plugins.txt", "version": "1.0",
+    }], manifest_data=manifest)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 0
+    assert result.still_pending == 1
+    assert md5_counter == []  # generated files never hashed
+    assert extract_recorder == []
+
+
+def test_error_page_in_archive_name_stays_pending(tmp_path, svc, extract_recorder):
+    """HTML saved under an archive name must not count as downloaded."""
+    bogus = tmp_path / "Foo.zip"
+    bogus.write_bytes(b"<html><body>403 premium required</body></html>")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo.zip", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 0
+    assert result.still_pending == 1
+    assert any("Validation error" in e for e in result.errors)
+    assert bogus.exists()
+    assert extract_recorder == []
+    assert _reload(tmp_path).mods[10].download_status == "pending_download"
+
+
+def test_no_extract_still_rejects_invalid_archive(tmp_path, svc, extract_recorder):
+    """Validation applies in --no-extract mode too."""
+    bogus = tmp_path / "Foo-1234-1-0-1699999999.zip"
+    bogus.write_bytes(b"<html>error page</html>")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(tmp_path, no_load_order=True, no_extract=True)
+
+    assert result.matched == 0
+    assert result.still_pending == 1
+    assert any("Validation error" in e for e in result.errors)
+    assert _reload(tmp_path).mods[10].download_status == "pending_download"
+
+
+def test_loose_file_import_preserved(tmp_path, svc, extract_recorder):
+    """A legitimate non-archive download still imports without extraction."""
+    loose = tmp_path / "Readme-mod.txt"
+    loose.write_text("installation instructions")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Readme",
+        "filename": "Readme-mod.txt", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert result.extracted == 0
+    assert result.errors == []
+    assert loose.exists()
+    assert extract_recorder == []
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
+
+
+# -- malformed state types and post-save failures --
+
+
+def test_malformed_version_and_mod_id_types_do_not_crash(tmp_path, svc, extract_recorder):
+    """Hand-edited state with wrong types must not crash the suffix match."""
+    archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo", "version": "1.0",
+    }])
+    state_path = tmp_path / ".nexus-state.json"
+    data = json.loads(state_path.read_text())
+    data["mods"]["10"]["version"] = 1.0     # float instead of str
+    data["mods"]["10"]["mod_id"] = "1234"   # str instead of int
+    state_path.write_text(json.dumps(data))
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert extract_recorder == [(archive, tmp_path)]
+
+
+def test_loadorder_failure_reported_not_fatal(monkeypatch, tmp_path, svc, extract_recorder):
+    """Load-order failure after persisted imports is an error, not a crash."""
+    archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
+    manifest = _manifest_with_md5(1234, 10, "Foo.zip", _md5(archive))
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo", "version": "1.0",
+    }], manifest_data=manifest)
+
+    def broken_regen(mods_dir, state):
+        raise ValueError("malformed cached manifest")
+
+    monkeypatch.setattr(svc, "_regen_load_order_from_state", broken_regen)
+
+    result = svc.import_downloads(tmp_path)  # default flags: regen enabled
+
+    assert result.matched == 1
+    assert result.load_order_files == []
+    assert any("Load order regeneration failed" in e for e in result.errors)
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
+
+
+def test_track_sync_failure_reported_not_fatal(monkeypatch, tmp_path, svc, extract_recorder):
+    """Track-sync failure after persisted imports is an error, not a crash."""
+    _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
+    state = _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo", "version": "1.0",
+    }])
+    state.track_sync_enabled = True
+    state.save()
+
+    def broken_sync(st):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(svc, "_sync_tracked_mods", broken_sync)
+
+    result = svc.import_downloads(tmp_path, no_load_order=True)
+
+    assert result.matched == 1
+    assert any("Track sync failed" in e for e in result.errors)
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
