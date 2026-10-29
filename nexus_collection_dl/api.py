@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from . import __version__
+
 GRAPHQL_URL = "https://api.nexusmods.com/v2/graphql"
 REST_BASE_URL = "https://api.nexusmods.com/v1"
 
@@ -42,7 +44,7 @@ class NexusAPI:
         self.session.headers.update(
             {
                 "apikey": self.api_key,
-                "User-Agent": "nexus-collection-dl/0.1.0",
+                "User-Agent": f"nexus-collection-dl/{__version__}",
             }
         )
         self._last_request_time = 0.0

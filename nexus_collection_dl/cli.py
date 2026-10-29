@@ -9,6 +9,7 @@ from rich.table import Table
 
 from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
+from .deploy import DeployError, UndeployError
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
 from .version_check import check_for_update
@@ -135,7 +136,13 @@ def sync(
             console.print(f"[red]Error:[/red] {err}")
 
     if result.pending_downloads:
-        _print_pending_downloads(result.pending_downloads, mods_dir)
+        # Point users at the per-collection subdirectory the state lives in,
+        # not the parent mods directory. (The update command passes its
+        # MODS_DIR directly to service.update, which operates on that
+        # directory in place, so its callsite is already correct.)
+        _print_pending_downloads(
+            result.pending_downloads, result.collection_dir or mods_dir
+        )
     else:
         console.print(
             f"\n[green]Successfully synced {result.mods_downloaded} mods "
@@ -385,15 +392,13 @@ def deploy(
             use_copy=use_copy,
             on_progress=_cli_progress,
         )
-    except (StateError, NexusAPIError) as e:
+    except (StateError, NexusAPIError, DeployError) as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
     if result.errors:
         for err in result.errors:
             console.print(f"[red]Error:[/red] {err}")
-        if result.deployed_count == 0:
-            sys.exit(1)
 
     if result.conflicts:
         console.print(f"\n[yellow]Conflicts ({len(result.conflicts)}):[/yellow]")
@@ -405,6 +410,15 @@ def deploy(
     if result.warnings:
         for w in result.warnings:
             console.print(f"  [yellow]Warning:[/yellow] {w}")
+
+    if result.errors:
+        # Partial deployment: never report a clean success. State keeps the
+        # refused/failed entries so deploy/undeploy can be retried.
+        console.print(
+            f"\n[red]Deploy incomplete: {result.deployed_count} file(s) deployed, "
+            f"{len(result.errors)} error(s).[/red]"
+        )
+        sys.exit(1)
 
     console.print(
         f"\n[green]Deployed {result.deployed_count} files "
@@ -430,6 +444,11 @@ def undeploy(ctx: click.Context, mods_dir: Path) -> None:
     svc = ctx.obj["service"]
     try:
         removed = svc.undeploy(mods_dir)
+    except UndeployError as e:
+        # Partial undeploy: show exactly what was refused/failed. State keeps
+        # those entries, so undeploy can be re-run after fixing them.
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
     except StateError as e:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)

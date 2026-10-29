@@ -1,16 +1,68 @@
 """State management for tracking installed mods."""
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX platforms: locking degrades to a no-op
+    fcntl = None
+
 STATE_FILENAME = ".nexus-state.json"
+LOCK_FILENAME = ".nexus-state.lock"
 
 
 class StateError(Exception):
     """Raised when state file operations fail."""
     pass
+
+
+class StateBusyError(StateError):
+    """Raised when another deploy/undeploy holds the collection lock."""
+    pass
+
+
+class CollectionLock:
+    """Advisory lock that serializes deploy/undeploy per state directory.
+
+    Uses a non-blocking flock on a lock file inside the mods directory, so a
+    second concurrent deploy or undeploy for the same collection fails fast
+    with StateBusyError instead of interleaving mutations. The lock file
+    itself is never removed; it carries no state.
+    """
+
+    def __init__(self, mods_dir: Path):
+        self.lock_path = Path(mods_dir) / LOCK_FILENAME
+        self._fd: int | None = None
+
+    def __enter__(self) -> "CollectionLock":
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            raise StateBusyError(
+                f"Another nexus-dl deploy/undeploy is already running for "
+                f"{self.lock_path.parent}. Wait for it to finish and try again."
+            )
+        self._fd = fd
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        if self._fd is not None:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+                self._fd = None
+        return False
 
 
 class ModState:
@@ -139,7 +191,12 @@ class CollectionState:
             self.mods[file_id] = ModState.from_dict(file_id, mod_data)
 
     def save(self) -> None:
-        """Save state to file."""
+        """Save state atomically: unique temp file, fsync, then rename.
+
+        The previous state file stays intact until the new one is fully
+        written and fsynced, so a crash or serialization failure mid-write
+        can never leave a truncated or empty state file behind.
+        """
         self.mods_dir.mkdir(parents=True, exist_ok=True)
 
         data = {
@@ -158,8 +215,34 @@ class CollectionState:
             "track_sync_enabled": self.track_sync_enabled,
         }
 
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2)
+        # Temp file lives in the same directory as the target so the final
+        # os.replace() is guaranteed to stay on one filesystem.
+        fd, tmp_name = tempfile.mkstemp(
+            dir=self.mods_dir, prefix=f"{STATE_FILENAME}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, self.state_file)
+            # Make the rename itself durable where the platform allows it.
+            try:
+                dir_fd = os.open(self.mods_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        except BaseException:
+            # Serialization or write failure: drop the temp file and let the
+            # original state file stand untouched.
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
 
     def set_collection_info(
         self, url: str, name: str, revision: int, game_domain: str

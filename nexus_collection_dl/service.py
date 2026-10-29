@@ -11,11 +11,16 @@ from typing import Any, Callable
 from .api import NexusAPI, NexusAPIError, NexusPremiumRequired
 from .collection import parse_collection_url, parse_mod_url, CollectionParseError, ModParseError
 from .deploy import (
+    BackupStore,
+    DeployError,
+    DeployJournal,
+    UndeployError,
     classify_files,
     deploy as deploy_files,
     get_game_ini_path,
     get_plugins_txt_dest,
-    undeploy as undeploy_files,
+    recover_ownership,
+    undeploy_records,
     write_game_ini,
     write_plugins_txt,
 )
@@ -30,7 +35,7 @@ from .loot_sort import (
     write_loot_plugins_txt,
 )
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
-from .state import CollectionState, StateError, STATE_FILENAME
+from .state import CollectionState, CollectionLock, StateError, STATE_FILENAME
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
 
@@ -307,6 +312,53 @@ def _expected_md5_maps(
     by_identity = {k: next(iter(v)) for k, v in identity_hits.items() if len(v) == 1}
     by_name = {k: next(iter(v)) for k, v in name_hits.items() if len(v) == 1}
     return by_identity, by_name
+
+
+def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
+    """Attach already-known manifest MD5s to mod dicts before downloading.
+
+    The downloader verifies these before publishing a file. Hashes come only
+    from the cached manifest keyed by exact (mod_id, file_id) identity, so no
+    extra API calls are made and a hash is never attached across identities.
+    """
+    by_identity, _ = _expected_md5_maps(state.manifest_data)
+    if not by_identity:
+        return
+    for mod in mods:
+        if mod.get("expected_md5"):
+            continue
+        key = (_as_int(mod.get("mod_id")), _as_int(mod.get("file_id")))
+        md5 = by_identity.get(key)
+        if md5:
+            mod["expected_md5"] = md5
+
+
+def _validate_no_overlap(mods_dir: Path, game_dir: Path) -> str | None:
+    """Reject staging/game directory overlap. Returns an error message or None.
+
+    Deploying a staging directory onto itself (or into a directory that
+    contains it) would make undeploy delete staged mod files, so any overlap
+    is refused before anything is mutated.
+    """
+    staging = os.path.realpath(mods_dir)
+    game = os.path.realpath(game_dir)
+    sep = os.sep
+    if staging == game:
+        return (
+            "Refusing to deploy: the staging directory and the game directory "
+            f"are the same path ({staging})."
+        )
+    if game.startswith(staging + sep):
+        return (
+            "Refusing to deploy: the game directory "
+            f"({game}) is inside the staging directory ({staging})."
+        )
+    if staging.startswith(game + sep):
+        return (
+            "Refusing to deploy: the staging directory "
+            f"({staging}) is inside the game directory ({game})."
+        )
+    return None
 
 
 def _resolve_import_match(
@@ -602,9 +654,6 @@ class ModManagerService:
         if skip_optional:
             mods = [m for m in mods if not m.get("optional", False)]
 
-        if not mods:
-            return SyncResult(0, 0, [], [], collection_dir=mods_dir)
-
         # Initialize state
         state = CollectionState(mods_dir)
         if state.exists():
@@ -615,6 +664,12 @@ class ModManagerService:
             revision=collection_data["revision"],
             game_domain=collection_data["game_domain"],
         )
+
+        if not mods:
+            # Empty collection or every mod optional and skipped: persist the
+            # collection info so status/update recognize this collection.
+            state.save()
+            return SyncResult(0, 0, [], [], collection_dir=mods_dir)
 
         if not is_premium:
             # Free user: register mods as pending_download
@@ -678,6 +733,24 @@ class ModManagerService:
             mods_to_download = mods
             skipped = 0
 
+        # Prefetch the collection manifest once when it is not cached yet, so
+        # download integrity checks can use its MD5s even on a first sync.
+        # This is the same single public fetch _generate_load_order would do
+        # later, passed through to avoid a redundant second download. If it
+        # fails, downloads proceed with size-only verification.
+        prefetched_manifest = None
+        if state.manifest_data is None and collection_data.get("download_link"):
+            try:
+                prefetched_manifest = download_and_parse_manifest(
+                    collection_data["download_link"], session=self.api.session
+                )
+            except ManifestError:
+                prefetched_manifest = None
+        if prefetched_manifest is not None:
+            state.manifest_data = prefetched_manifest.to_dict()
+            state.mod_rules = prefetched_manifest.mod_rules
+            state.save()
+
         total_mods = len(mods_to_download)
         downloader = Downloader(self.api)
 
@@ -690,6 +763,7 @@ class ModManagerService:
                     progress("download", pct, f"Downloading... ({bytes_dl}/{total_bytes} bytes)")
 
             progress("download", 0.1, f"Downloading {total_mods} mods...")
+            _attach_expected_md5(state, mods_to_download)
             results = downloader.download_mods(
                 game_domain=collection_data["game_domain"],
                 mods=mods_to_download,
@@ -730,7 +804,9 @@ class ModManagerService:
         # Generate load order
         if not no_load_order:
             progress("loadorder", 0.9, "Generating load order...")
-            lo_files = self._generate_load_order(collection_data, mods_dir, state)
+            lo_files = self._generate_load_order(
+                collection_data, mods_dir, state, manifest=prefetched_manifest
+            )
             load_order_files = lo_files
 
         # Track sync
@@ -799,6 +875,7 @@ class ModManagerService:
                         progress("download", pct, f"Downloading...")
 
                 progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
+                _attach_expected_md5(state, mods_to_download)
                 results = downloader.download_mods(
                     game_domain=collection_data["game_domain"],
                     mods=mods_to_download,
@@ -921,7 +998,10 @@ class ModManagerService:
             "file_id": selected_file_id,
             "filename": selected.get("file_name", selected_name),
             "version": selected_version,
-            "size_bytes": int(selected.get("size_in_bytes") or selected.get("size", 0) or 0),
+            # Only size_in_bytes is an exact byte count. The legacy REST
+            # "size" field is in KB and must never be verified as bytes, so
+            # when it is the only value available the size check is skipped.
+            "size_bytes": int(selected.get("size_in_bytes") or 0),
             "optional": False,
             "requirements": [],
         }
@@ -933,7 +1013,8 @@ class ModManagerService:
             download_info["download_status"] = "pending_download"
             download_info["browser_url"] = browser_url
             state.add_mod(download_info)
-            state.mods[mod_info.mod_id].phase = 999
+            # State is keyed by file_id, not mod_id
+            state.mods[selected_file_id].phase = 999
             state.save()
 
             pending = PendingDownload(
@@ -957,6 +1038,7 @@ class ModManagerService:
 
         progress("download", 0.2, f"Downloading {mod_name}...")
         downloader = Downloader(self.api)
+        _attach_expected_md5(state, [download_info])
         results = downloader.download_mods(
             game_domain=mod_info.game_domain,
             mods=[download_info],
@@ -985,7 +1067,8 @@ class ModManagerService:
         # Register in state as manual
         download_info["manual"] = True
         state.add_mod(download_info)
-        state.mods[mod_info.mod_id].phase = 999
+        # State is keyed by file_id, not mod_id
+        state.mods[selected_file_id].phase = 999
         state.save()
 
         self._maybe_sync_tracked(state)
@@ -1005,15 +1088,19 @@ class ModManagerService:
         state = CollectionState(mods_dir)
         state.load()
 
+        # State is keyed by file_id: pick a negative id that is unique among
+        # both file_id keys and mod_ids, and use it for both so repeated
+        # add-local calls never collide and the phase lookup below is valid.
         existing_ids = set(state.mods.keys())
+        existing_mod_ids = {ms.mod_id for ms in state.mods.values()}
         synthetic_id = -1
-        while synthetic_id in existing_ids:
+        while synthetic_id in existing_ids or synthetic_id in existing_mod_ids:
             synthetic_id -= 1
 
         mod_info = {
             "mod_id": synthetic_id,
             "mod_name": name,
-            "file_id": 0,
+            "file_id": synthetic_id,
             "filename": "",
             "version": "",
             "optional": False,
@@ -1040,7 +1127,8 @@ class ModManagerService:
                 name=f.get("name", f.get("file_name", "")),
                 version=f.get("version", ""),
                 category=category_names.get(f.get("category_id", 0), "Unknown"),
-                size_bytes=(f.get("size_in_bytes") or f.get("size", 0)),
+                # Legacy "size" is in KB; only size_in_bytes is reported as bytes
+                size_bytes=(f.get("size_in_bytes") or 0),
             )
             for f in files
         ]
@@ -1059,8 +1147,10 @@ class ModManagerService:
 
         # 2. No mods extracted
         mod_files = [f for f in mods_dir.iterdir() if f.is_file() or f.is_dir()]
-        # Filter out state file
-        mod_files = [f for f in mod_files if f.name != ".nexus-state.json"]
+        # Filter out internal files this tool generates in the mods dir
+        # (.nexus-state.json, .nexus-state.lock, .nexus-journal.jsonl,
+        # .nexus-backups/)
+        mod_files = [f for f in mod_files if not f.name.startswith(".")]
         if not mod_files:
             warnings.append(DeployWarning(
                 "no_mods", "No mods found in mods directory", "error"
@@ -1132,117 +1222,238 @@ class ModManagerService:
         use_copy: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> DeployResult:
-        """Deploy mods from staging to game directory."""
+        """Deploy mods from staging to game directory.
+
+        The deployment is tracked and reversible: originals at destination
+        paths are backed up before being replaced, every mutation is
+        journaled, and files changed outside nexus-dl are refused instead of
+        overwritten. The previous deployment is removed safely first; if any
+        old entry cannot be safely removed, the redeploy stops and the
+        remaining entries stay in state for retry.
+        """
         progress = on_progress or _noop_progress
 
-        state = CollectionState(mods_dir)
-        state.load()
-        game_domain = state.game_domain
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+            game_domain = state.game_domain
 
-        # Resolve game directory
-        if game_dir is None and state.game_dir:
-            game_dir = Path(state.game_dir)
-        if game_dir is None:
-            progress("detect", 0.05, "Detecting game directory from Steam...")
-            game_dir = find_game_dir(game_domain)
+            # Resolve game directory
+            if game_dir is None and state.game_dir:
+                game_dir = Path(state.game_dir)
             if game_dir is None:
-                return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False, warnings=[])
+                progress("detect", 0.05, "Detecting game directory from Steam...")
+                game_dir = find_game_dir(game_domain)
+                if game_dir is None:
+                    return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False, warnings=[])
 
-        if not game_dir.exists():
-            return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=[])
+            if not game_dir.exists():
+                return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=[])
 
-        # Pre-deploy validation
-        method = "copy" if use_copy else "symlink"
-        check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method)
-        deploy_warnings = [w.message for w in check_warnings]
+            overlap_error = _validate_no_overlap(mods_dir, game_dir)
+            if overlap_error:
+                return DeployResult(0, [], [overlap_error], str(game_dir), False, warnings=[])
 
-        # Block on errors
-        errors_found = [w for w in check_warnings if w.severity == "error"]
-        if errors_found:
+            # Trusted roots for recovery come from configuration only (never
+            # from journal content): the resolved game dir plus any recorded
+            # game dir/prefix from previous runs.
+            recovery_roots: list[Path] = []
+            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+                if candidate:
+                    p = Path(candidate)
+                    if p not in recovery_roots:
+                        recovery_roots.append(p)
+
+            # Recover from any interrupted deploy/undeploy before mutating.
+            ownership, reports = recover_ownership(
+                state.deployed_files, mods_dir, recovery_roots
+            )
+            journal = DeployJournal(mods_dir)
+            if journal.exists() or reports:
+                state.deployed_files = list(ownership.values())
+                state.save()
+                journal.clear()
+
+            # Pre-deploy validation
+            method = "copy" if use_copy else "symlink"
+            check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method)
+            deploy_warnings = [w.message for w in check_warnings]
+            deploy_warnings.extend(reports)
+
+            # Block on errors
+            errors_found = [w for w in check_warnings if w.severity == "error"]
+            if errors_found:
+                return DeployResult(
+                    0, [], [w.message for w in errors_found], str(game_dir), False,
+                    warnings=deploy_warnings,
+                )
+
+            # Resolve Proton prefix
+            if prefix is None and state.proton_prefix:
+                prefix = Path(state.proton_prefix)
+            if prefix is None:
+                prefix = find_proton_prefix(game_domain)
+
+            # Preflight: classify BEFORE any destructive removal of the old
+            # deployment, so a staging directory with nothing deployable
+            # never tears down a working deployment.
+            progress("classify", 0.15, "Classifying files...")
+            manifest_choices = {}
+            if state.manifest_data:
+                manifest = CollectionManifest.from_dict(state.manifest_data)
+                manifest_choices = manifest.mod_choices
+            plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
+
+            if plan.total_files == 0:
+                errors: list[str] = []
+                if ownership:
+                    errors.append(
+                        "Nothing to deploy; the existing deployment was left "
+                        "in place (run undeploy to remove it)."
+                    )
+                return DeployResult(0, [], errors, str(game_dir), False, skipped=len(plan.skipped), warnings=deploy_warnings)
+
+            backups = BackupStore(mods_dir)
+            roots = []
+            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+                if candidate:
+                    p = Path(candidate)
+                    if p not in roots:
+                        roots.append(p)
+
+            # Remove previous deployment safely; stop the redeploy when any
+            # old entry cannot be verified and removed.
+            if ownership:
+                progress("undeploy", 0.1, "Removing previous deployment...")
+                kept, problems, _notes, _cleared = undeploy_records(ownership, roots, backups, journal)
+                if kept:
+                    state.deployed_files = kept
+                    state.save()
+                    # Journal kept: entries were not all safely resolved, so
+                    # dangling intents must stay recoverable for the next run.
+                    errors = [
+                        f"Redeploy stopped: {len(kept)} previously deployed "
+                        f"file(s) could not be safely removed. Resolve the "
+                        f"reported issues and run deploy (or undeploy) again."
+                    ] + problems
+                    return DeployResult(
+                        0, [], errors, str(game_dir), False, warnings=deploy_warnings
+                    )
+                state.deployed_files = []
+                state.deployed_at = None
+
+            # Deploy
+            progress("deploy", 0.3, f"Deploying {plan.total_files} files via {method}...")
+            result = deploy_files(
+                plan, game_dir, method=method, dry_run=False,
+                backups=backups, journal=journal, ownership=ownership,
+            )
+
+            # Write plugins.txt and the game INI through the same tracking,
+            # but only when the file deployment itself had no failures.
+            if prefix and result.errors:
+                deploy_warnings.append(
+                    "Skipped plugins.txt/game INI writes because the "
+                    "deployment reported errors."
+                )
+            if prefix and not result.errors:
+                plugins_src = mods_dir / "plugins.txt"
+                plugins_dest = get_plugins_txt_dest(prefix, game_domain)
+                if plugins_dest and plugins_src.exists():
+                    try:
+                        write_plugins_txt(
+                            plugins_src, plugins_dest,
+                            root=prefix, backups=backups, journal=journal,
+                            ownership=ownership,
+                        )
+                    except (DeployError, OSError) as e:
+                        result.errors.append(f"plugins.txt: {e}")
+                ini_path = get_game_ini_path(prefix, game_domain)
+                if ini_path:
+                    try:
+                        write_game_ini(
+                            ini_path, game_domain,
+                            root=prefix, backups=backups, journal=journal,
+                            ownership=ownership,
+                        )
+                    except (DeployError, OSError) as e:
+                        result.errors.append(f"game INI: {e}")
+
+            # Save state
+            state.game_dir = str(game_dir)
+            if prefix:
+                state.proton_prefix = str(prefix)
+            state.deployed_files = list(ownership.values())
+            state.deployed_at = (
+                datetime.now(timezone.utc).isoformat() if ownership else None
+            )
+            state.save()
+            if not result.errors:
+                # Only a clean run may discard the journal: every record is
+                # accounted for in the saved state. On errors, keep it so
+                # dangling intents stay recoverable on the next run.
+                journal.clear()
+
+            has_sfse = any("sfse_loader" in str(f.dest).lower() for f in result.deployed)
+
+            progress("done", 1.0, f"Deployed {len(result.deployed)} files")
             return DeployResult(
-                0, [], [w.message for w in errors_found], str(game_dir), False,
+                deployed_count=len(result.deployed),
+                conflicts=result.conflicts,
+                errors=result.errors,
+                game_dir=str(game_dir),
+                has_sfse=has_sfse,
+                skipped=len(result.skipped),
                 warnings=deploy_warnings,
             )
 
-        # Resolve Proton prefix
-        if prefix is None and state.proton_prefix:
-            prefix = Path(state.proton_prefix)
-        if prefix is None:
-            prefix = find_proton_prefix(game_domain)
+    def undeploy(self, mods_dir: Path) -> int:
+        """Remove all deployed mod files and restore backed-up originals.
 
-        # Remove previous deployment
-        if state.deployed_files:
-            progress("undeploy", 0.1, "Removing previous deployment...")
-            undeploy_files(state.deployed_files)
+        Returns the number of cleared deployment entries on full success.
+        Raises UndeployError (after persisting state) when any entry was
+        refused or failed, carrying the removed count plus the refused and
+        failed paths, so callers never report a partial undeploy as clean.
+        Refused/failed entries stay in state so the operation is retryable.
+        """
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+
+            roots = [Path(p) for p in (state.game_dir, state.proton_prefix) if p]
+            ownership, reports = recover_ownership(state.deployed_files, mods_dir, roots)
+            journal = DeployJournal(mods_dir)
+            if journal.exists() or reports:
+                state.deployed_files = list(ownership.values())
+                state.save()
+                journal.clear()
+
+            if not ownership:
+                if state.deployed_files or state.deployed_at:
+                    state.deployed_files = []
+                    state.deployed_at = None
+                    state.game_dir = ""
+                    state.save()
+                return 0
+
+            backups = BackupStore(mods_dir)
+            kept, problems, _notes, cleared = undeploy_records(ownership, roots, backups, journal)
+
+            if kept:
+                # Keep the remaining records (and backups) for retry; never
+                # clear state or the journal before a fully safe undeploy.
+                state.deployed_files = kept
+                state.save()
+                refused = [m for m in problems if m.startswith("refused")]
+                failed = [m for m in problems if not m.startswith("refused")]
+                raise UndeployError(removed=cleared, refused=refused, failed=failed)
+
             state.deployed_files = []
             state.deployed_at = None
-
-        # Classify files
-        progress("classify", 0.2, "Classifying files...")
-        # Load manifest choices for FOMOD filtering
-        manifest_choices = {}
-        if state.manifest_data:
-            manifest = CollectionManifest.from_dict(state.manifest_data)
-            manifest_choices = manifest.mod_choices
-        plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
-
-        if plan.total_files == 0:
-            return DeployResult(0, [], [], str(game_dir), False, skipped=len(plan.skipped), warnings=deploy_warnings)
-
-        # Deploy
-        progress("deploy", 0.3, f"Deploying {plan.total_files} files via {method}...")
-        result = deploy_files(plan, game_dir, method=method, dry_run=False)
-
-        # Write plugins.txt
-        if prefix:
-            plugins_src = mods_dir / "plugins.txt"
-            plugins_dest = get_plugins_txt_dest(prefix, game_domain)
-            if plugins_dest and plugins_src.exists():
-                write_plugins_txt(plugins_src, plugins_dest)
-
-        # Write game INI
-        if prefix:
-            ini_path = get_game_ini_path(prefix, game_domain)
-            if ini_path:
-                write_game_ini(ini_path, game_domain)
-
-        # Save state
-        state.game_dir = str(game_dir)
-        if prefix:
-            state.proton_prefix = str(prefix)
-        state.deployed_files = [f.to_dict() for f in result.deployed]
-        state.deployed_at = datetime.now(timezone.utc).isoformat()
-        state.save()
-
-        has_sfse = any("sfse_loader" in str(f.dest).lower() for f in result.deployed)
-
-        progress("done", 1.0, f"Deployed {len(result.deployed)} files")
-        return DeployResult(
-            deployed_count=len(result.deployed),
-            conflicts=result.conflicts,
-            errors=result.errors,
-            game_dir=str(game_dir),
-            has_sfse=has_sfse,
-            skipped=len(result.skipped),
-            warnings=deploy_warnings,
-        )
-
-    def undeploy(self, mods_dir: Path) -> int:
-        """Remove all deployed mod files. Returns count of removed files."""
-        state = CollectionState(mods_dir)
-        state.load()
-
-        if not state.deployed_files:
-            return 0
-
-        removed = undeploy_files(state.deployed_files)
-
-        state.deployed_files = []
-        state.deployed_at = None
-        state.game_dir = ""
-        state.save()
-
-        return removed
+            state.game_dir = ""
+            state.save()
+            journal.clear()
+            return cleared
 
     def regenerate_load_order(self, mods_dir: Path) -> list[str]:
         """Regenerate load order from cached manifest. Returns list of written file names."""
@@ -1468,18 +1679,28 @@ class ModManagerService:
     # -- internal helpers --
 
     def _generate_load_order(
-        self, collection_data: dict, mods_dir: Path, state: CollectionState
+        self,
+        collection_data: dict,
+        mods_dir: Path,
+        state: CollectionState,
+        manifest: CollectionManifest | None = None,
     ) -> list[str]:
-        """Download manifest and generate load order. Returns list of written filenames."""
-        download_link = collection_data.get("download_link")
-        if not download_link:
-            return []
+        """Generate load order from a manifest. Returns list of written filenames.
 
-        try:
-            session = self.api.session
-            manifest = download_and_parse_manifest(download_link, session=session)
-        except ManifestError:
-            return []
+        `manifest` may be passed in when the caller already fetched it (e.g.
+        sync prefetches it for download MD5 verification); otherwise it is
+        downloaded here.
+        """
+        if manifest is None:
+            download_link = collection_data.get("download_link")
+            if not download_link:
+                return []
+
+            try:
+                session = self.api.session
+                manifest = download_and_parse_manifest(download_link, session=session)
+            except ManifestError:
+                return []
 
         mod_requirements: dict[int, list[int]] = {}
         for mod in collection_data.get("mods", []):
@@ -1577,7 +1798,9 @@ class ModManagerService:
         """Sync local mod list with Nexus tracked mods."""
         remote = self.api.get_tracked_mods()
         remote_ids = {m["mod_id"] for m in remote if m["domain_name"] == state.game_domain}
-        local_ids = {mid for mid in state.mods if mid > 0}
+        # State is keyed by file_id; Nexus tracks mod_ids. A multi-file mod
+        # contributes one mod_id no matter how many files it has.
+        local_ids = {ms.mod_id for ms in state.mods.values() if ms.mod_id > 0}
 
         to_track = local_ids - remote_ids
         to_untrack = remote_ids - local_ids

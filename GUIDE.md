@@ -289,6 +289,14 @@ This means:
 - You can "undeploy" cleanly at any time
 - Updating mods automatically updates what the game sees
 
+Deploying is tracked and reversible. If a file already exists where a mod file needs to go (your own config, a file from another manager), it is backed up byte-for-byte first, including permissions and symlink targets, into a private `.nexus-backups/` folder inside your collection directory. `plugins.txt` and the game's custom INI are tracked the same way, and your originals are put back on undeploy.
+
+Every deployed file is fingerprinted (a SHA256 hash for copies, the exact link target for symlinks). If something changes a deployed file behind the tool's back, undeploy and redeploy refuse to touch that path and tell you which one it is, rather than deleting your edit. Fix or remove the file yourself and re-run, and it finishes the job. Each step is also journaled, so if a deploy or undeploy is interrupted (crash, power loss, Ctrl-C), the next run picks up where it left off without guessing.
+
+Two limitations worth knowing:
+- Deployments made before version 0.2.1 kept no backups, so originals those deploys replaced cannot be restored. Removing those old entries requires the deployed file to still match the staging source.
+- Destination paths reached through symlinked parent directories (for example, `Data/` itself being a symlink to another drive) are refused instead of followed. This is deliberate: the tool will not mutate files outside the game directory it was pointed at.
+
 ### Preview before deploying
 
 ```bash
@@ -304,6 +312,8 @@ To undo a deployment and restore your game directory:
 ```bash
 nexus-dl undeploy ~/mods/bg3
 ```
+
+This removes every deployed symlink/copy, restores the backed-up originals (including your original `plugins.txt` and INI files), and cleans up the empty folders it created. If a path can't be removed safely (it was edited outside the tool, or its backup is missing), undeploy reports that path, keeps it tracked, and exits with an error so you know it's unfinished. Resolve the reported file and run undeploy again to complete the restore.
 
 ## Using the web UI
 
