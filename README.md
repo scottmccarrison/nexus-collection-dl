@@ -160,6 +160,8 @@ Creates symlinks (or copies) from your staging directory into the game's install
 
 Redeploying is safe - it removes previously deployed files before creating new ones, so no orphaned symlinks accumulate.
 
+**How deployment stays safe:** any file that already exists at a destination (regular file or symlink) is backed up byte-for-byte, including permissions and symlink targets, in a private `.nexus-backups/` directory inside the collection folder before it is replaced. `undeploy` restores those originals. Every deployed file is fingerprinted (SHA256 for copies, exact link target for symlinks), and if a deployed file was changed outside nexus-dl, removal or replacement is refused and the path is reported instead of destroying your edit. Each step is journaled, so an interrupted deploy or undeploy resumes cleanly on the next run. Limitations: deployments made by versions before 0.2.1 have no backups, so originals they replaced cannot be restored, and destination paths reached through symlinked parent directories are refused (fail closed) rather than followed.
+
 **SFSE/script extender note:** If the collection includes SFSE, the tool deploys `sfse_loader.exe` to the game root and prints launch instructions. For non-Steam games, set your Steam shortcut TARGET to `sfse_loader.exe`. Do not rename it - SFSE needs the original game executable alongside it.
 
 ### Add individual mods
@@ -213,7 +215,7 @@ Opt-in only - won't touch your tracked mods unless you explicitly enable it. Dis
 nexus-dl undeploy ~/mods/starfield
 ```
 
-Removes all symlinks/copies that were deployed and restores the game directory to its pre-mod state.
+Removes all symlinks/copies that were deployed and restores the game directory to its pre-mod state, including original files and config files (`plugins.txt`, the game's custom INI) that existed before deploying. Removal is verified: if a deployed file was modified outside nexus-dl, or its backup is missing, that path is refused and reported, the entry stays in state, and re-running `undeploy` after resolving it finishes the job.
 
 ### Import manually downloaded files
 
@@ -312,8 +314,8 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
 - **add-local** - Registers an already-present mod in the state without downloading anything.
 - **import** - Matches manually downloaded files to pending mods, extracts archives, and regenerates load order. Used with free accounts after downloading files through the browser.
-- **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files.
-- **undeploy** - Removes all deployed files using the tracked manifest, restoring the game directory.
+- **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files. Backs up any pre-existing destination file first and journals every mutation for crash recovery.
+- **undeploy** - Removes all deployed files using the tracked manifest, restoring backed-up originals. Refuses (and reports) entries that were changed externally or whose backup is missing, keeping them retryable.
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
