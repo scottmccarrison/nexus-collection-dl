@@ -694,15 +694,20 @@ def fingerprint_state(dest: Path, rec: dict) -> tuple[str, str | None, str | Non
                 return "original", actual, None
             return "unknown", actual, None
         # Legacy copy record: compare against the staging source content.
-        src = rec.get("src", "")
-        src_path = Path(src)
-        if src and src_path.is_file():
-            try:
-                actual = sha256_file(dest)
-                if actual == sha256_file(src_path):
-                    return "deployed", actual, None
-            except DeployError:
-                return "unknown", None, None
+        # Current-format records must never match by source content: a
+        # symlink deployment whose dest was externally replaced by a regular
+        # file is not ours even when the bytes equal the staging source
+        # (ownership is positive per kind), so it stays "unknown".
+        if is_legacy_record(rec):
+            src = rec.get("src", "")
+            src_path = Path(src)
+            if src and src_path.is_file():
+                try:
+                    actual = sha256_file(dest)
+                    if actual == sha256_file(src_path):
+                        return "deployed", actual, None
+                except DeployError:
+                    return "unknown", None, None
         return "unknown", None, None
 
     return "unknown", None, None

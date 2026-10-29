@@ -23,6 +23,7 @@ from nexus_collection_dl.deploy import (
     DeploymentPlan,
     UndeployError,
     deploy as run_deploy,
+    fingerprint_state,
     get_game_ini_path,
     get_plugins_txt_dest,
     recover_ownership,
@@ -1212,3 +1213,65 @@ def test_service_corrupt_backup_mid_restore_never_replaces_deployed_file(
     state = CollectionState(mods)
     state.load()
     assert state.deployed_files == []
+
+
+def test_symlink_deploy_replaced_by_matching_regular_file_refused(env: Env):
+    """Positive per-kind ownership: a symlink deployment externally replaced
+    by a regular file is never ours, even when the bytes match the staging
+    source (the pre-fix source-content fallback treated it as deployed)."""
+    src = _src(env, "mod.esp", b"mod content")
+    _deploy(env, [(src, Path("mod.esp"))], method="symlink")
+    dest = env.game / "Data" / "mod.esp"
+    assert dest.is_symlink()
+
+    dest.unlink()
+    dest.write_bytes(b"mod content")  # external regular file, staging bytes
+
+    rec = env.ownership[str(dest)]
+    assert fingerprint_state(dest, rec)[0] == "unknown"
+
+    # Undeploy refuses and leaves the external file alone
+    kept, problems, _notes, cleared = _undeploy(env)
+    assert cleared == 0 and len(kept) == 1
+    assert any("changed outside" in p for p in problems)
+    assert dest.read_bytes() == b"mod content"
+    assert not dest.is_symlink()
+
+    # Redeploy refuses to replace it as well
+    result = _deploy(env, [(src, Path("mod.esp"))], method="symlink")
+    assert len(result.errors) == 1 and "changed outside" in result.errors[0]
+    assert dest.read_bytes() == b"mod content"
+    assert not dest.is_symlink()
+
+
+def test_symlink_over_original_symlink_replaced_by_regular_file_refused(env: Env):
+    """Same guarantee when the recorded original was itself a symlink (the
+    record has neither sha256 nor orig_sha256): a regular-file replacement
+    matching staging bytes is external content, never ours."""
+    user_target = env.tmp / "user-target.txt"
+    user_target.write_bytes(b"user target content")
+    dest = env.game / "Data" / "mod.esp"
+    dest.parent.mkdir(parents=True)
+    os.symlink(user_target, dest)
+
+    src = _src(env, "mod.esp", b"mod content")
+    _deploy(env, [(src, Path("mod.esp"))], method="symlink")
+    assert dest.is_symlink()
+    rec = env.ownership[str(dest)]
+    assert rec["had_original"] and rec["orig_link_target"] == str(user_target)
+    assert rec["sha256"] is None and rec["orig_sha256"] is None
+
+    dest.unlink()
+    dest.write_bytes(b"mod content")  # external regular file, staging bytes
+    assert fingerprint_state(dest, rec)[0] == "unknown"
+
+    kept, problems, _notes, cleared = _undeploy(env)
+    assert cleared == 0 and len(kept) == 1
+    assert any("changed outside" in p for p in problems)
+    assert dest.read_bytes() == b"mod content"
+    assert not dest.is_symlink()
+
+    result = _deploy(env, [(src, Path("mod.esp"))], method="symlink")
+    assert len(result.errors) == 1 and "changed outside" in result.errors[0]
+    assert dest.read_bytes() == b"mod content"
+    assert not dest.is_symlink()

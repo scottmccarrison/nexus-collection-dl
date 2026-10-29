@@ -136,7 +136,13 @@ def sync(
             console.print(f"[red]Error:[/red] {err}")
 
     if result.pending_downloads:
-        _print_pending_downloads(result.pending_downloads, mods_dir)
+        # Point users at the per-collection subdirectory the state lives in,
+        # not the parent mods directory. (The update command passes its
+        # MODS_DIR directly to service.update, which operates on that
+        # directory in place, so its callsite is already correct.)
+        _print_pending_downloads(
+            result.pending_downloads, result.collection_dir or mods_dir
+        )
     else:
         console.print(
             f"\n[green]Successfully synced {result.mods_downloaded} mods "

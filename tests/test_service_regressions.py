@@ -256,3 +256,57 @@ def test_sync_first_run_prefetches_manifest_for_md5(svc, tmp_path, monkeypatch):
     state = CollectionState(result.collection_dir)
     state.load()
     assert state.manifest_data is not None  # cached for future syncs
+
+
+# ---------------------------------------------------------------------------
+# CLI: pending-download instructions point at the collection subdirectory
+# ---------------------------------------------------------------------------
+
+def test_cli_pending_instructions_point_at_collection_dir(tmp_path, monkeypatch):
+    """Real CliRunner run of `sync`: the generated save/import instructions
+    must name the per-collection subdirectory, not the parent mods dir."""
+    from click.testing import CliRunner
+
+    from nexus_collection_dl import cli as cli_module
+    from nexus_collection_dl.service import PendingDownload, SyncResult
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    collection_dir = mods / "My Collection"
+    collection_dir.mkdir()
+
+    class FakeService:
+        def __init__(self, api_key=None, force_free=False):
+            pass
+
+        def sync(self, collection_url, mods_dir, skip_optional=False,
+                 no_load_order=False, no_extract=False, on_progress=None):
+            return SyncResult(
+                mods_downloaded=0, mods_extracted=0, errors=[],
+                load_order_files=[],
+                pending_downloads=[PendingDownload(
+                    mod_id=1, mod_name="Manual Mod", file_id=2,
+                    filename="Manual-1.0.zip", size_bytes=1024,
+                    browser_url=(
+                        "https://www.nexusmods.com/skyrimspecialedition"
+                        "/mods/1?tab=files&file_id=2"
+                    ),
+                )],
+                collection_dir=collection_dir,
+            )
+
+    monkeypatch.setattr(cli_module, "ModManagerService", FakeService)
+    monkeypatch.setattr(cli_module, "check_for_update", lambda: None)
+    monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["--api-key", "k", "--skip-update-check", "sync",
+         COLLECTION_URL, str(mods)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Manual-1.0.zip" in result.output
+    assert f"save them to {collection_dir}" in result.output
+    assert f"nexus-dl import {collection_dir}" in result.output
+    # The parent mods dir alone must never be the instructed target
+    assert f"nexus-dl import {mods}\n" not in result.output
