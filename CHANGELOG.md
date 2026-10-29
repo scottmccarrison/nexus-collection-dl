@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `import` matching for browser-downloaded files - deterministic matching using exact archive names, verified content hashes, and the Nexus `-modid-version-timestamp` filename suffix instead of fuzzy word matching
+- Ambiguous or unverifiable downloads now stay pending with an actionable error instead of silently importing the wrong file
+- Each downloaded file can only fulfill one pending mod per import, and internal state/config files are no longer match candidates
+
+### Removed
+
+- `tqdm` dependency - import progress now goes through the existing progress callback
+
 ## [0.2.0] - 2026-03-02
 
 ### Added

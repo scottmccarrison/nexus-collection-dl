@@ -3,7 +3,6 @@
 import os
 import re
 import hashlib
-from tqdm import tqdm
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -165,6 +164,208 @@ class ModFileInfo:
 
 def _noop_progress(event: str, pct: float, msg: str) -> None:
     pass
+
+
+def _file_md5(path: Path) -> str | None:
+    """Compute the MD5 hex digest of a file, or None if it cannot be read.
+
+    Module-level so tests can monkeypatch it to observe lazy hashing.
+    """
+    h = hashlib.md5()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _as_int(value: Any) -> int | None:
+    """Best-effort int conversion for manifest identity fields."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _normalize_version(version: str) -> str:
+    """Normalize a version string for comparison.
+
+    Browser downloads encode versions with hyphens ("1-0-3") while the API
+    reports dots ("1.0.3"); treat the separators as equivalent.
+    """
+    return version.strip().lower().replace(".", "-")
+
+
+# Browser downloads are named "{logical}-{modId}-{version}-{unixTimestamp}".
+# The timestamp is unix seconds (9-10 digits today); 6-12 digits stays
+# permissive for old uploads while still requiring a long numeric tail.
+_BROWSER_TIMESTAMP_RE = r"\d{6,12}"
+
+
+def _browser_suffix_match(logical_name: str, mod_id: int, version: str, stem: str) -> bool:
+    """Check a disk filename stem against the Nexus browser-download suffix.
+
+    Requires the full "{logical}-{modId}-{version}-{timestamp}" shape built
+    from known mod/file identity. Never matches on loose word overlap: if the
+    identity cannot be established, this returns False and the item stays
+    pending instead of risking a false match.
+    """
+    if mod_id <= 0:
+        return False  # identity unknown; refuse to guess
+    logical = logical_name.strip().lower()
+    if not logical:
+        return False
+    prefix = f"{logical}-{mod_id}-"
+    s = stem.lower()
+    if not s.startswith(prefix):
+        return False
+    rest = s[len(prefix):]
+    m = re.match(rf"^(.+)-({_BROWSER_TIMESTAMP_RE})$", rest)
+    if not m:
+        return False
+    file_version = m.group(1)
+    if version and version.strip():
+        return _normalize_version(file_version) == _normalize_version(version)
+    # Version unknown: still require the version segment to start with a digit
+    return file_version[0].isdigit()
+
+
+def _expected_md5_maps(
+    manifest_data: Any,
+) -> tuple[dict[tuple[int, int], str], dict[str, str]]:
+    """Build expected-MD5 lookups from cached manifest mod_rules.
+
+    Returns (by_identity, by_name):
+      by_identity: (mod_id, file_id) -> md5
+      by_name:     lowercase logical filename -> md5
+
+    Malformed or incomplete manifest entries are skipped silently; hashes are
+    a verification aid, never a requirement for matching.
+    """
+    by_identity: dict[tuple[int, int], str] = {}
+    by_name: dict[str, str] = {}
+    if not isinstance(manifest_data, dict):
+        return by_identity, by_name
+    rules = manifest_data.get("mod_rules")
+    if not isinstance(rules, list):
+        return by_identity, by_name
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        for side in ("source", "reference"):
+            entry = rule.get(side)
+            if not isinstance(entry, dict):
+                continue
+            md5 = ""
+            for key in ("fileMD5", "fileMd5", "file_md5"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    md5 = value.strip().lower()
+                    break
+            if not md5:
+                continue
+            mod_id = _as_int(entry.get("modId")) or _as_int(entry.get("modID"))
+            file_id = _as_int(entry.get("fileID")) or _as_int(entry.get("fileId"))
+            if mod_id and file_id:
+                by_identity[(mod_id, file_id)] = md5
+            for key in ("logicalFileName", "logicalFilename"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    by_name.setdefault(value.strip().lower(), md5)
+    return by_identity, by_name
+
+
+def _resolve_import_match(
+    filename: str,
+    mod_id: int,
+    version: str,
+    candidates: list[Path],
+    expected_md5: str | None,
+    md5_cache: dict[Path, str | None],
+    archive_cache: dict[Path, bool],
+) -> tuple[Path | None, list[Path]]:
+    """Find the single disk file that fulfills one pending download.
+
+    Deterministic precedence, strongest identity first:
+      1. exact full filename, case-insensitive (premium downloads keep the
+         archive name)
+      2. verified content MD5, only when the manifest provides one
+      3. exact stem match, so logical/display names without extensions
+         (GraphQL file.name) match "Name.zip"/"Name.7z" (archives only)
+      4. Nexus browser suffix "{logical}-{modId}-{version}-{timestamp}"
+         parsed from known identity (archives only)
+
+    Returns (matched_path, ambiguous_candidates). A level with several hits
+    is ambiguous: matching continues at the next level so stronger evidence
+    can resolve it, and if nothing resolves, the ambiguity is reported
+    instead of silently picking a file.
+    """
+    filename_lower = filename.strip().lower()
+    ambiguous: list[Path] = []
+
+    # 1. Exact full filename (case-insensitive)
+    if filename_lower:
+        exact = [p for p in candidates if p.name.lower() == filename_lower]
+        if len(exact) == 1:
+            return exact[0], []
+        if exact:
+            ambiguous = exact
+
+    # 2. Verified content hash. Lazy: files are hashed only when an expected
+    #    hash exists, and each unique candidate is hashed at most once.
+    if expected_md5:
+        hits = []
+        for p in candidates:
+            if p not in md5_cache:
+                md5_cache[p] = _file_md5(p)
+            if md5_cache[p] == expected_md5:
+                hits.append(p)
+        if len(hits) == 1:
+            return hits[0], []
+        if len(hits) > 1:
+            # Byte-identical duplicates (e.g. a browser re-download saved as
+            # "Foo (1).zip"): content is verified for every hit, so picking
+            # deterministically by name is safe.
+            return min(hits, key=lambda p: p.name.lower()), []
+
+    # Name-pattern levels only consider archives, so loose extracted files
+    # (e.g. "ModName.pak" from an earlier import) can never false-match.
+    def _is_archive_candidate(p: Path) -> bool:
+        if p not in archive_cache:
+            archive_cache[p] = is_archive(p)
+        return archive_cache[p]
+
+    stem_lower = Path(filename_lower).stem if filename_lower else ""
+
+    # 3. Exact stem match: "Foo" matches "Foo.zip" or "Foo.7z"
+    if stem_lower:
+        hits = [
+            p for p in candidates
+            if _is_archive_candidate(p) and p.stem.lower() == stem_lower
+        ]
+        if len(hits) == 1:
+            return hits[0], []
+        if hits and not ambiguous:
+            ambiguous = hits
+
+    # 4. Browser-download suffix built from known mod/file identity
+    if stem_lower and mod_id > 0:
+        hits = [
+            p for p in candidates
+            if _is_archive_candidate(p)
+            and _browser_suffix_match(filename, mod_id, version, p.stem)
+        ]
+        if len(hits) == 1:
+            return hits[0], []
+        if hits and not ambiguous:
+            ambiguous = hits
+
+    return None, ambiguous
 
 
 class ModManagerService:
@@ -1033,103 +1234,100 @@ class ModManagerService:
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
     ) -> ImportResult:
-        """Match manually downloaded files to pending mods, extract, and update state."""
+        """Match manually downloaded files to pending mods, extract, and update state.
+
+        Matching is deterministic and conservative: exact archive filenames and
+        verified content hashes win first, then exact stems and the Nexus
+        browser suffix "{name}-{modId}-{version}-{timestamp}" parsed from known
+        identities. Ambiguous or unverifiable candidates stay pending with a
+        useful error instead of being guessed at, and each disk file fulfills
+        at most one pending item per run.
+        """
         progress = on_progress or _noop_progress
         errors: list[str] = []
 
         state = CollectionState(mods_dir)
         state.load()
 
-        pending = state.get_pending_mods()
+        # Sorted by file_id so contested files resolve deterministically
+        pending = sorted(state.get_pending_mods(), key=lambda ms: ms.file_id)
         if not pending:
             return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
 
-        # Build filename lookup (case-insensitive).
-        # Keyed by both full filename and stem to match browser-downloaded files
-        # where Nexus appends "-modid-version-timestamp" to the logical name.
-        files_on_disk: dict[str, Path] = {}
-        for f in mods_dir.iterdir():
-            if f.is_file():
-                files_on_disk[f.name.lower()] = f
-                files_on_disk[f.stem.lower()] = f
+        # Candidate files: skip hidden files (.nexus-state.json, .DS_Store,
+        # config dotfiles) so internal state is never matched or hashed.
+        candidates = [
+            f for f in sorted(mods_dir.iterdir())
+            if f.is_file() and not f.name.startswith(".")
+        ]
 
-        def _logical_name_regex(logical_name: str) -> re.Pattern:
-            # Match all words from the logical name in the filename stem, order-independent
-            words = [re.escape(w) for w in logical_name.split() if len(w) > 2]
-            return re.compile(r"(?i)" + "".join(f"(?=.*{w})" for w in words))
-
-        def _md5(path: Path) -> str:
-            h = hashlib.md5()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(65536), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-
-        disk_md5s: dict[str, Path] = {}
-        for path in files_on_disk.values():
-            try:
-                disk_md5s[_md5(path)] = path
-            except OSError:
-                pass
-
-        # Build logicalFileName -> fileMD5 lookup from manifest mod_rules
-        logical_to_md5: dict[str, str] = {}
-        if state.manifest_data:
-            for rule in state.manifest_data.get("mod_rules", []):
-                for side in ("source", "reference"):
-                    entry = rule.get(side, {})
-                    lf = entry.get("logicalFileName", "")
-                    md5 = entry.get("fileMD5", "")
-                    if lf and md5:
-                        logical_to_md5[lf] = md5
+        by_identity_md5, by_name_md5 = _expected_md5_maps(state.manifest_data)
+        md5_cache: dict[Path, str | None] = {}
+        archive_cache: dict[Path, bool] = {}
+        claimed: dict[Path, str] = {}  # disk file -> pending mod that consumed it
 
         matched = 0
         extracted = 0
         progress("import", 0.1, f"Scanning for {len(pending)} pending downloads...")
 
-        for i, mod_state in enumerate(tqdm(pending, desc="Processing mods")):
-            filename_lower = mod_state.filename.lower()
-            file_path = None
+        for i, mod_state in enumerate(pending):
+            progress("import", 0.1 + 0.8 * (i / len(pending)), f"Checking {mod_state.name}...")
 
-            #MD5 match
-            if file_path is None:
-                expected_md5 = logical_to_md5.get(mod_state.filename)
-                if expected_md5:
-                    file_path = disk_md5s.get(expected_md5)
+            filename = (mod_state.filename or "").strip()
+            expected_md5 = by_identity_md5.get((mod_state.mod_id, mod_state.file_id))
+            if expected_md5 is None and filename:
+                expected_md5 = by_name_md5.get(filename.lower())
 
-            # Exact match (premium downloads, already correctly named)
-            file_path = files_on_disk.get(filename_lower)
+            available = [p for p in candidates if p not in claimed]
+            match, ambiguous = _resolve_import_match(
+                filename, mod_state.mod_id, mod_state.version,
+                available, expected_md5, md5_cache, archive_cache,
+            )
 
-            #stem matching
-            if file_path is None:
-                # Browser downloads append "-modid-version-timestamp" to the logical name.
-                # Match any disk file whose stem starts with the logical name + "-".
-                file_path = next(
-                    (p for stem, p in files_on_disk.items()
-                    if stem.startswith(filename_lower + "-")),
-                    None,
+            if match is None and not ambiguous and claimed:
+                # Every match for this item was already consumed by an earlier
+                # pending item in this run: report the collision explicitly.
+                used, _ = _resolve_import_match(
+                    filename, mod_state.mod_id, mod_state.version,
+                    list(claimed), expected_md5, md5_cache, archive_cache,
                 )
+                if used is not None:
+                    errors.append(
+                        f"Skipped {mod_state.name}: the matching file {used.name} "
+                        f"already matched {claimed[used]} in this run."
+                    )
+                    continue
 
-            #Regex matching words in logical name fallback
-            if file_path is None:
-                pattern = _logical_name_regex(mod_state.filename)
-                file_path = next(
-                    (p for stem, p in files_on_disk.items()
-                    if pattern.search(stem)),
-                    None,
-                )
-
-            if file_path is None:
+            if match is None:
+                if ambiguous:
+                    names = ", ".join(sorted(p.name for p in ambiguous))
+                    errors.append(
+                        f"Ambiguous match for {mod_state.name}: several files could be "
+                        f"'{mod_state.filename}' ({names}). Keep only the right one, "
+                        f"then re-run import."
+                    )
+                else:
+                    hint = (
+                        f" Download it from {mod_state.browser_url} and"
+                        if mod_state.browser_url else ""
+                    )
+                    errors.append(
+                        f"No local file found for {mod_state.name} (expected "
+                        f"'{mod_state.filename}').{hint} place it in {mods_dir}, "
+                        f"then re-run import."
+                    )
                 continue
 
+            claimed[match] = mod_state.name
             matched += 1
 
             try:
-                if not no_extract and is_archive(file_path):
-                    extract_archive(file_path, mods_dir)
-                    file_path.unlink()
+                if not no_extract and is_archive(match):
+                    extract_archive(match, mods_dir)
+                    match.unlink()
                     extracted += 1
             except ExtractionError as e:
+                # A failed extraction must never mark the mod downloaded
                 errors.append(f"Extraction error for {mod_state.name}: {e}")
                 continue
 
