@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import re
+import threading
 import time
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -16,6 +17,13 @@ GRAPHQL_URL = "https://api.nexusmods.com/v2/graphql"
 REST_BASE_URL = "https://api.nexusmods.com/v1"
 
 _URL_RE = re.compile(r"https?://\S+")
+
+# (connect, read) seconds for the signed download-link request. It runs
+# inside the serialized HTTP-logging context, so an unbounded hang would
+# also stall every other thread's signed request; the timeout keeps that
+# lock hold bounded. Other API endpoints keep their pre-existing
+# (untimed) behavior for now.
+SIGNED_REQUEST_TIMEOUT = (15, 60)
 
 
 def redact_url(url: str) -> str:
@@ -38,7 +46,9 @@ def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
 
     Defense in depth for error paths: a server that reflects a download
     key in an error body or a hostile response URL can never surface the
-    credential. Values shorter than 6 characters are skipped so unrelated
+    credential. Every explicitly provided secret is redacted regardless
+    of length (a caller-supplied credential is always worth protecting);
+    only None, empty, and whitespace-only values are skipped so unrelated
     text is not mangled.
     """
     out = str(text)
@@ -46,7 +56,7 @@ def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
         if secret is None:
             continue
         value = str(secret)
-        if len(value) >= 6:
+        if value and not value.isspace():
             out = out.replace(value, "[redacted]")
     return out
 
@@ -60,6 +70,18 @@ def redact_secret_values(text: str, secrets: Iterable[Any]) -> str:
     return _URL_RE.sub("[url redacted]", redact_literal_values(text, secrets))
 
 
+# Serializes suppress_http_debug_logging contexts across threads. Logger
+# levels are process-global, so two concurrent signed requests must never
+# interleave "raise to INFO" with another request's "restore to DEBUG":
+# the restore would re-expose the still-running request's signed URL to
+# DEBUG handlers. The RLock is reentrant, so nested contexts in one thread
+# (downloader inside API call) compose without deadlock; the inner context
+# saves and restores the already-lifted levels, and only the outermost
+# context restores the originals. Cross-thread contexts are fully
+# serialized: no protected request is active when levels are restored.
+_HTTP_LOG_LOCK = threading.RLock()
+
+
 @contextlib.contextmanager
 def suppress_http_debug_logging():
     """Keep DEBUG-level HTTP logging from writing signed URLs to logs.
@@ -69,20 +91,30 @@ def suppress_http_debug_logging():
     are lifted to INFO for the duration of a signed request and restored
     afterwards, so even an application running with DEBUG logging cannot
     leak a credential through them.
+
+    Thread safety: the whole context (level lift, request, restore) runs
+    under a module RLock. Overlapping signed requests in different threads
+    are serialized, so a restore can never happen while another protected
+    request is still running; nested same-thread contexts are reentrant
+    and only the outermost restores the original levels. Restoration is
+    exact even when the request raises. The lock is held only around
+    signed operations and never modifies logging configuration outside
+    the context, so the user's own logging setup is untouched.
     """
-    loggers = [
-        logging.getLogger(name)
-        for name in ("urllib3", "requests", "urllib3.connectionpool")
-    ]
-    previous = [lg.level for lg in loggers]
-    try:
-        for lg in loggers:
-            if lg.level < logging.INFO:
-                lg.setLevel(logging.INFO)
-        yield
-    finally:
-        for lg, level in zip(loggers, previous):
-            lg.setLevel(level)
+    with _HTTP_LOG_LOCK:
+        loggers = [
+            logging.getLogger(name)
+            for name in ("urllib3", "requests", "urllib3.connectionpool")
+        ]
+        previous = [lg.level for lg in loggers]
+        try:
+            for lg in loggers:
+                if lg.level < logging.INFO:
+                    lg.setLevel(logging.INFO)
+            yield
+        finally:
+            for lg, level in zip(loggers, previous):
+                lg.setLevel(level)
 
 
 class NexusAPIError(Exception):
@@ -143,7 +175,20 @@ class NexusAPI:
         """
         status = response.status_code
         if 200 <= status < 300:
-            return response.json()
+            try:
+                return response.json()
+            except ValueError:
+                # A proxy, captive portal, or compromised endpoint can
+                # return HTML with a 2xx status. The body and URL are
+                # never echoed: they could carry reflected credentials.
+                raise NexusAPIError(
+                    redact_literal_values(
+                        f"The Nexus API returned a non-JSON response "
+                        f"(HTTP {status}); a proxy or network middleware "
+                        "may be intercepting the request.",
+                        secrets,
+                    )
+                )
 
         if status == 429:
             try:
@@ -365,8 +410,11 @@ class NexusAPI:
         response body, and the credential values themselves are redacted
         from every exception message, and DEBUG HTTP logging is
         suppressed for the request so the signed query cannot leak
-        through logs. An invalid or expired pair is reported as an
-        actionable failure; it never falls back to an unsigned request.
+        through logs. Redirects are refused (allow_redirects=False) so
+        the apikey header and the credential pair can never be forwarded
+        to an arbitrary host. An invalid or expired pair is reported as
+        an actionable failure; it never falls back to an unsigned
+        request.
         """
         if (key is None) != (expires is None):
             raise NexusAPIError(
@@ -382,7 +430,18 @@ class NexusAPI:
         secrets: tuple = (key, expires) if key is not None else ()
 
         with suppress_http_debug_logging():
-            response = self.session.get(url, params=params)
+            # allow_redirects=False: this request carries the apikey header
+            # and the signed key/expires pair. Following a redirect would
+            # forward them to an arbitrary host; a redirect is refused as a
+            # safe failure instead (requests strips nothing custom). The
+            # bounded timeout keeps the serialized HTTP-logging lock hold
+            # bounded even if the endpoint stalls.
+            response = self.session.get(
+                url,
+                params=params,
+                allow_redirects=False,
+                timeout=SIGNED_REQUEST_TIMEOUT,
+            )
 
         try:
             data = self._handle_response(response, secrets=secrets)

@@ -162,6 +162,7 @@ class Downloader:
         task_id: TaskID | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         signed: SignedLink | None = None,
+        no_clobber: bool = False,
     ) -> Path:
         """
         Download a mod file to a temporary location, verify it, and publish
@@ -179,6 +180,13 @@ class Downloader:
           - the final file is published with an atomic same-directory rename,
             so an existing final file is never clobbered by a failed or
             corrupt download,
+          - with ``no_clobber=True`` the publish additionally refuses to
+            replace ANY existing destination entry (including a dangling
+            symlink or a file created concurrently after the caller's
+            precheck): publication is an atomic hard link from the
+            verified temp file, which fails if the destination exists; a
+            filesystem without hard-link support is a clean failure with
+            nothing written, never a partially visible copy,
           - error messages never include the signed download URL, and any
             ``signed`` nxm:// credential pair is redacted from every error
             path and kept out of DEBUG HTTP logs.
@@ -189,6 +197,9 @@ class Downloader:
             signed: Optional website-issued key/expires pair (free-account
                     nxm:// links). Transient: forwarded to the download-link
                     request only, never persisted.
+            no_clobber: Refuse to replace an existing destination instead of
+                        atomically overwriting it (nxm:// flows where the
+                        target is not proven owned by this download).
 
         Returns path to the downloaded file.
         """
@@ -282,7 +293,38 @@ class Downloader:
 
             # Atomic publish: replaces the final file only now that the
             # payload is fully downloaded and verified.
-            os.replace(temp_path, final_path)
+            if no_clobber:
+                # No-replace publish: a hard link fails with FileExistsError
+                # if ANY directory entry exists at the destination (regular
+                # file, symlink, even a dangling one), including one created
+                # concurrently after the caller's precheck. os.rename/replace
+                # would silently overwrite it, so it is not used here. There
+                # is deliberately no streamed-copy fallback: an O_EXCL copy
+                # would make a partially written file visible at the final
+                # path and could leave debris on failure, so a filesystem
+                # without hard-link support is a clean, actionable failure
+                # instead. The verified payload stays in the temp file and
+                # the finally block removes it; existing files are never
+                # touched.
+                try:
+                    os.link(temp_path, final_path)
+                except FileExistsError:
+                    raise DownloadError(
+                        f"{filename}: refusing to overwrite an existing "
+                        "file at the destination; it appeared while this "
+                        "download was running. Remove it or choose another "
+                        "directory and retry."
+                    )
+                except OSError as e:
+                    raise DownloadError(
+                        f"{filename}: this filesystem does not support the "
+                        "safe no-overwrite publication this download "
+                        f"requires ({type(e).__name__}). Nothing was "
+                        "written; use a normal local filesystem for the "
+                        "target directory."
+                    )
+            else:
+                os.replace(temp_path, final_path)
             return final_path
 
         except DownloadError:

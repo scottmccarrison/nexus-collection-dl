@@ -694,3 +694,210 @@ def test_collection_link_recognized_with_sync_guidance(svc, tmp_path):
 
     assert "nexus-dl sync" in str(excinfo.value)
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Bugcheck regressions: race-safe publish, save-failure retention,
+# warnings, malformed metadata, fail-closed account verification
+# ---------------------------------------------------------------------------
+
+def test_output_refuses_existing_regular_file_before_download(svc, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "TestMod-1.0.zip").write_bytes(b"sentinel-original")
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    svc._api = fake
+
+    result = svc.add_nxm(uri(), output_dir=out)
+
+    assert not result.success
+    assert "already exists" in result.error
+    assert "get_download_url" not in fake.calls     # refused before download
+    assert (out / "TestMod-1.0.zip").read_bytes() == b"sentinel-original"
+
+
+def test_output_refuses_symlink_and_dangling_before_download(svc, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    other = tmp_path / "other.zip"
+    other.write_bytes(b"sentinel-target")
+    link = out / "TestMod-1.0.zip"
+    link.symlink_to(other)
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    svc._api = fake
+
+    result = svc.add_nxm(uri(), output_dir=out)
+    assert not result.success
+    assert "get_download_url" not in fake.calls
+    assert other.read_bytes() == b"sentinel-target"
+
+    link.unlink()
+    link.symlink_to(tmp_path / "nowhere.zip")       # dangling symlink
+    result = svc.add_nxm(uri(), output_dir=out)
+    assert not result.success
+    assert "get_download_url" not in fake.calls
+    assert link.is_symlink()                        # dangling link preserved
+
+
+def test_output_concurrent_creator_wins_and_is_preserved(svc, tmp_path, monkeypatch):
+    zip_bytes = make_zip()
+    out = tmp_path / "out"
+    out.mkdir()
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+
+    class RacingSession(FakeCdnSession):
+        def get(self, url, **kwargs):
+            # External writer creates the destination mid-download
+            (out / "TestMod-1.0.zip").write_bytes(b"external-sentinel")
+            return super().get(url, **kwargs)
+
+    session = RacingSession(zip_bytes)
+
+    class PatchedDownloader(Downloader):
+        def __init__(self, api):
+            super().__init__(api)
+            self.session = session
+
+    monkeypatch.setattr(service_module, "Downloader", PatchedDownloader)
+
+    result = svc.add_nxm(uri(), output_dir=out)
+
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert (out / "TestMod-1.0.zip").read_bytes() == b"external-sentinel"
+    assert KEY not in result.error and str(FUTURE) not in result.error
+    assert not [p for p in out.iterdir() if p.name.startswith(".nexus-download-")]
+
+
+def test_output_hardlink_unsupported_fails_safely(svc, tmp_path, monkeypatch):
+    zip_bytes = make_zip()
+    out = tmp_path / "out"
+    out.mkdir()
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    import nexus_collection_dl.downloader as downloader_module
+
+    def no_links(src, dst, **kwargs):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(downloader_module.os, "link", no_links)
+
+    result = svc.add_nxm(uri(), output_dir=out)
+
+    assert not result.success
+    assert "does not support" in result.error
+    assert list(out.iterdir()) == []                # nothing published or left
+
+
+def test_state_save_failure_preserves_archive_and_pending(svc, tmp_path, monkeypatch):
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
+
+    def fail_save(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(service_module.CollectionState, "save", fail_save)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be saved" in result.error
+    assert "import" in result.error
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes   # archive kept
+    assert (cdir / "Data" / "test.txt").exists()    # honest about extraction
+    assert state_raw(cdir) == before                # on-disk state unchanged
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "pending_download"
+
+
+def test_load_order_failure_yields_success_with_warning(svc, tmp_path, monkeypatch):
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(self, target, state):
+        raise RuntimeError("loot exploded")
+
+    monkeypatch.setattr(
+        service_module.ModManagerService, "_regen_load_order_from_state", boom
+    )
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "downloaded"
+    assert len(result.warnings) == 1
+    assert "Load order regeneration failed" in result.warnings[0]
+    assert "nexus-dl load-order" in result.warnings[0]
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"
+
+
+def test_malformed_size_metadata_fails_without_download(svc, tmp_path):
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    meta = files_meta(make_zip())
+    meta[0]["size_in_bytes"] = "twelve-ish"
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "malformed" in result.error
+    assert "get_download_url" not in fake.calls
+
+
+def test_missing_account_id_fails_closed(svc, tmp_path):
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    fake._user_id = None                            # no account id in response
+    svc._api = fake
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)      # link carries user_id
+
+    assert not result.success
+    assert "Could not verify" in result.error
+    assert "get_download_url" not in fake.calls
+    assert state_raw(cdir) == before
+
+
+def test_nonjson_api_response_at_service_boundary(svc, tmp_path):
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    from nexus_collection_dl.api import NexusAPI
+    from nexus_collection_dl.api import NexusAPIError as ApiError
+
+    class HtmlResponse:
+        status_code = 200
+        headers = {}
+        url = "https://api.nexusmods.com/v1/validate.json"
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    class HtmlSession:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            return HtmlResponse()
+
+    real = NexusAPI(api_key="test-key")
+    real.session = HtmlSession()
+    svc._api = real
+
+    with pytest.raises(ApiError) as excinfo:
+        svc.add_nxm(uri(), mods_dir=cdir)
+    msg = str(excinfo.value)
+    assert "non-JSON" in msg
+    assert "<html>" not in msg

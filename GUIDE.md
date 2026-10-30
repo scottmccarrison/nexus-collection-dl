@@ -322,8 +322,10 @@ On each mod page, Nexus Mods shows a **Mod manager download** button next to eve
 ### One-time setup
 
 ```bash
-# Tell nexus-dl which collection folder belongs to which game
-nexus-dl handler map starfield ~/mods/starfield
+# Tell nexus-dl which synced collection folder belongs to which game.
+# Use the collection subfolder created by 'nexus-dl sync' - the one
+# containing .nexus-state.json, not its parent folder.
+nexus-dl handler map starfield "~/mods/starfield/My Collection"
 
 # Optional: make nexus-dl open nxm:// links from your browser
 nexus-dl handler install

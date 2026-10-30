@@ -429,7 +429,7 @@ def test_notify_uses_argv_and_sanitizes_body(monkeypatch):
                 runner=runner)
     assert ok is True
     assert runner.calls == [[
-        "notify-send", "-a", "nexus-dl", "nexus-dl: download complete",
+        "notify-send", "-a", "nexus-dl", "--", "nexus-dl: download complete",
         "Saved Mod.zip from [url redacted]",
     ]]
 
@@ -584,3 +584,105 @@ def test_tricky_executable_entry_passes_desktop_file_validate(tmp_path):
         ["desktop-file-validate", str(entry)], capture_output=True, text=True
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Bugcheck regressions: canonical mappings, subprocess timeouts, X_OK,
+# single status query
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+import os  # noqa: E402
+
+
+class TimeoutRunner:
+    """argv runner that times out on 'xdg-mime default' registration calls."""
+
+    def __init__(self, query_default=""):
+        self.calls = []
+        self.query_default = query_default
+
+    def __call__(self, argv):
+        assert isinstance(argv, (list, tuple))
+        assert all(isinstance(a, str) for a in argv)
+        self.calls.append(list(argv))
+        if argv[:2] == ["xdg-mime", "default"]:
+            raise subprocess.TimeoutExpired(cmd=argv[0], timeout=30)
+        if argv[:2] == ["xdg-mime", "query"]:
+            return SimpleNamespace(returncode=0, stdout=self.query_default, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_install_timeout_rolls_back_with_domain_error(exe, cfg_path, tmp_path):
+    runner = TimeoutRunner(query_default="vortex-nxm.desktop")
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+    with pytest.raises(DesktopEntryError):
+        inst.install()
+    assert not (tmp_path / "apps" / DESKTOP_ENTRY_NAME).exists()
+    assert not cfg_path.exists()                    # nothing persisted
+
+
+def test_uninstall_restore_timeout_keeps_recovery_state(tmp_path, cfg_path):
+    _apps, entry, cfg = _installed_env(tmp_path, cfg_path, previous="vortex-nxm.desktop")
+    runner = TimeoutRunner(query_default=DESKTOP_ENTRY_NAME)
+    inst = DesktopInstaller(config=cfg, runner=runner, entry_dir=tmp_path / "apps")
+    with pytest.raises(DesktopEntryError):
+        inst.uninstall()
+    assert entry.exists()                           # retryable
+    assert cfg.desktop["previous_default"] == "vortex-nxm.desktop"
+
+
+def test_install_rejects_non_executable_file(cfg_path, tmp_path):
+    bad = tmp_path / "notexe"
+    bad.write_text("#!/bin/sh\n")
+    bad.chmod(0o644)
+    inst = DesktopInstaller(config=HandlerConfig(cfg_path), runner=FakeRunner(),
+                            entry_dir=tmp_path / "apps", executable=bad)
+    with pytest.raises(DesktopEntryError, match="not executable"):
+        inst.install()
+    assert not cfg_path.exists()
+
+
+def test_status_queries_default_exactly_once(tmp_path, cfg_path):
+    _apps, _entry, cfg = _installed_env(tmp_path, cfg_path)
+    runner = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    info = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps").status()
+    queries = [c for c in runner.calls if c[:2] == ["xdg-mime", "query"]]
+    assert len(queries) == 1
+    assert info["is_default"] is True
+
+
+def test_relative_mapping_resolves_against_map_time_cwd(tmp_path, cfg_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_path.parent))
+    cdir = make_collection(tmp_path)
+    cwd_a = tmp_path / "cwd-a"
+    cwd_a.mkdir()
+    monkeypatch.chdir(cwd_a)
+    add_mapping(GAME, os.path.relpath(cdir, cwd_a))
+    stored = HandlerConfig.load().mappings[GAME][0]
+    assert os.path.isabs(stored)
+    assert Path(stored) == cdir.resolve()
+    # A desktop launch from an unrelated cwd must hit the same target
+    cwd_b = tmp_path / "cwd-b"
+    cwd_b.mkdir()
+    monkeypatch.chdir(cwd_b)
+    assert resolve_collection_dir(GAME) == Path(stored)
+
+
+def test_relative_config_entries_are_dropped(tmp_path, cfg_path, monkeypatch):
+    config_home = cfg_path.parent
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    # HandlerConfig.load() reads the XDG default location, not the
+    # explicit fixture path: config_home/nexus-dl/<CONFIG_FILENAME>.
+    default_cfg = config_home / "nexus-dl" / CONFIG_FILENAME
+    default_cfg.parent.mkdir(parents=True, exist_ok=True)
+    default_cfg.write_text(json.dumps(
+        {"version": 1, "mappings": {GAME: ["relative/dir"]}, "desktop": {}}
+    ))
+    assert HandlerConfig.load().mappings[GAME] == []
+    make_collection(tmp_path)                       # valid, but not validly mapped
+    with pytest.raises(NxmRoutingError, match="handler map"):
+        resolve_collection_dir(GAME)

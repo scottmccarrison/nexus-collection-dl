@@ -189,8 +189,9 @@ If the tool can't auto-select a file (no main file category), it lists all avail
 Handle "Mod manager download" links from the Nexus website directly, without another mod manager:
 
 ```bash
-# One-time setup: map each game to a synced collection directory
-nexus-dl handler map starfield ~/mods/starfield
+# One-time setup: map each game to its SYNCED COLLECTION directory - the
+# subfolder created by 'nexus-dl sync' that contains .nexus-state.json
+nexus-dl handler map starfield "~/mods/starfield/My Collection"
 
 # Optional: register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
 nexus-dl handler install
@@ -212,7 +213,7 @@ Useful flags when running `nxm` yourself:
 
 ```bash
 # Choose the collection explicitly (overrides the game mapping)
-nexus-dl nxm "nxm://..." --mods-dir ~/mods/starfield
+nexus-dl nxm "nxm://..." --mods-dir "~/mods/starfield/My Collection"
 
 # Save the verified archive to a folder without touching any collection
 nexus-dl nxm "nxm://..." --output ~/Downloads
@@ -223,9 +224,10 @@ nexus-dl nxm "nxm://..." --no-extract --no-load-order
 
 Notes:
 
+- `handler map` requires an already-synced collection: the directory must contain `.nexus-state.json` (the collection subfolder created by `nexus-dl sync`, not its parent), and its game must match the mapping key.
 - The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
 - Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
-- Downloads are verified (exact size, manifest MD5 when known) before they are registered. A file already downloaded in the collection is a no-op with no network traffic.
+- Downloads are verified (exact size, manifest MD5 when known) before they are registered. A file already downloaded in the collection is a no-op with no network traffic. With `--no-extract` the verified archive stays in the collection folder, and re-running the same link is a no-op (proven duplicate).
 - `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
 - Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
 

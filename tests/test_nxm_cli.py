@@ -393,3 +393,68 @@ def test_handler_status_shows_diagnostics(cli_env, monkeypatch):
     assert "no longer exists" in result.output
     assert "handler install" in result.output
     assert "vortex.desktop" in result.output      # previous default shown
+
+
+# ---------------------------------------------------------------------------
+# Bugcheck regressions: host isolation, warnings, timeout surfacing
+# ---------------------------------------------------------------------------
+
+import subprocess as _sp  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_host_subprocesses(monkeypatch):
+    """Never spawn real xdg/notify tools from CLI tests, even read-only."""
+    from nexus_collection_dl import handler as _handler_module
+
+    def refuse(argv):
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(_handler_module, "_default_runner", refuse)
+
+
+def test_nxm_success_prints_warnings_and_still_succeeds(cli_env):
+    FakeService.result = NxmResult(
+        success=True, status="downloaded", game_domain=GAME, mod_id=1,
+        file_id=2, mod_name="Test Mod",
+        collection_dir=cli_env["tmp_path"] / "col",
+        warnings=["Load order regeneration failed: boom. Run "
+                  "'nexus-dl load-order /x' to retry."],
+    )
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2", "--no-notify"])
+    assert result.exit_code == 0, result.output
+    assert "Warning:" in result.output
+    assert "nexus-dl load-order" in result.output
+
+
+def test_handler_install_timeout_is_clean_cli_failure(cli_env, monkeypatch):
+    from nexus_collection_dl.handler import DesktopInstaller as RealInstaller
+    from nexus_collection_dl.handler import HandlerConfig
+
+    tmp_path = cli_env["tmp_path"]
+    cfg_file = tmp_path / "xdg-config" / "nexus-dl" / "handler.json"
+    exe = tmp_path / "nexus-dl-exe"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+
+    class TimeoutRunner:
+        def __call__(self, argv):
+            if argv[:2] == ["xdg-mime", "query"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if argv[:2] == ["xdg-mime", "default"]:
+                raise _sp.TimeoutExpired(cmd=argv[0], timeout=30)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def factory():
+        return RealInstaller(config=HandlerConfig(cfg_file),
+                             runner=TimeoutRunner(),
+                             entry_dir=tmp_path / "apps", executable=exe)
+
+    monkeypatch.setattr(cli_module, "DesktopInstaller", factory)
+    result = invoke(["handler", "install"])
+    assert result.exit_code == 1
+    assert "timed out" in result.output
+    assert "Traceback" not in result.output
+    assert not (tmp_path / "apps" / "nexus-dl-nxm.desktop").exists()
+    assert not cfg_file.exists()

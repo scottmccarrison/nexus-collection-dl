@@ -791,6 +791,10 @@ def nxm(
                 "nothing was deployed automatically.[/dim]"
             )
         summary = f"Downloaded {result.mod_name}"
+    # Non-fatal follow-up failures on a completed download (e.g. load
+    # order): truthful warnings, still a success exit.
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(str(warning))}")
     if want_notify:
         handler_notify("nexus-dl: download complete", summary)
 

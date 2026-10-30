@@ -118,7 +118,13 @@ class HandlerConfig:
             for game, dirs in mappings.items():
                 if isinstance(game, str) and isinstance(dirs, list):
                     cfg.mappings[game.strip().lower()] = [
-                        d for d in dirs if isinstance(d, str)
+                        # Absolute paths only: a relative entry (from a
+                        # hand-edited or pre-canonicalization config) would
+                        # resolve against whatever cwd the desktop-launched
+                        # handler happens to run in, so it is dropped and
+                        # the game reads as unmapped instead.
+                        d for d in dirs
+                        if isinstance(d, str) and Path(d).is_absolute()
                     ]
         desktop = data.get("desktop")
         if isinstance(desktop, dict):
@@ -154,6 +160,11 @@ def add_mapping(game_domain: str, collection_dir: Path | str) -> HandlerConfig:
     directory = Path(collection_dir).expanduser()
     if not directory.is_dir():
         raise HandlerError(f"{directory} is not an existing directory.")
+    # Canonicalize to an absolute, symlink-resolved path NOW, against the
+    # mapping command's own cwd. The desktop handler later runs with an
+    # arbitrary cwd (browser-launched), so a stored relative path would
+    # resolve against the wrong directory.
+    directory = directory.resolve()
     if not (directory / STATE_FILENAME).exists():
         raise HandlerError(
             f"{directory} is not a synced collection (no {STATE_FILENAME}). "
@@ -336,7 +347,9 @@ def notify(summary: str, body: str = "", runner: Callable | None = None) -> bool
     """
     if shutil.which("notify-send") is None:
         return False
-    argv = ["notify-send", "-a", "nexus-dl", sanitize_message(summary)]
+    # "--" ends option parsing: message text can never be reinterpreted
+    # as a notify-send flag, whatever a caller passes.
+    argv = ["notify-send", "-a", "nexus-dl", "--", sanitize_message(summary)]
     if body:
         argv.append(sanitize_message(body))
     try:
@@ -393,6 +406,12 @@ class DesktopInstaller:
         exe = exe.resolve()
         if not exe.is_file():
             raise DesktopEntryError(f"{exe} is not an existing file.")
+        if not os.access(exe, os.X_OK):
+            raise DesktopEntryError(
+                f"{exe} exists but is not executable. Fix its permissions "
+                "or reinstall nexus-dl, then re-run 'nexus-dl handler "
+                "install'."
+            )
         return exe
 
     def _query_default(self) -> str | None:
@@ -454,6 +473,18 @@ class DesktopInstaller:
                     "xdg-mime was not found. Install xdg-utils, or register "
                     f"{self.entry_path} with your desktop environment manually."
                 )
+            except (subprocess.SubprocessError, OSError) as e:
+                # TimeoutExpired and other subprocess failures become
+                # domain errors so the rollback below runs and the CLI
+                # prints an actionable message instead of a traceback.
+                kind = "timed out" if isinstance(e, subprocess.TimeoutExpired) else "failed"
+                raise DesktopEntryError(
+                    f"Registering the nxm:// default handler {kind}"
+                    f" ({type(e).__name__}). The desktop entry was rolled "
+                    "back; you can retry 'nexus-dl handler install' or "
+                    f"register {self.entry_path} with your desktop "
+                    "environment manually."
+                )
             if getattr(proc, "returncode", 0) != 0:
                 detail = (getattr(proc, "stderr", "") or "").strip()
                 raise DesktopEntryError(
@@ -496,6 +527,16 @@ class DesktopInstaller:
                         "could not be restored. The desktop entry was left in "
                         "place so uninstall can be retried."
                     )
+                except (subprocess.SubprocessError, OSError):
+                    # TimeoutExpired etc: keep the recovery state intact
+                    # (entry + saved previous default) so uninstall is
+                    # retryable, and surface a domain error, not a traceback.
+                    raise DesktopEntryError(
+                        "Could not restore the previous default handler "
+                        f"({prior}): xdg-mime failed or timed out. The "
+                        "desktop entry was left in place so uninstall can "
+                        "be retried."
+                    )
                 if getattr(proc, "returncode", 0) != 0:
                     raise DesktopEntryError(
                         "Could not restore the previous default handler "
@@ -527,13 +568,23 @@ class DesktopInstaller:
         """Read-only diagnostics for 'nexus-dl handler status'."""
         desktop = self.config.desktop
         exe = desktop.get("executable")
+        # One query per status call: the default handler is read exactly
+        # once and reused, so diagnostics never spawn duplicate xdg-mime
+        # subprocesses or report inconsistent snapshots.
+        current = self._query_default()
+        exe_path = Path(str(exe)) if isinstance(exe, str) and exe else None
+        exe_ok = bool(
+            exe_path
+            and exe_path.is_file()
+            and os.access(exe_path, os.X_OK)
+        )
         return {
             "entry_path": self.entry_path,
             "entry_installed": self.entry_path.exists(),
             "executable": exe if isinstance(exe, str) else None,
-            "executable_exists": bool(exe) and Path(str(exe)).exists(),
-            "current_default": self._query_default(),
-            "is_default": self._query_default() == DESKTOP_ENTRY_NAME,
+            "executable_exists": exe_ok,
+            "current_default": current,
+            "is_default": current == DESKTOP_ENTRY_NAME,
             "previous_default": desktop.get("previous_default"),
             "xdg_mime_available": shutil.which("xdg-mime") is not None,
             "mappings": {g: list(d) for g, d in self.config.mappings.items()},

@@ -213,8 +213,9 @@ def test_redact_secret_values_literal_and_url():
     out = redact_secret_values(text, (KEY, EXPIRES))
     assert KEY not in out and str(EXPIRES) not in out
     assert "https://" not in out
-    # Short values are skipped (no mangling of unrelated text)
-    assert redact_secret_values("id 42 ok", ("42",)) == "id 42 ok"
+    # Explicitly provided secrets are redacted at ANY length (fail-safe);
+    # only None/empty/whitespace values are skipped.
+    assert redact_secret_values("id 42 ok", ("42",)) == "id [redacted] ok"
 
 
 def test_debug_http_logging_suppressed_during_signed_request(api):
@@ -248,3 +249,139 @@ def test_suppress_context_restores_levels_on_error():
         assert logger.level == logging.DEBUG
     finally:
         logger.setLevel(old_level)
+
+
+# ---------------------------------------------------------------------------
+# Bugcheck regressions: redaction lengths, non-JSON bodies, redirects,
+# timeouts, and thread-safe log suppression
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+from nexus_collection_dl.api import (  # noqa: E402
+    SIGNED_REQUEST_TIMEOUT,
+    redact_literal_values,
+)
+
+
+def test_provided_secrets_redacted_regardless_of_length():
+    text = "reflected k9x in /path/k9x?q=k9x"
+    out = redact_secret_values(text, ("k9x",))
+    assert "k9x" not in out
+    assert out.count("[redacted]") == 3
+    # None/empty/whitespace secrets never mangle text
+    assert redact_literal_values("keep me", ("", "  ", None)) == "keep me"
+
+
+def test_nonjson_2xx_becomes_domain_error_without_echo(api):
+    html = b"<html><body>intercepted</body></html>"
+    api.session = FakeSession([make_response(200, html, url=signed_url_with_query())])
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
+    msg = str(excinfo.value)
+    assert "non-JSON" in msg
+    assert "<html>" not in msg
+    assert KEY not in msg and str(EXPIRES) not in msg
+    assert "https://" not in msg
+
+
+def test_nonjson_2xx_on_plain_endpoint(api):
+    api.session = FakeSession([make_response(200, b"<html>portal</html>")])
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.get_mod_files(GAME, 123)
+    msg = str(excinfo.value)
+    assert "non-JSON" in msg and "<html>" not in msg
+
+
+def test_signed_request_refuses_redirects_and_is_time_bounded(api):
+    api.session = FakeSession([make_response(302)])
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
+    assert len(api.session.calls) == 1              # redirect never followed
+    _url, kwargs = api.session.calls[0]
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["timeout"] == SIGNED_REQUEST_TIMEOUT
+    msg = str(excinfo.value)
+    assert KEY not in msg and str(EXPIRES) not in msg
+
+
+def test_suppress_context_nested_same_thread_restores_only_outermost():
+    logger = logging.getLogger("requests")
+    old = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        with suppress_http_debug_logging():
+            assert logger.level >= logging.INFO
+            with suppress_http_debug_logging():
+                assert logger.level >= logging.INFO
+            assert logger.level >= logging.INFO     # inner exit keeps the lift
+        assert logger.level == logging.DEBUG        # outermost restores exactly
+    finally:
+        logger.setLevel(old)
+
+
+def test_suppress_contexts_serialize_across_threads_without_debug_leaks():
+    logger = logging.getLogger("urllib3")
+    old = logger.level
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture(level=logging.DEBUG)
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    secret_line = f"GET https://cdn.example/f?key={KEY}&expires={EXPIRES}"
+    a_in = threading.Event()
+    a_release = threading.Event()
+    b_inside = threading.Event()
+    errors = []
+
+    def worker_a():
+        try:
+            with suppress_http_debug_logging():
+                a_in.set()
+                if not a_release.wait(timeout=10):
+                    errors.append(RuntimeError("A stalled"))
+                logger.debug(secret_line)           # must be suppressed
+        except Exception as e:
+            errors.append(e)
+
+    def worker_b():
+        try:
+            if not a_in.wait(timeout=10):
+                errors.append(RuntimeError("B stalled"))
+                return
+            with suppress_http_debug_logging():     # must block until A is done
+                b_inside.set()
+                logger.debug(secret_line)
+        except Exception as e:
+            errors.append(e)
+
+    try:
+        ta = threading.Thread(target=worker_a)
+        tb = threading.Thread(target=worker_b)
+        ta.start()
+        tb.start()
+        assert a_in.wait(timeout=10)
+        # While A holds the context, B cannot enter and levels stay lifted
+        assert not b_inside.wait(timeout=0.3)
+        assert logger.level >= logging.INFO
+        a_release.set()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+        assert not ta.is_alive() and not tb.is_alive()
+        assert not errors
+        assert b_inside.is_set()                    # B ran after A completed
+        # Neither protected section produced a DEBUG record carrying secrets
+        assert not any(KEY in m or str(EXPIRES) in m for m in records)
+        # Exact restoration once every context has exited
+        assert logger.level == logging.DEBUG
+        # Suppression is scoped: outside contexts DEBUG flows again
+        records.clear()
+        logger.debug(secret_line)
+        assert any(KEY in m for m in records)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old)

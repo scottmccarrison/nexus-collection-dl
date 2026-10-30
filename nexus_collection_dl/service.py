@@ -187,6 +187,33 @@ class NxmResult:
     extracted: bool = False
     error: str = ""
     re_click_required: bool = False  # user must re-click on the website
+    # Non-fatal issues on an otherwise successful run (e.g. load order
+    # regeneration failed after the download was already completed and
+    # saved). Truthful completion: success stays True, the warning says
+    # what did not finish and how to retry it.
+    warnings: list[str] = field(default_factory=list)
+
+
+def _metadata_size_bytes(selected: dict) -> int:
+    """Exact expected byte size from file metadata, 0 when unknown.
+
+    Raises ValueError when Nexus sends a size of an unexpected type or a
+    negative count: a hostile or broken endpoint must not produce a raw
+    int() traceback deep in the download flow; callers convert this into
+    a domain failure.
+    """
+    raw = selected.get("size_in_bytes")
+    if raw is None or raw == "":
+        return 0
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"unexpected size_in_bytes type: {type(raw).__name__}"
+        ) from None
+    if size < 0:
+        raise ValueError("negative size_in_bytes")
+    return size
 
 
 @dataclass
@@ -1856,12 +1883,27 @@ class ModManagerService:
                         filename=filename,
                     )
             owned_by_this = existing is not None and existing.filename == filename
-            if (target / filename).exists() and not owned_by_this:
+            # lexists: a dangling symlink at the destination also counts as
+            # an existing entry that must never be silently replaced.
+            dest_existed = os.path.lexists(target / filename)
+            if dest_existed and not owned_by_this:
                 return self._nxm_failure(
                     info,
                     f"'{filename}' already exists in {target} and is not "
                     "this file's tracked archive. Refusing to overwrite "
                     "it. Remove it or use --output.",
+                    collection_dir=target,
+                    filename=filename,
+                )
+
+            try:
+                size_bytes = _metadata_size_bytes(selected)
+            except ValueError:
+                return self._nxm_failure(
+                    info,
+                    "File metadata from Nexus Mods is malformed (unexpected "
+                    "file size); refusing to download without a verifiable "
+                    "expected size.",
                     collection_dir=target,
                     filename=filename,
                 )
@@ -1874,7 +1916,7 @@ class ModManagerService:
                 "version": selected.get("version", ""),
                 # Only size_in_bytes is an exact byte count (legacy "size"
                 # is KB and must never be verified as bytes).
-                "size_bytes": int(selected.get("size_in_bytes") or 0),
+                "size_bytes": size_bytes,
                 "optional": bool(existing.optional) if existing is not None else False,
                 "requirements": existing.requirements if existing is not None else [],
             }
@@ -1901,6 +1943,11 @@ class ModManagerService:
                     target,
                     on_progress=on_download_progress,
                     signed=signed,
+                    # No-clobber unless this download provably owns and is
+                    # replacing its own existing (corrupt) archive: a file
+                    # created by anyone else between the precheck above and
+                    # the publish must never be overwritten.
+                    no_clobber=not (owned_by_this and dest_existed),
                 )
             except DownloadError as e:
                 # State is untouched and any previous files are intact:
@@ -1935,8 +1982,6 @@ class ModManagerService:
                         mod_name=mod_name,
                         filename=filename,
                     )
-                with contextlib.suppress(OSError):
-                    path.unlink()
 
             if existing is not None:
                 existing.download_status = "downloaded"
@@ -1951,14 +1996,61 @@ class ModManagerService:
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
-            state.save()
+            try:
+                state.save()
+            except (OSError, StateError) as e:
+                # The download and extraction happened but the completion
+                # could not be persisted. Never claim completion: the
+                # verified archive is kept (NOT deleted) so the work is
+                # not lost, and the failure says exactly how to recover.
+                extracted_note = (
+                    " Extracted files were left in place." if extracted else ""
+                )
+                return self._nxm_failure(
+                    info,
+                    f"The download completed but the collection state could "
+                    f"not be saved: {e}. The verified archive is kept at "
+                    f"{path}.{extracted_note} Nothing was marked as "
+                    f"downloaded. Fix the underlying problem (permissions, "
+                    f"disk space) and run 'nexus-dl import {target}'"
+                    + (
+                        ""
+                        if existing is not None
+                        else ", or move the archive aside and retry the link"
+                    )
+                    + ".",
+                    collection_dir=target,
+                    mod_name=mod_name,
+                    filename=filename,
+                )
+
+            # The archive is removed only now that the completion is
+            # persisted, and only when this run downloaded and extracted
+            # it: a caller-owned, newly downloaded file, never a pre-existing
+            # one.
+            if extracted:
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
             # Same post-download steps as add/import: tracked-mod sync and
-            # load order regeneration. No deployment is ever triggered.
-            self._maybe_sync_tracked(state)
+            # load order regeneration. Both run AFTER the successful save,
+            # so their failure can no longer crash a completed download:
+            # it is reported as a truthful warning on a successful result.
+            # No deployment is ever triggered.
+            warnings: list[str] = []
+            try:
+                self._maybe_sync_tracked(state)
+            except Exception as e:
+                warnings.append(f"Tracked-mod sync failed: {e}")
             if not no_load_order:
                 progress("loadorder", 0.9, "Regenerating load order...")
-                self._regen_load_order_from_state(target, state)
+                try:
+                    self._regen_load_order_from_state(target, state)
+                except Exception as e:
+                    warnings.append(
+                        f"Load order regeneration failed: {e}. Run "
+                        f"'nexus-dl load-order {target}' to retry."
+                    )
 
             progress("done", 1.0, f"Downloaded {mod_name}")
             return NxmResult(
@@ -1971,6 +2063,7 @@ class ModManagerService:
                 filename=filename,
                 collection_dir=target,
                 extracted=extracted,
+                warnings=warnings,
             )
 
     def _nxm_to_output(
@@ -2002,13 +2095,38 @@ class ModManagerService:
         except DownloadError as e:
             return self._nxm_failure(info, str(e))
 
+        # Refuse ANY existing destination entry BEFORE downloading
+        # (regular file, symlink, or dangling symlink): --output must
+        # never overwrite something the user already has. The publish
+        # itself is additionally no-clobber, so a file created after this
+        # precheck is refused too instead of replaced.
+        if os.path.lexists(output_dir / filename):
+            return self._nxm_failure(
+                info,
+                f"{filename} already exists in {output_dir}. Refusing to "
+                "overwrite it; remove it or choose another --output "
+                "directory.",
+                filename=filename,
+            )
+
+        try:
+            size_bytes = _metadata_size_bytes(selected)
+        except ValueError:
+            return self._nxm_failure(
+                info,
+                "File metadata from Nexus Mods is malformed (unexpected "
+                "file size); refusing to download without a verifiable "
+                "expected size.",
+                filename=filename,
+            )
+
         download_info = {
             "mod_id": info.mod_id,
             "mod_name": self._nxm_mod_name(info),
             "file_id": info.file_id,
             "filename": filename,
             "version": selected.get("version", ""),
-            "size_bytes": int(selected.get("size_in_bytes") or 0),
+            "size_bytes": size_bytes,
         }
         signed = (
             SignedLink(key=info.key, expires=info.expires)
@@ -2020,7 +2138,8 @@ class ModManagerService:
         downloader = Downloader(self.api)
         try:
             path = downloader.download_mod(
-                info.game_domain, download_info, output_dir, signed=signed
+                info.game_domain, download_info, output_dir, signed=signed,
+                no_clobber=True,
             )
         except DownloadError as e:
             return self._nxm_failure(info, str(e), filename=filename)
@@ -2108,7 +2227,18 @@ class ModManagerService:
             account_user = _as_int(user_info.get("user_id"))
             if account_user is None:
                 account_user = _as_int(user_info.get("id"))
-            if account_user is not None and account_user != info.user_id:
+            if account_user is None:
+                # Fail closed: without an account identifier in the API
+                # response the link's user_id cannot be checked, so the
+                # download is refused instead of proceeding unverified.
+                return (
+                    "Could not verify which Nexus account the configured "
+                    "API key belongs to (the API response carried no "
+                    "account identifier), so this link's account could not "
+                    "be checked and nothing was downloaded. Try again; if "
+                    "this persists, verify NEXUS_API_KEY."
+                )
+            if account_user != info.user_id:
                 return (
                     "This download link was issued for a different Nexus "
                     "account than the configured API key. Log in to the "
