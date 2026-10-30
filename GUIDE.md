@@ -191,7 +191,7 @@ Run the same sync command as Premium users:
 nexus-dl sync "https://next.nexusmods.com/baldursgate3/collections/abc123" ~/mods/bg3
 ```
 
-The tool fetches the collection metadata, caches the manifest for load order generation, and shows you a table with each mod's name, filename, and a clickable URL:
+The tool fetches the collection metadata, caches the manifest for load order generation, and shows you a table with each mod's name, filename, and a clickable URL. (`My Collection` below is the example collection subfolder `sync` creates inside `~/mods/bg3` - the folder holding `.nexus-state.json`):
 
 ```
 Pending Downloads (manual)
@@ -200,13 +200,13 @@ Script Extender      | ScriptExtender-v2.zip | 12.3 MB | https://www.nexusmods.c
 Better UI            | BetterUI-1.5.pak      | 4.1 MB  | https://www.nexusmods.com/baldursgate3/mods/...
 ...
 
-Free account detected. Download the files above through your browser, save them to ~/mods/bg3, then run:
-  nexus-dl import ~/mods/bg3
+Free account detected. Download the files above through your browser, save them to $HOME/mods/bg3/My Collection, then run:
+  nexus-dl import "$HOME/mods/bg3/My Collection"
 ```
 
 ### Step 2: Download the files
 
-Click each URL. Nexus Mods will show its standard free download page with a countdown timer. When the download starts, save the file to your mods directory (`~/mods/bg3` in this example). Keep the original filename - the tool matches files by name.
+Click each URL. Nexus Mods will show its standard free download page with a countdown timer. When the download starts, save the file to the collection subfolder (`$HOME/mods/bg3/My Collection` in this example - the folder containing `.nexus-state.json`, not its parent). Keep the original filename - the tool matches files by name.
 
 **Tip:** You don't have to download everything at once. Download a few, run import, download more later - the tool tracks what's done and what's still pending.
 
@@ -215,17 +215,17 @@ Click each URL. Nexus Mods will show its standard free download page with a coun
 Once you've downloaded some or all of the files:
 
 ```bash
-nexus-dl import ~/mods/bg3
+nexus-dl import "$HOME/mods/bg3/My Collection"
 ```
 
-This scans the mods directory for files matching the pending downloads, extracts archives, updates the state, and regenerates load order. If some files are still missing, it tells you which ones.
+This scans the collection folder for files matching the pending downloads, extracts archives, updates the state, and regenerates load order. If some files are still missing, it tells you which ones.
 
 ### Step 4: Deploy
 
 Once all mods are imported (or whenever you're ready), deploy as usual:
 
 ```bash
-nexus-dl deploy ~/mods/bg3
+nexus-dl deploy "$HOME/mods/bg3/My Collection"
 ```
 
 Everything works identically to Premium from here on - status, updates, undeploy, tracked mods, etc.
@@ -324,8 +324,9 @@ On each mod page, Nexus Mods shows a **Mod manager download** button next to eve
 ```bash
 # Tell nexus-dl which synced collection folder belongs to which game.
 # Use the collection subfolder created by 'nexus-dl sync' - the one
-# containing .nexus-state.json, not its parent folder.
-nexus-dl handler map starfield "~/mods/starfield/My Collection"
+# containing .nexus-state.json, not its parent folder. Use $HOME, not a
+# quoted ~: the shell only expands ~ when it is unquoted.
+nexus-dl handler map starfield "$HOME/mods/starfield/My Collection"
 
 # Optional: make nexus-dl open nxm:// links from your browser
 nexus-dl handler install

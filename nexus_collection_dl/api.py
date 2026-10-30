@@ -265,7 +265,16 @@ class NexusAPI:
         )
         data = self._handle_response(response)
         if "errors" in data:
-            raise NexusAPIError(f"GraphQL errors: {data['errors']}")
+            # Server-controlled text: a hostile or compromised endpoint
+            # could reflect the apikey or a signed URL inside an error
+            # entry. Redact known secrets and strip residual URLs before
+            # the text is embedded in the exception (same defense as
+            # every other error path).
+            raise NexusAPIError(
+                redact_secret_values(
+                    f"GraphQL errors: {data['errors']}", (self.api_key,)
+                )
+            )
         return data.get("data", {})
 
     def get_collection_mods(self, game_domain: str, slug: str) -> dict[str, Any]:

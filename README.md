@@ -191,7 +191,8 @@ Handle "Mod manager download" links from the Nexus website directly, without ano
 ```bash
 # One-time setup: map each game to its SYNCED COLLECTION directory - the
 # subfolder created by 'nexus-dl sync' that contains .nexus-state.json
-nexus-dl handler map starfield "~/mods/starfield/My Collection"
+# (use $HOME, not a quoted ~: the shell only expands ~ when unquoted)
+nexus-dl handler map starfield "$HOME/mods/starfield/My Collection"
 
 # Optional: register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
 nexus-dl handler install
@@ -213,7 +214,7 @@ Useful flags when running `nxm` yourself:
 
 ```bash
 # Choose the collection explicitly (overrides the game mapping)
-nexus-dl nxm "nxm://..." --mods-dir "~/mods/starfield/My Collection"
+nexus-dl nxm "nxm://..." --mods-dir "$HOME/mods/starfield/My Collection"
 
 # Save the verified archive to a folder without touching any collection
 nexus-dl nxm "nxm://..." --output ~/Downloads
@@ -267,10 +268,12 @@ Removes all symlinks/copies that were deployed and restores the game directory t
 ### Import manually downloaded files
 
 ```bash
-nexus-dl import ~/mods/starfield
+# Point import at the synced collection folder - the subfolder created
+# by 'nexus-dl sync' that contains .nexus-state.json, not its parent
+nexus-dl import "$HOME/mods/starfield/My Collection"
 
 # Keep archives intact
-nexus-dl import --no-extract ~/mods/starfield
+nexus-dl import --no-extract "$HOME/mods/starfield/My Collection"
 ```
 
 Matches files you downloaded through the browser to pending mods, extracts archives, and regenerates load order. See [Free vs Premium](#free-vs-premium-accounts) below for the full workflow.
@@ -292,7 +295,9 @@ Both free and Premium Nexus Mods accounts work with `nexus-dl`. The difference i
 ### Free account workflow
 
 ```bash
-# 1. Sync the collection - fetches metadata, caches manifest, prints download links
+# 1. Sync the collection - fetches metadata, caches manifest, prints download
+#    links. sync creates a per-collection subfolder (e.g. "My Collection")
+#    and prints its path; steps 3-5 use that subfolder, not the parent.
 nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 
 # 2. You'll see a table like:
@@ -301,13 +306,14 @@ nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/s
 #    Better Textures   | BetterTex-v3.7z       | 120 MB  | https://www.nexusmods.com/...
 #    ...
 
-# 3. Click each URL, download through Nexus (free countdown timer), save files to ~/mods/starfield
+# 3. Click each URL, download through Nexus (free countdown timer), and save
+#    the files into the collection subfolder: $HOME/mods/starfield/My Collection
 
 # 4. Import the downloaded files
-nexus-dl import ~/mods/starfield
+nexus-dl import "$HOME/mods/starfield/My Collection"
 
 # 5. Deploy as usual
-nexus-dl deploy ~/mods/starfield
+nexus-dl deploy "$HOME/mods/starfield/My Collection"
 ```
 
 The `import` command matches downloaded files by filename (case-insensitive), extracts archives, updates the state, and regenerates load order. If some files are missing, it reports which mods are still pending.

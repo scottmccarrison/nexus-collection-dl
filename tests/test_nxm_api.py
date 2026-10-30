@@ -4,9 +4,10 @@ Uses a fake session recording every call plus real requests.Response
 objects, so the true _handle_response code paths run. Verifies: the
 key/expires pair is forwarded as query params exactly as issued, user_id
 is never an API parameter, status codes map to credential-safe errors,
-malicious/reflected server text never surfaces secrets, an invalid pair
-never silently falls back to an unsigned retry, and DEBUG HTTP logging is
-suppressed for signed requests. No network.
+malicious/reflected server text never surfaces secrets (including in
+GraphQL error payloads), an invalid pair never silently falls back to an
+unsigned retry, and DEBUG HTTP logging is suppressed for signed
+requests. No network.
 """
 
 import json
@@ -188,6 +189,32 @@ def test_unexpected_body_shape_error_is_sanitized(api):
     text = str(excinfo.value)
     assert KEY not in text
     assert "Unexpected download link response" in text
+
+
+def test_graphql_errors_redact_reflected_secrets(api):
+    """Server-controlled GraphQL error text is redacted before it is
+    embedded in the exception: a reflected apikey never surfaces and
+    residual URLs are stripped, while benign text survives."""
+
+    class GraphqlSession(FakeSession):
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return make_response(200, {"errors": [
+                {"message": "invalid apikey test-api-key"},
+                {"message": f"retry at https://x.example/?key={KEY}"},
+                {"message": "field 'collection' is unknown"},
+            ]})
+
+    api.session = GraphqlSession()
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.graphql_query('{ collection(slug: "x") { id } }')
+    text = str(excinfo.value)
+    assert "GraphQL errors" in text
+    assert "test-api-key" not in text          # reflected apikey redacted
+    assert KEY not in text
+    assert "https://" not in text              # residual URLs stripped
+    assert "[redacted]" in text
+    assert "field 'collection' is unknown" in text  # benign text survives
 
 
 def test_existing_endpoints_unaffected(api):

@@ -1967,17 +1967,41 @@ class ModManagerService:
                     # verified archive stays on disk and the entry stays
                     # (or becomes) pending so `nexus-dl import` can finish
                     # the job without another download.
+                    state_note = ""
                     if existing is None:
                         download_info["manual"] = True
                         download_info["download_status"] = "pending_download"
                         state.add_mod(download_info)
                         state.mods[info.file_id].phase = 999
                         state.save()
+                    elif existing.download_status == "downloaded":
+                        # Recover a previously-downloaded entry: without
+                        # this regression the fresh archive would strand
+                        # forever - re-clicks dedupe to already_downloaded
+                        # and import only processes pending entries. Going
+                        # back to pending lets either path finish the
+                        # extraction. Best-effort save under the already-
+                        # held collection lock: a save failure must not
+                        # mask the extraction error, and the prior on-disk
+                        # state (and in-memory status) is left standing.
+                        existing.download_status = "pending_download"
+                        try:
+                            state.save()
+                        except (OSError, StateError) as save_exc:
+                            existing.download_status = "downloaded"
+                            state_note = (
+                                " The collection state could not be "
+                                f"updated ({save_exc}), so the entry "
+                                "remains marked as downloaded; fix the "
+                                "underlying problem (permissions, disk "
+                                "space), then remove the archive and "
+                                "click the download link again."
+                            )
                     return self._nxm_failure(
                         info,
                         f"Download succeeded but extraction failed: {e}. "
                         f"The archive is kept at {path}; run 'nexus-dl "
-                        f"import {target}' to retry.",
+                        f"import {target}' to retry.{state_note}",
                         collection_dir=target,
                         mod_name=mod_name,
                         filename=filename,

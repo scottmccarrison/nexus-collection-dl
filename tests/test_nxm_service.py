@@ -21,7 +21,12 @@ from nexus_collection_dl.downloader import Downloader
 from nexus_collection_dl.handler import NxmRoutingError, add_mapping
 from nexus_collection_dl.nxm import NxmCollectionLinkError
 from nexus_collection_dl.service import ModManagerService
-from nexus_collection_dl.state import CollectionLock, CollectionState, StateBusyError
+from nexus_collection_dl.state import (
+    CollectionLock,
+    CollectionState,
+    StateBusyError,
+    StateError,
+)
 
 GAME = "skyrimspecialedition"
 MOD_ID = 123
@@ -552,6 +557,125 @@ def test_extraction_failure_registers_new_entry_as_pending(svc, tmp_path, monkey
     assert entry.download_status == "pending_download"
     assert entry.phase == 999
     assert (cdir / "TestMod-1.0.zip").exists()
+
+
+def test_extraction_failure_regresses_downloaded_entry_to_pending(
+    svc, tmp_path, monkeypatch
+):
+    """A previously-downloaded entry must not strand a fresh archive.
+
+    The entry says 'downloaded' but its artifact is gone, so the link
+    re-downloads and extraction then fails. Without the regression to
+    pending, the entry would stay 'downloaded' with an unextracted
+    archive: import only processes pending entries, and re-clicks would
+    dedupe to already_downloaded forever.
+    """
+    zip_bytes = make_zip()
+    entry = pending_entry()
+    entry["download_status"] = "downloaded"
+    entry["browser_url"] = ""
+    cdir = make_collection(tmp_path, mods=[entry])
+    # No archive on disk: the flag alone must not short-circuit dedupe.
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    real_extract = service_module.extract_archive
+    calls = []
+
+    def flaky_extract(path, target):
+        calls.append(Path(path))
+        if len(calls) == 1:
+            raise service_module.ExtractionError("boom")
+        return real_extract(path, target)
+
+    monkeypatch.setattr(service_module, "extract_archive", flaky_extract)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "extraction failed" in result.error
+    assert f"nexus-dl import {cdir}" in result.error
+    # The verified archive is retained and the entry regressed to pending
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "pending_download"
+
+    # The advised import now finishes the job: extraction succeeds on
+    # the second attempt, the entry is downloaded, the archive is gone.
+    import_result = svc.import_downloads(cdir)
+    assert import_result.matched == 1
+    assert import_result.extracted == 1
+    assert import_result.still_pending == 0
+    assert import_result.errors == []
+    assert (cdir / "Data" / "test.txt").exists()
+    assert not (cdir / "TestMod-1.0.zip").exists()
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"
+
+
+def test_extraction_failure_pending_entry_stays_pending(svc, tmp_path, monkeypatch):
+    """An already-pending entry keeps its prior state semantics: no
+    regression save is attempted and the on-disk state is untouched."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(path, target):
+        raise service_module.ExtractionError("boom")
+
+    monkeypatch.setattr(service_module, "extract_archive", boom)
+
+    def no_save(self):
+        raise AssertionError("pending entries must not trigger a save")
+
+    monkeypatch.setattr(CollectionState, "save", no_save)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "extraction failed" in result.error
+    assert state_raw(cdir) == before
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+
+
+def test_extraction_failure_save_error_keeps_prior_state(svc, tmp_path, monkeypatch):
+    """When the regression save itself fails, the honest extraction
+    error is still reported, the save failure is disclosed, and the
+    prior on-disk state stands unchanged (entry remains 'downloaded')."""
+    zip_bytes = make_zip()
+    entry = pending_entry()
+    entry["download_status"] = "downloaded"
+    entry["browser_url"] = ""
+    cdir = make_collection(tmp_path, mods=[entry])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(path, target):
+        raise service_module.ExtractionError("boom")
+
+    monkeypatch.setattr(service_module, "extract_archive", boom)
+
+    def failing_save(self):
+        raise StateError("disk on fire")
+
+    monkeypatch.setattr(CollectionState, "save", failing_save)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "extraction failed" in result.error   # primary error intact
+    assert "disk on fire" in result.error        # save failure disclosed
+    assert "remains marked as downloaded" in result.error
+    assert state_raw(cdir) == before             # prior state stands
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
 
 
 def test_missing_file_on_mod_reported(svc, tmp_path):
