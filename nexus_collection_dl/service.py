@@ -1,8 +1,10 @@
 """Service layer - business logic extracted from CLI for programmatic use."""
 
+import contextlib
 import os
 import re
 import hashlib
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +26,14 @@ from .deploy import (
     write_game_ini,
     write_plugins_txt,
 )
-from .downloader import DownloadError, Downloader
+from .downloader import (
+    DownloadError,
+    Downloader,
+    SignedLink,
+    validate_download_filename,
+)
 from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
+from .handler import NxmRoutingError, resolve_collection_dir
 from .loadorder import LoadOrderGenerator
 from .loot_sort import (
     is_bethesda_game,
@@ -35,6 +43,7 @@ from .loot_sort import (
     write_loot_plugins_txt,
 )
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
+from .nxm import NxmLinkInfo, parse_nxm_url
 from .state import CollectionState, CollectionLock, StateError, STATE_FILENAME
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
@@ -156,6 +165,28 @@ class AddResult:
     success: bool
     error: str = ""
     pending_download: PendingDownload | None = None
+
+
+@dataclass
+class NxmResult:
+    """Outcome of handling one nxm:// individual-file link.
+
+    Carries safe display fields only: never the link credentials, and
+    error text is built from redacted sources.
+    """
+
+    success: bool
+    status: str  # downloaded, already_downloaded, saved_to_output, error
+    game_domain: str
+    mod_id: int
+    file_id: int
+    mod_name: str = ""
+    filename: str = ""
+    collection_dir: Path | None = None
+    output_path: Path | None = None
+    extracted: bool = False
+    error: str = ""
+    re_click_required: bool = False  # user must re-click on the website
 
 
 @dataclass
@@ -646,184 +677,184 @@ class ModManagerService:
         dir_name = _sanitize_dirname(collection_data["name"])
         mods_dir = mods_dir / dir_name
         mods_dir.mkdir(parents=True, exist_ok=True)
+        with CollectionLock(mods_dir):
+            mods = collection_data["mods"]
+            dupes = collection_data.get("duplicates_removed", 0)
+            if dupes:
+                progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
+            if skip_optional:
+                mods = [m for m in mods if not m.get("optional", False)]
 
-        mods = collection_data["mods"]
-        dupes = collection_data.get("duplicates_removed", 0)
-        if dupes:
-            progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
-        if skip_optional:
-            mods = [m for m in mods if not m.get("optional", False)]
-
-        # Initialize state
-        state = CollectionState(mods_dir)
-        if state.exists():
-            state.load()
-        state.set_collection_info(
-            url=collection_info.url,
-            name=collection_data["name"],
-            revision=collection_data["revision"],
-            game_domain=collection_data["game_domain"],
-        )
-
-        if not mods:
-            # Empty collection or every mod optional and skipped: persist the
-            # collection info so status/update recognize this collection.
-            state.save()
-            return SyncResult(0, 0, [], [], collection_dir=mods_dir)
-
-        if not is_premium:
-            # Free user: register mods as pending_download
-            progress("pending", 0.5, "Building pending download list...")
-            pending_downloads: list[PendingDownload] = []
-            game_domain = collection_data["game_domain"]
-            for mod in mods:
-                mod_id = mod["mod_id"]
-                # Don't regress already-downloaded files (check by file_id)
-                existing = state.get_file(mod["file_id"])
-                if existing and existing.download_status == "downloaded":
-                    continue
-                browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
-                size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
-                pending = PendingDownload(
-                    mod_id=mod_id,
-                    mod_name=mod["mod_name"],
-                    file_id=mod["file_id"],
-                    filename=mod.get("filename", ""),
-                    size_bytes=size_bytes,
-                    browser_url=browser_url,
-                )
-                pending_downloads.append(pending)
-                mod_info_dict = dict(mod)
-                mod_info_dict["download_status"] = "pending_download"
-                mod_info_dict["browser_url"] = browser_url
-                state.add_mod(mod_info_dict)
-
-            state.save()
-
-            # Cache manifest + generate load order even for free users
-            # (the manifest download is a public URL, doesn't need premium)
-            load_order_files: list[str] = []
-            if not no_load_order:
-                progress("loadorder", 0.8, "Caching manifest and generating load order...")
-                lo_files = self._generate_load_order(collection_data, mods_dir, state)
-                load_order_files = lo_files
-
-            progress("done", 1.0, f"Registered {len(pending_downloads)} mods for manual download")
-            return SyncResult(
-                mods_downloaded=0,
-                mods_extracted=0,
-                errors=errors,
-                load_order_files=load_order_files,
-                pending_downloads=pending_downloads,
-                collection_dir=mods_dir,
-            )
-
-        # Premium user: download directly
-        # Skip mods already downloaded with matching file_id
-        if state.mods:
-            to_install, to_update, up_to_date, _ = state.compare_with_collection(mods)
-            mods_to_download = to_install + to_update
-            skipped = len(up_to_date)
-            if skipped:
-                progress("download", 0.1, f"Skipping {skipped} already-downloaded mods")
-            # Re-register up-to-date mods in state so they stay tracked
-            for mod in up_to_date:
-                state.add_mod(mod)
-        else:
-            mods_to_download = mods
-            skipped = 0
-
-        # Prefetch the collection manifest once when it is not cached yet, so
-        # download integrity checks can use its MD5s even on a first sync.
-        # This is the same single public fetch _generate_load_order would do
-        # later, passed through to avoid a redundant second download. If it
-        # fails, downloads proceed with size-only verification.
-        prefetched_manifest = None
-        if state.manifest_data is None and collection_data.get("download_link"):
-            try:
-                prefetched_manifest = download_and_parse_manifest(
-                    collection_data["download_link"], session=self.api.session
-                )
-            except ManifestError:
-                prefetched_manifest = None
-        if prefetched_manifest is not None:
-            state.manifest_data = prefetched_manifest.to_dict()
-            state.mod_rules = prefetched_manifest.mod_rules
-            state.save()
-
-        total_mods = len(mods_to_download)
-        downloader = Downloader(self.api)
-
-        if not mods_to_download:
-            results = []
-        else:
-            def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
-                if total_bytes > 0:
-                    pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                    progress("download", pct, f"Downloading... ({bytes_dl}/{total_bytes} bytes)")
-
-            progress("download", 0.1, f"Downloading {total_mods} mods...")
-            _attach_expected_md5(state, mods_to_download)
-            results = downloader.download_mods(
+            # Initialize state
+            state = CollectionState(mods_dir)
+            if state.exists():
+                state.load()
+            state.set_collection_info(
+                url=collection_info.url,
+                name=collection_data["name"],
+                revision=collection_data["revision"],
                 game_domain=collection_data["game_domain"],
-                mods=mods_to_download,
-                target_dir=mods_dir,
-                on_progress=on_download_progress,
             )
 
-        # Extract archives
-        progress("extract", 0.75, "Extracting archives...")
-        extracted = 0
-        file_owners: dict[str, str] = {}
-        conflicts: list[FileConflict] = []
-        for i, (mod_info, file_path) in enumerate(results):
-            try:
-                if not no_extract and is_archive(file_path):
-                    final_files = extract_archive(file_path, mods_dir)
-                    for ef in final_files:
-                        rel = str(ef.relative_to(mods_dir))
+            if not mods:
+                # Empty collection or every mod optional and skipped: persist the
+                # collection info so status/update recognize this collection.
+                state.save()
+                return SyncResult(0, 0, [], [], collection_dir=mods_dir)
+
+            if not is_premium:
+                # Free user: register mods as pending_download
+                progress("pending", 0.5, "Building pending download list...")
+                pending_downloads: list[PendingDownload] = []
+                game_domain = collection_data["game_domain"]
+                for mod in mods:
+                    mod_id = mod["mod_id"]
+                    # Don't regress already-downloaded files (check by file_id)
+                    existing = state.get_file(mod["file_id"])
+                    if existing and existing.download_status == "downloaded":
+                        continue
+                    browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
+                    size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
+                    pending = PendingDownload(
+                        mod_id=mod_id,
+                        mod_name=mod["mod_name"],
+                        file_id=mod["file_id"],
+                        filename=mod.get("filename", ""),
+                        size_bytes=size_bytes,
+                        browser_url=browser_url,
+                    )
+                    pending_downloads.append(pending)
+                    mod_info_dict = dict(mod)
+                    mod_info_dict["download_status"] = "pending_download"
+                    mod_info_dict["browser_url"] = browser_url
+                    state.add_mod(mod_info_dict)
+
+                state.save()
+
+                # Cache manifest + generate load order even for free users
+                # (the manifest download is a public URL, doesn't need premium)
+                load_order_files: list[str] = []
+                if not no_load_order:
+                    progress("loadorder", 0.8, "Caching manifest and generating load order...")
+                    lo_files = self._generate_load_order(collection_data, mods_dir, state)
+                    load_order_files = lo_files
+
+                progress("done", 1.0, f"Registered {len(pending_downloads)} mods for manual download")
+                return SyncResult(
+                    mods_downloaded=0,
+                    mods_extracted=0,
+                    errors=errors,
+                    load_order_files=load_order_files,
+                    pending_downloads=pending_downloads,
+                    collection_dir=mods_dir,
+                )
+
+            # Premium user: download directly
+            # Skip mods already downloaded with matching file_id
+            if state.mods:
+                to_install, to_update, up_to_date, _ = state.compare_with_collection(mods)
+                mods_to_download = to_install + to_update
+                skipped = len(up_to_date)
+                if skipped:
+                    progress("download", 0.1, f"Skipping {skipped} already-downloaded mods")
+                # Re-register up-to-date mods in state so they stay tracked
+                for mod in up_to_date:
+                    state.add_mod(mod)
+            else:
+                mods_to_download = mods
+                skipped = 0
+
+            # Prefetch the collection manifest once when it is not cached yet, so
+            # download integrity checks can use its MD5s even on a first sync.
+            # This is the same single public fetch _generate_load_order would do
+            # later, passed through to avoid a redundant second download. If it
+            # fails, downloads proceed with size-only verification.
+            prefetched_manifest = None
+            if state.manifest_data is None and collection_data.get("download_link"):
+                try:
+                    prefetched_manifest = download_and_parse_manifest(
+                        collection_data["download_link"], session=self.api.session
+                    )
+                except ManifestError:
+                    prefetched_manifest = None
+            if prefetched_manifest is not None:
+                state.manifest_data = prefetched_manifest.to_dict()
+                state.mod_rules = prefetched_manifest.mod_rules
+                state.save()
+
+            total_mods = len(mods_to_download)
+            downloader = Downloader(self.api)
+
+            if not mods_to_download:
+                results = []
+            else:
+                def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                    if total_bytes > 0:
+                        pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
+                        progress("download", pct, f"Downloading... ({bytes_dl}/{total_bytes} bytes)")
+
+                progress("download", 0.1, f"Downloading {total_mods} mods...")
+                _attach_expected_md5(state, mods_to_download)
+                results = downloader.download_mods(
+                    game_domain=collection_data["game_domain"],
+                    mods=mods_to_download,
+                    target_dir=mods_dir,
+                    on_progress=on_download_progress,
+                )
+
+            # Extract archives
+            progress("extract", 0.75, "Extracting archives...")
+            extracted = 0
+            file_owners: dict[str, str] = {}
+            conflicts: list[FileConflict] = []
+            for i, (mod_info, file_path) in enumerate(results):
+                try:
+                    if not no_extract and is_archive(file_path):
+                        final_files = extract_archive(file_path, mods_dir)
+                        for ef in final_files:
+                            rel = str(ef.relative_to(mods_dir))
+                            prev_owner = file_owners.get(rel)
+                            if prev_owner:
+                                conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
+                            file_owners[rel] = mod_info["mod_name"]
+                        file_path.unlink()
+                        extracted += 1
+                    else:
+                        rel = str(file_path.relative_to(mods_dir))
                         prev_owner = file_owners.get(rel)
                         if prev_owner:
                             conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                         file_owners[rel] = mod_info["mod_name"]
-                    file_path.unlink()
-                    extracted += 1
-                else:
-                    rel = str(file_path.relative_to(mods_dir))
-                    prev_owner = file_owners.get(rel)
-                    if prev_owner:
-                        conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
-                    file_owners[rel] = mod_info["mod_name"]
-                state.add_mod(mod_info)
-                state.save()
-                pct = 0.75 + 0.15 * ((i + 1) / len(results))
-                progress("extract", pct, f"Extracted {mod_info['mod_name']}")
-            except ExtractionError as e:
-                errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                    state.add_mod(mod_info)
+                    state.save()
+                    pct = 0.75 + 0.15 * ((i + 1) / len(results))
+                    progress("extract", pct, f"Extracted {mod_info['mod_name']}")
+                except ExtractionError as e:
+                    errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
 
-        # Generate load order
-        if not no_load_order:
-            progress("loadorder", 0.9, "Generating load order...")
-            lo_files = self._generate_load_order(
-                collection_data, mods_dir, state, manifest=prefetched_manifest
+            # Generate load order
+            if not no_load_order:
+                progress("loadorder", 0.9, "Generating load order...")
+                lo_files = self._generate_load_order(
+                    collection_data, mods_dir, state, manifest=prefetched_manifest
+                )
+                load_order_files = lo_files
+
+            # Track sync
+            tracked, untracked = self._maybe_sync_tracked(state)
+            skip_msg = f", {skipped} skipped" if skipped else ""
+            progress("done", 1.0, f"Synced {len(results)} mods successfully{skip_msg}")
+
+            return SyncResult(
+                mods_downloaded=len(results),
+                mods_extracted=extracted,
+                errors=errors,
+                load_order_files=load_order_files,
+                tracked=tracked,
+                untracked=untracked,
+                collection_dir=mods_dir,
+                conflicts=conflicts,
             )
-            load_order_files = lo_files
-
-        # Track sync
-        tracked, untracked = self._maybe_sync_tracked(state)
-        skip_msg = f", {skipped} skipped" if skipped else ""
-        progress("done", 1.0, f"Synced {len(results)} mods successfully{skip_msg}")
-
-        return SyncResult(
-            mods_downloaded=len(results),
-            mods_extracted=extracted,
-            errors=errors,
-            load_order_files=load_order_files,
-            tracked=tracked,
-            untracked=untracked,
-            collection_dir=mods_dir,
-            conflicts=conflicts,
-        )
 
     def update(
         self,
@@ -838,107 +869,108 @@ class ModManagerService:
         errors: list[str] = []
         load_order_files: list[str] = []
 
-        state = CollectionState(mods_dir)
-        state.load()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
 
-        progress("init", 0.0, "Validating API key...")
-        user_info = self.api.validate_key()
-        is_premium = self._check_premium(user_info)
+            progress("init", 0.0, "Validating API key...")
+            user_info = self.api.validate_key()
+            is_premium = self._check_premium(user_info)
 
-        collection_info = parse_collection_url(state.collection_url)
+            collection_info = parse_collection_url(state.collection_url)
 
-        progress("fetch", 0.05, "Checking for updates...")
-        collection_data = self.api.get_collection_mods(
-            collection_info.game_domain, collection_info.slug
-        )
+            progress("fetch", 0.05, "Checking for updates...")
+            collection_data = self.api.get_collection_mods(
+                collection_info.game_domain, collection_info.slug
+            )
 
-        new_revision = collection_data["revision"]
-        mods = collection_data["mods"]
-        dupes = collection_data.get("duplicates_removed", 0)
-        if dupes:
-            progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
-        if skip_optional:
-            mods = [m for m in mods if not m.get("optional", False)]
+            new_revision = collection_data["revision"]
+            mods = collection_data["mods"]
+            dupes = collection_data.get("duplicates_removed", 0)
+            if dupes:
+                progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
+            if skip_optional:
+                mods = [m for m in mods if not m.get("optional", False)]
 
-        to_install, to_update, up_to_date, to_remove = state.compare_with_collection(mods)
+            to_install, to_update, up_to_date, to_remove = state.compare_with_collection(mods)
 
-        downloaded = 0
-        pending_downloads: list[PendingDownload] = []
-        if to_install or to_update:
-            mods_to_download = to_install + to_update
-            if is_premium:
-                downloader = Downloader(self.api)
+            downloaded = 0
+            pending_downloads: list[PendingDownload] = []
+            if to_install or to_update:
+                mods_to_download = to_install + to_update
+                if is_premium:
+                    downloader = Downloader(self.api)
 
-                def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
-                    if total_bytes > 0:
-                        pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                        progress("download", pct, f"Downloading...")
+                    def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                        if total_bytes > 0:
+                            pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
+                            progress("download", pct, f"Downloading...")
 
-                progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
-                _attach_expected_md5(state, mods_to_download)
-                results = downloader.download_mods(
-                    game_domain=collection_data["game_domain"],
-                    mods=mods_to_download,
-                    target_dir=mods_dir,
-                    on_progress=on_download_progress,
-                )
+                    progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
+                    _attach_expected_md5(state, mods_to_download)
+                    results = downloader.download_mods(
+                        game_domain=collection_data["game_domain"],
+                        mods=mods_to_download,
+                        target_dir=mods_dir,
+                        on_progress=on_download_progress,
+                    )
 
-                progress("extract", 0.75, "Extracting archives...")
-                for mod_info, file_path in results:
-                    try:
-                        if not no_extract and is_archive(file_path):
-                            extract_archive(file_path, mods_dir)
-                            file_path.unlink()
-                        state.add_mod(mod_info)
-                        downloaded += 1
-                    except ExtractionError as e:
-                        errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
-            else:
-                # Free user: register as pending
-                game_domain = collection_data["game_domain"]
-                for mod in mods_to_download:
-                    mod_id = mod["mod_id"]
-                    existing = state.get_file(mod["file_id"])
-                    if existing and existing.download_status == "downloaded":
-                        continue
-                    browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
-                    size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
-                    pending_downloads.append(PendingDownload(
-                        mod_id=mod_id,
-                        mod_name=mod["mod_name"],
-                        file_id=mod["file_id"],
-                        filename=mod.get("filename", ""),
-                        size_bytes=size_bytes,
-                        browser_url=browser_url,
-                    ))
-                    mod_info_dict = dict(mod)
-                    mod_info_dict["download_status"] = "pending_download"
-                    mod_info_dict["browser_url"] = browser_url
-                    state.add_mod(mod_info_dict)
+                    progress("extract", 0.75, "Extracting archives...")
+                    for mod_info, file_path in results:
+                        try:
+                            if not no_extract and is_archive(file_path):
+                                extract_archive(file_path, mods_dir)
+                                file_path.unlink()
+                            state.add_mod(mod_info)
+                            downloaded += 1
+                        except ExtractionError as e:
+                            errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                else:
+                    # Free user: register as pending
+                    game_domain = collection_data["game_domain"]
+                    for mod in mods_to_download:
+                        mod_id = mod["mod_id"]
+                        existing = state.get_file(mod["file_id"])
+                        if existing and existing.download_status == "downloaded":
+                            continue
+                        browser_url = f"https://www.nexusmods.com/{game_domain}/mods/{mod_id}?tab=files&file_id={mod['file_id']}"
+                        size_bytes = int(mod.get("size_bytes", 0) or mod.get("size", 0) or 0)
+                        pending_downloads.append(PendingDownload(
+                            mod_id=mod_id,
+                            mod_name=mod["mod_name"],
+                            file_id=mod["file_id"],
+                            filename=mod.get("filename", ""),
+                            size_bytes=size_bytes,
+                            browser_url=browser_url,
+                        ))
+                        mod_info_dict = dict(mod)
+                        mod_info_dict["download_status"] = "pending_download"
+                        mod_info_dict["browser_url"] = browser_url
+                        state.add_mod(mod_info_dict)
 
-        state.collection_revision = new_revision
-        state.save()
+            state.collection_revision = new_revision
+            state.save()
 
-        if not no_load_order and (to_install or to_update):
-            progress("loadorder", 0.9, "Generating load order...")
-            load_order_files = self._generate_load_order(collection_data, mods_dir, state)
+            if not no_load_order and (to_install or to_update):
+                progress("loadorder", 0.9, "Generating load order...")
+                load_order_files = self._generate_load_order(collection_data, mods_dir, state)
 
-        tracked, untracked = self._maybe_sync_tracked(state)
-        progress("done", 1.0, "Update complete")
+            tracked, untracked = self._maybe_sync_tracked(state)
+            progress("done", 1.0, "Update complete")
 
-        return UpdateResult(
-            to_install=to_install,
-            to_update=to_update,
-            up_to_date=up_to_date,
-            to_remove=to_remove,
-            downloaded=downloaded,
-            errors=errors,
-            new_revision=new_revision,
-            load_order_files=load_order_files,
-            tracked=tracked,
-            untracked=untracked,
-            pending_downloads=pending_downloads,
-        )
+            return UpdateResult(
+                to_install=to_install,
+                to_update=to_update,
+                up_to_date=up_to_date,
+                to_remove=to_remove,
+                downloaded=downloaded,
+                errors=errors,
+                new_revision=new_revision,
+                load_order_files=load_order_files,
+                tracked=tracked,
+                untracked=untracked,
+                pending_downloads=pending_downloads,
+            )
 
     def add_mod(
         self,
@@ -954,167 +986,169 @@ class ModManagerService:
 
         mod_info = parse_mod_url(mod_url)
 
-        state = CollectionState(mods_dir)
-        state.load()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
 
-        # Validate game domain matches
-        if state.game_domain and state.game_domain.lower() != mod_info.game_domain.lower():
-            return AddResult(
-                mod_name="", mod_id=mod_info.mod_id, file_name="",
-                success=False,
-                error=f"Mod is for '{mod_info.game_domain}' but collection is for '{state.game_domain}'"
+            # Validate game domain matches
+            if state.game_domain and state.game_domain.lower() != mod_info.game_domain.lower():
+                return AddResult(
+                    mod_name="", mod_id=mod_info.mod_id, file_name="",
+                    success=False,
+                    error=f"Mod is for '{mod_info.game_domain}' but collection is for '{state.game_domain}'"
+                )
+
+            progress("init", 0.0, "Validating API key...")
+            user_info = self.api.validate_key()
+            is_premium = self._check_premium(user_info)
+
+            progress("fetch", 0.1, "Fetching mod info...")
+            nexus_mod = self.api.get_mod_info(mod_info.game_domain, mod_info.mod_id)
+            mod_name = nexus_mod.get("name", f"Mod {mod_info.mod_id}")
+
+            files = self.api.get_mod_files(mod_info.game_domain, mod_info.mod_id)
+            if not files:
+                return AddResult(
+                    mod_name=mod_name, mod_id=mod_info.mod_id, file_name="",
+                    success=False, error="No files found for this mod"
+                )
+
+            selected = _select_mod_file(files, file_id)
+            if selected is None:
+                return AddResult(
+                    mod_name=mod_name, mod_id=mod_info.mod_id, file_name="",
+                    success=False,
+                    error=f"Could not select file. Use file_id param. Available: {[f['file_id'] for f in files]}"
+                )
+
+            selected_file_id = selected["file_id"]
+            selected_name = selected.get("name", selected.get("file_name", ""))
+            selected_version = selected.get("version", "")
+
+            download_info = {
+                "mod_id": mod_info.mod_id,
+                "mod_name": mod_name,
+                "file_id": selected_file_id,
+                "filename": selected.get("file_name", selected_name),
+                "version": selected_version,
+                # Only size_in_bytes is an exact byte count. The legacy REST
+                # "size" field is in KB and must never be verified as bytes, so
+                # when it is the only value available the size check is skipped.
+                "size_bytes": int(selected.get("size_in_bytes") or 0),
+                "optional": False,
+                "requirements": [],
+            }
+
+            if not is_premium:
+                # Free user: register as pending download
+                browser_url = f"https://www.nexusmods.com/{mod_info.game_domain}/mods/{mod_info.mod_id}?tab=files&file_id={selected_file_id}"
+                download_info["manual"] = True
+                download_info["download_status"] = "pending_download"
+                download_info["browser_url"] = browser_url
+                state.add_mod(download_info)
+                # State is keyed by file_id, not mod_id
+                state.mods[selected_file_id].phase = 999
+                state.save()
+
+                pending = PendingDownload(
+                    mod_id=mod_info.mod_id,
+                    mod_name=mod_name,
+                    file_id=selected_file_id,
+                    filename=download_info["filename"],
+                    size_bytes=download_info["size_bytes"],
+                    browser_url=browser_url,
+                )
+                progress("done", 1.0, f"Registered {mod_name} for manual download")
+                return AddResult(
+                    mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
+                    success=True, pending_download=pending,
+                )
+
+            def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                if total_bytes > 0:
+                    pct = 0.2 + 0.6 * (bytes_dl / total_bytes)
+                    progress("download", pct, f"Downloading {mod_name}...")
+
+            progress("download", 0.2, f"Downloading {mod_name}...")
+            downloader = Downloader(self.api)
+            _attach_expected_md5(state, [download_info])
+            results = downloader.download_mods(
+                game_domain=mod_info.game_domain,
+                mods=[download_info],
+                target_dir=mods_dir,
+                on_progress=on_download_progress,
             )
 
-        progress("init", 0.0, "Validating API key...")
-        user_info = self.api.validate_key()
-        is_premium = self._check_premium(user_info)
+            if not results:
+                return AddResult(
+                    mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
+                    success=False, error="Download failed"
+                )
 
-        progress("fetch", 0.1, "Fetching mod info...")
-        nexus_mod = self.api.get_mod_info(mod_info.game_domain, mod_info.mod_id)
-        mod_name = nexus_mod.get("name", f"Mod {mod_info.mod_id}")
+            progress("extract", 0.85, "Extracting...")
+            for _mod, file_path in results:
+                try:
+                    if not no_extract and is_archive(file_path):
+                        extract_archive(file_path, mods_dir)
+                        file_path.unlink()
+                except ExtractionError as e:
+                    return AddResult(
+                        mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
+                        success=False, error=f"Extraction error: {e}"
+                    )
 
-        files = self.api.get_mod_files(mod_info.game_domain, mod_info.mod_id)
-        if not files:
-            return AddResult(
-                mod_name=mod_name, mod_id=mod_info.mod_id, file_name="",
-                success=False, error="No files found for this mod"
-            )
-
-        selected = _select_mod_file(files, file_id)
-        if selected is None:
-            return AddResult(
-                mod_name=mod_name, mod_id=mod_info.mod_id, file_name="",
-                success=False,
-                error=f"Could not select file. Use file_id param. Available: {[f['file_id'] for f in files]}"
-            )
-
-        selected_file_id = selected["file_id"]
-        selected_name = selected.get("name", selected.get("file_name", ""))
-        selected_version = selected.get("version", "")
-
-        download_info = {
-            "mod_id": mod_info.mod_id,
-            "mod_name": mod_name,
-            "file_id": selected_file_id,
-            "filename": selected.get("file_name", selected_name),
-            "version": selected_version,
-            # Only size_in_bytes is an exact byte count. The legacy REST
-            # "size" field is in KB and must never be verified as bytes, so
-            # when it is the only value available the size check is skipped.
-            "size_bytes": int(selected.get("size_in_bytes") or 0),
-            "optional": False,
-            "requirements": [],
-        }
-
-        if not is_premium:
-            # Free user: register as pending download
-            browser_url = f"https://www.nexusmods.com/{mod_info.game_domain}/mods/{mod_info.mod_id}?tab=files&file_id={selected_file_id}"
+            # Register in state as manual
             download_info["manual"] = True
-            download_info["download_status"] = "pending_download"
-            download_info["browser_url"] = browser_url
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
             state.save()
 
-            pending = PendingDownload(
-                mod_id=mod_info.mod_id,
-                mod_name=mod_name,
-                file_id=selected_file_id,
-                filename=download_info["filename"],
-                size_bytes=download_info["size_bytes"],
-                browser_url=browser_url,
-            )
-            progress("done", 1.0, f"Registered {mod_name} for manual download")
+            self._maybe_sync_tracked(state)
+
+            if not no_load_order:
+                progress("loadorder", 0.95, "Regenerating load order...")
+                self._regen_load_order_from_state(mods_dir, state)
+
+            progress("done", 1.0, f"Added {mod_name}")
             return AddResult(
                 mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                success=True, pending_download=pending,
+                success=True,
             )
-
-        def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
-            if total_bytes > 0:
-                pct = 0.2 + 0.6 * (bytes_dl / total_bytes)
-                progress("download", pct, f"Downloading {mod_name}...")
-
-        progress("download", 0.2, f"Downloading {mod_name}...")
-        downloader = Downloader(self.api)
-        _attach_expected_md5(state, [download_info])
-        results = downloader.download_mods(
-            game_domain=mod_info.game_domain,
-            mods=[download_info],
-            target_dir=mods_dir,
-            on_progress=on_download_progress,
-        )
-
-        if not results:
-            return AddResult(
-                mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                success=False, error="Download failed"
-            )
-
-        progress("extract", 0.85, "Extracting...")
-        for _mod, file_path in results:
-            try:
-                if not no_extract and is_archive(file_path):
-                    extract_archive(file_path, mods_dir)
-                    file_path.unlink()
-            except ExtractionError as e:
-                return AddResult(
-                    mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                    success=False, error=f"Extraction error: {e}"
-                )
-
-        # Register in state as manual
-        download_info["manual"] = True
-        state.add_mod(download_info)
-        # State is keyed by file_id, not mod_id
-        state.mods[selected_file_id].phase = 999
-        state.save()
-
-        self._maybe_sync_tracked(state)
-
-        if not no_load_order:
-            progress("loadorder", 0.95, "Regenerating load order...")
-            self._regen_load_order_from_state(mods_dir, state)
-
-        progress("done", 1.0, f"Added {mod_name}")
-        return AddResult(
-            mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-            success=True,
-        )
 
     def add_local(self, name: str, mods_dir: Path, no_load_order: bool = False) -> int:
         """Register a pre-existing local mod. Returns synthetic mod_id."""
-        state = CollectionState(mods_dir)
-        state.load()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
 
-        # State is keyed by file_id: pick a negative id that is unique among
-        # both file_id keys and mod_ids, and use it for both so repeated
-        # add-local calls never collide and the phase lookup below is valid.
-        existing_ids = set(state.mods.keys())
-        existing_mod_ids = {ms.mod_id for ms in state.mods.values()}
-        synthetic_id = -1
-        while synthetic_id in existing_ids or synthetic_id in existing_mod_ids:
-            synthetic_id -= 1
+            # State is keyed by file_id: pick a negative id that is unique among
+            # both file_id keys and mod_ids, and use it for both so repeated
+            # add-local calls never collide and the phase lookup below is valid.
+            existing_ids = set(state.mods.keys())
+            existing_mod_ids = {ms.mod_id for ms in state.mods.values()}
+            synthetic_id = -1
+            while synthetic_id in existing_ids or synthetic_id in existing_mod_ids:
+                synthetic_id -= 1
 
-        mod_info = {
-            "mod_id": synthetic_id,
-            "mod_name": name,
-            "file_id": synthetic_id,
-            "filename": "",
-            "version": "",
-            "optional": False,
-            "manual": True,
-        }
+            mod_info = {
+                "mod_id": synthetic_id,
+                "mod_name": name,
+                "file_id": synthetic_id,
+                "filename": "",
+                "version": "",
+                "optional": False,
+                "manual": True,
+            }
 
-        state.add_mod(mod_info)
-        state.mods[synthetic_id].phase = 999
-        state.save()
+            state.add_mod(mod_info)
+            state.mods[synthetic_id].phase = 999
+            state.save()
 
-        if not no_load_order:
-            self._regen_load_order_from_state(mods_dir, state)
+            if not no_load_order:
+                self._regen_load_order_from_state(mods_dir, state)
 
-        return synthetic_id
+            return synthetic_id
 
     def get_mod_files(self, mod_url: str) -> list[ModFileInfo]:
         """Get available files for a mod by URL."""
@@ -1468,23 +1502,29 @@ class ModManagerService:
 
     def track_sync_enable(self, mods_dir: Path) -> tuple[int, int]:
         """Enable track sync and run initial sync. Returns (tracked, untracked)."""
-        state = CollectionState(mods_dir)
-        state.load()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
 
-        state.track_sync_enabled = True
-        state.save()
+            state.track_sync_enabled = True
+            state.save()
 
-        return self._sync_tracked_mods(state)
+            return self._sync_tracked_mods(state)
 
     def track_sync_disable(self, mods_dir: Path) -> None:
         """Disable track sync."""
-        state = CollectionState(mods_dir)
-        state.load()
-        state.track_sync_enabled = False
-        state.save()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+            state.track_sync_enabled = False
+            state.save()
 
     def track_sync_push(self, mods_dir: Path) -> tuple[int, int]:
-        """One-shot sync regardless of enable/disable state."""
+        """One-shot sync regardless of enable/disable state.
+
+        Read-only with respect to local state (only Nexus-side tracking
+        changes), so it deliberately does not take the collection lock.
+        """
         state = CollectionState(mods_dir)
         state.load()
         return self._sync_tracked_mods(state)
@@ -1513,168 +1553,607 @@ class ModManagerService:
         progress = on_progress or _noop_progress
         errors: list[str] = []
 
-        state = CollectionState(mods_dir)
-        state.load()
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
 
-        # Sorted by file_id so contested files resolve deterministically
-        pending = sorted(state.get_pending_mods(), key=lambda ms: ms.file_id)
-        if not pending:
-            return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
+            # Sorted by file_id so contested files resolve deterministically
+            pending = sorted(state.get_pending_mods(), key=lambda ms: ms.file_id)
+            if not pending:
+                return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
 
-        # Candidate files: skip hidden files (.nexus-state.json, .DS_Store,
-        # config dotfiles) and files this tool generates inside the mods dir,
-        # so internal state and generated output are never matched or hashed.
-        candidates = [
-            f for f in sorted(mods_dir.iterdir())
-            if f.is_file()
-            and not f.name.startswith(".")
-            and f.name.lower() not in _INTERNAL_FILENAMES
-        ]
+            # Candidate files: skip hidden files (.nexus-state.json, .DS_Store,
+            # config dotfiles) and files this tool generates inside the mods dir,
+            # so internal state and generated output are never matched or hashed.
+            candidates = [
+                f for f in sorted(mods_dir.iterdir())
+                if f.is_file()
+                and not f.name.startswith(".")
+                and f.name.lower() not in _INTERNAL_FILENAMES
+            ]
 
-        by_identity_md5, by_name_md5 = _expected_md5_maps(state.manifest_data)
-        md5_cache: dict[Path, str | None] = {}
-        archive_cache: dict[Path, bool] = {}
-        claimed: dict[Path, str] = {}  # disk file -> pending mod that consumed it
+            by_identity_md5, by_name_md5 = _expected_md5_maps(state.manifest_data)
+            md5_cache: dict[Path, str | None] = {}
+            archive_cache: dict[Path, bool] = {}
+            claimed: dict[Path, str] = {}  # disk file -> pending mod that consumed it
 
-        matched = 0
-        extracted = 0
-        progress("import", 0.1, f"Scanning for {len(pending)} pending downloads...")
+            matched = 0
+            extracted = 0
+            progress("import", 0.1, f"Scanning for {len(pending)} pending downloads...")
 
-        for i, mod_state in enumerate(pending):
-            progress("import", 0.1 + 0.8 * (i / len(pending)), f"Checking {mod_state.name}...")
+            for i, mod_state in enumerate(pending):
+                progress("import", 0.1 + 0.8 * (i / len(pending)), f"Checking {mod_state.name}...")
 
-            filename = (mod_state.filename or "").strip()
-            mod_id = _as_int(mod_state.mod_id) or 0
-            file_id = _as_int(mod_state.file_id) or 0
-            expected_md5 = by_identity_md5.get((mod_id, file_id))
-            if expected_md5 is None and filename:
-                expected_md5 = by_name_md5.get(filename.lower())
+                filename = (mod_state.filename or "").strip()
+                mod_id = _as_int(mod_state.mod_id) or 0
+                file_id = _as_int(mod_state.file_id) or 0
+                expected_md5 = by_identity_md5.get((mod_id, file_id))
+                if expected_md5 is None and filename:
+                    expected_md5 = by_name_md5.get(filename.lower())
 
-            available = [p for p in candidates if p not in claimed]
-            match, ambiguous, hash_rejected = _resolve_import_match(
-                filename, mod_id, mod_state.version,
-                available, expected_md5, md5_cache, archive_cache,
-            )
-
-            if match is None and not ambiguous and not hash_rejected and claimed:
-                # Every match for this item was already consumed by an earlier
-                # pending item in this run: report the collision explicitly.
-                used, _, _ = _resolve_import_match(
+                available = [p for p in candidates if p not in claimed]
+                match, ambiguous, hash_rejected = _resolve_import_match(
                     filename, mod_id, mod_state.version,
-                    list(claimed), expected_md5, md5_cache, archive_cache,
+                    available, expected_md5, md5_cache, archive_cache,
                 )
-                if used is not None:
+
+                if match is None and not ambiguous and not hash_rejected and claimed:
+                    # Every match for this item was already consumed by an earlier
+                    # pending item in this run: report the collision explicitly.
+                    used, _, _ = _resolve_import_match(
+                        filename, mod_id, mod_state.version,
+                        list(claimed), expected_md5, md5_cache, archive_cache,
+                    )
+                    if used is not None:
+                        errors.append(
+                            f"Skipped {mod_state.name}: the matching file {used.name} "
+                            f"already matched {claimed[used]} in this run."
+                        )
+                        continue
+
+                if match is None:
+                    if hash_rejected:
+                        names = ", ".join(sorted(p.name for p in hash_rejected))
+                        errors.append(
+                            f"Content hash mismatch for {mod_state.name}: {names} matches "
+                            f"the name but not the expected content hash for this file "
+                            f"(stale, corrupt, or the wrong download). Delete it, "
+                            f"re-download the file, then re-run import."
+                        )
+                    elif ambiguous:
+                        names = ", ".join(sorted(p.name for p in ambiguous))
+                        errors.append(
+                            f"Ambiguous match for {mod_state.name}: several files could be "
+                            f"'{mod_state.filename}' ({names}). Keep only the right one, "
+                            f"then re-run import."
+                        )
+                    else:
+                        hint = (
+                            f" Download it from {mod_state.browser_url} and"
+                            if mod_state.browser_url else ""
+                        )
+                        errors.append(
+                            f"No local file found for {mod_state.name} (expected "
+                            f"'{mod_state.filename}').{hint} place it in {mods_dir}, "
+                            f"then re-run import."
+                        )
+                    continue
+
+                # A file matched under an archive name must contain real archive
+                # content: an error page or truncated download saved as
+                # .zip/.7z/.rar must never count as downloaded, in any mode.
+                if (
+                    match.suffix.lower() in _MAGIC_VERIFIED_SUFFIXES
+                    or Path(filename).suffix.lower() in _MAGIC_VERIFIED_SUFFIXES
+                ) and sniff_archive_magic(match) is None:
                     errors.append(
-                        f"Skipped {mod_state.name}: the matching file {used.name} "
-                        f"already matched {claimed[used]} in this run."
+                        f"Validation error for {mod_state.name}: {match.name} is not "
+                        f"valid archive content (corrupt, incomplete, or an error "
+                        f"page). Delete it, re-download the file, then re-run import."
                     )
                     continue
 
-            if match is None:
-                if hash_rejected:
-                    names = ", ".join(sorted(p.name for p in hash_rejected))
-                    errors.append(
-                        f"Content hash mismatch for {mod_state.name}: {names} matches "
-                        f"the name but not the expected content hash for this file "
-                        f"(stale, corrupt, or the wrong download). Delete it, "
-                        f"re-download the file, then re-run import."
-                    )
-                elif ambiguous:
-                    names = ", ".join(sorted(p.name for p in ambiguous))
-                    errors.append(
-                        f"Ambiguous match for {mod_state.name}: several files could be "
-                        f"'{mod_state.filename}' ({names}). Keep only the right one, "
-                        f"then re-run import."
-                    )
-                else:
-                    hint = (
-                        f" Download it from {mod_state.browser_url} and"
-                        if mod_state.browser_url else ""
-                    )
-                    errors.append(
-                        f"No local file found for {mod_state.name} (expected "
-                        f"'{mod_state.filename}').{hint} place it in {mods_dir}, "
-                        f"then re-run import."
-                    )
-                continue
+                claimed[match] = mod_state.name
+                matched += 1
 
-            # A file matched under an archive name must contain real archive
-            # content: an error page or truncated download saved as
-            # .zip/.7z/.rar must never count as downloaded, in any mode.
-            if (
-                match.suffix.lower() in _MAGIC_VERIFIED_SUFFIXES
-                or Path(filename).suffix.lower() in _MAGIC_VERIFIED_SUFFIXES
-            ) and sniff_archive_magic(match) is None:
-                errors.append(
-                    f"Validation error for {mod_state.name}: {match.name} is not "
-                    f"valid archive content (corrupt, incomplete, or an error "
-                    f"page). Delete it, re-download the file, then re-run import."
-                )
-                continue
+                is_arch = is_archive(match)
+                try:
+                    if not no_extract and is_arch:
+                        extract_archive(match, mods_dir)
+                        extracted += 1
+                except ExtractionError as e:
+                    # A failed extraction must never mark the mod downloaded.
+                    # The archive stays on disk and the item stays pending;
+                    # partially moved content cannot be rolled back.
+                    errors.append(f"Extraction error for {mod_state.name}: {e}")
+                    continue
 
-            claimed[match] = mod_state.name
-            matched += 1
+                mod_state.download_status = "downloaded"
+                mod_state.browser_url = ""
+                mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+                # Persist before any destructive cleanup so a mid-run failure
+                # cannot lose progress for already-imported items.
+                state.save()
 
-            is_arch = is_archive(match)
-            try:
                 if not no_extract and is_arch:
-                    extract_archive(match, mods_dir)
-                    extracted += 1
-            except ExtractionError as e:
-                # A failed extraction must never mark the mod downloaded.
-                # The archive stays on disk and the item stays pending;
-                # partially moved content cannot be rolled back.
-                errors.append(f"Extraction error for {mod_state.name}: {e}")
-                continue
+                    try:
+                        match.unlink()
+                    except OSError as e:
+                        # The import itself succeeded and is persisted; a leftover
+                        # archive is reported but does not roll back the success.
+                        errors.append(f"Could not remove {match.name} after import: {e}")
 
-            mod_state.download_status = "downloaded"
-            mod_state.browser_url = ""
-            mod_state.installed_at = datetime.now(timezone.utc).isoformat()
-            # Persist before any destructive cleanup so a mid-run failure
-            # cannot lose progress for already-imported items.
+                pct = 0.1 + 0.8 * ((i + 1) / len(pending))
+                progress("import", pct, f"Imported {mod_state.name}")
+
             state.save()
 
-            if not no_extract and is_arch:
+            # Regenerate load order if any mods were matched. Imports are already
+            # persisted at this point, so post-save failures are reported as
+            # errors instead of crashing the run.
+            load_order_files: list[str] = []
+            if matched > 0 and not no_load_order:
+                progress("loadorder", 0.95, "Regenerating load order...")
                 try:
-                    match.unlink()
-                except OSError as e:
-                    # The import itself succeeded and is persisted; a leftover
-                    # archive is reported but does not roll back the success.
-                    errors.append(f"Could not remove {match.name} after import: {e}")
+                    load_order_files = self._regen_load_order_from_state(mods_dir, state)
+                except Exception as e:
+                    errors.append(f"Load order regeneration failed: {e}")
 
-            pct = 0.1 + 0.8 * ((i + 1) / len(pending))
-            progress("import", pct, f"Imported {mod_state.name}")
+            # Sync tracked mods (same as premium sync does after downloading)
+            if matched > 0:
+                try:
+                    self._maybe_sync_tracked(state)
+                except Exception as e:
+                    errors.append(f"Track sync failed: {e}")
 
-        state.save()
+            still_pending = len(state.get_pending_mods())
+            progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")
 
-        # Regenerate load order if any mods were matched. Imports are already
-        # persisted at this point, so post-save failures are reported as
-        # errors instead of crashing the run.
-        load_order_files: list[str] = []
-        if matched > 0 and not no_load_order:
-            progress("loadorder", 0.95, "Regenerating load order...")
+            return ImportResult(
+                matched=matched,
+                extracted=extracted,
+                still_pending=still_pending,
+                errors=errors,
+                load_order_files=load_order_files,
+            )
+
+    def add_nxm(
+        self,
+        uri: str,
+        mods_dir: Path | None = None,
+        output_dir: Path | None = None,
+        no_load_order: bool = False,
+        no_extract: bool = False,
+        on_progress: ProgressCallback | None = None,
+    ) -> NxmResult:
+        """Handle one nxm:// individual-file download link.
+
+        Flow (collection target):
+          1. strict parse and local expiry check (no network),
+          2. resolve the collection directory (read-only, no network),
+          3. acquire the collection lock and load state under it,
+          4. consistency checks: game match, file/mod identity, archive
+             collisions; a proven local duplicate returns with no network,
+          5. account validation: user_id identity check, premium status
+             (including profile expiry), free-account credential rules,
+          6. metadata fetch, signed download, integrity verification,
+             extraction, state update, load order, tracked-mod sync.
+
+        The key/expires credential pair is transient: it is forwarded to
+        the download-link request only and never written to state,
+        results, logs, or error messages. The URI user_id is a client
+        identity check and is never sent to the API.
+
+        Raises NxmParseError/NxmCollectionLinkError (parser), NxmRoutingError
+        (no or ambiguous target), StateBusyError (concurrent operation).
+        Failures never claim completion and never mutate prior state.
+        """
+        progress = on_progress or _noop_progress
+        info = parse_nxm_url(uri)
+
+        if info.is_expired():
+            # Fail locally: an expired pair can never be redeemed, so no
+            # request is made and nothing is mutated.
+            return self._nxm_failure(
+                info,
+                "This download link has expired. Click 'Mod manager "
+                "download' on the Nexus website again to get a fresh link.",
+                re_click_required=True,
+            )
+
+        if output_dir is not None:
+            return self._nxm_to_output(info, Path(output_dir), progress)
+
+        # Routing is read-only: no directories, files, or state are
+        # created for an unmapped or ambiguous game.
+        target = resolve_collection_dir(info.game_domain, mods_dir)
+
+        with CollectionLock(target):
+            state = CollectionState(target)
+            state.load()
+
+            if (
+                state.game_domain
+                and state.game_domain.lower() != info.game_domain.lower()
+            ):
+                return self._nxm_failure(
+                    info,
+                    f"This link is for '{info.game_domain}' but {target} "
+                    f"holds a '{state.game_domain}' collection.",
+                    collection_dir=target,
+                )
+
+            existing = state.get_file(info.file_id)
+            if existing is not None and existing.mod_id != info.mod_id:
+                return self._nxm_failure(
+                    info,
+                    f"File {info.file_id} is already registered under mod "
+                    f"{existing.mod_id} ({existing.name}) in this "
+                    f"collection, but the link claims mod {info.mod_id}. "
+                    "Refusing to mix identities.",
+                    collection_dir=target,
+                )
+
+            if (
+                existing is not None
+                and existing.download_status == "downloaded"
+                and existing.filename
+            ):
+                archive = target / existing.filename
+                if archive.is_file() and (
+                    archive.suffix.lower() not in _MAGIC_VERIFIED_SUFFIXES
+                    or sniff_archive_magic(archive) is not None
+                ):
+                    # Proven local duplicate: the artifact exists and is
+                    # sane, so this is a no-op with zero network calls.
+                    return NxmResult(
+                        success=True,
+                        status="already_downloaded",
+                        game_domain=info.game_domain,
+                        mod_id=info.mod_id,
+                        file_id=info.file_id,
+                        mod_name=existing.name,
+                        filename=existing.filename,
+                        collection_dir=target,
+                    )
+                # Artifact gone or corrupt: do not blindly trust the state
+                # flag; fall through and re-download.
+
+            progress("init", 0.05, "Validating API key...")
+            account_error = self._nxm_account_error(info, collection_dir=target)
+            if account_error:
+                return self._nxm_failure(
+                    info, account_error, collection_dir=target,
+                    re_click_required=True,
+                )
+
+            progress("fetch", 0.1, "Fetching file metadata...")
+            selected, meta_error = self._nxm_file_metadata(info)
+            if meta_error:
+                return self._nxm_failure(
+                    info, meta_error, collection_dir=target
+                )
             try:
-                load_order_files = self._regen_load_order_from_state(mods_dir, state)
-            except Exception as e:
-                errors.append(f"Load order regeneration failed: {e}")
+                filename = validate_download_filename(
+                    selected.get("file_name") or selected.get("name")
+                )
+            except DownloadError as e:
+                return self._nxm_failure(info, str(e), collection_dir=target)
 
-        # Sync tracked mods (same as premium sync does after downloading)
-        if matched > 0:
+            mod_name = self._nxm_mod_name(info, existing=existing)
+
+            # Archive collisions: never silently overwrite an archive that
+            # belongs to a different file_id or to no tracked entry.
+            for fid, ms in state.mods.items():
+                if fid != info.file_id and ms.filename and ms.filename == filename:
+                    return self._nxm_failure(
+                        info,
+                        f"'{filename}' already belongs to file {fid} "
+                        f"({ms.name}) in this collection. Refusing to "
+                        "overwrite it with a different file. Use --output "
+                        "to save this download elsewhere.",
+                        collection_dir=target,
+                        filename=filename,
+                    )
+            owned_by_this = existing is not None and existing.filename == filename
+            if (target / filename).exists() and not owned_by_this:
+                return self._nxm_failure(
+                    info,
+                    f"'{filename}' already exists in {target} and is not "
+                    "this file's tracked archive. Refusing to overwrite "
+                    "it. Remove it or use --output.",
+                    collection_dir=target,
+                    filename=filename,
+                )
+
+            download_info = {
+                "mod_id": info.mod_id,
+                "mod_name": mod_name,
+                "file_id": info.file_id,
+                "filename": filename,
+                "version": selected.get("version", ""),
+                # Only size_in_bytes is an exact byte count (legacy "size"
+                # is KB and must never be verified as bytes).
+                "size_bytes": int(selected.get("size_in_bytes") or 0),
+                "optional": bool(existing.optional) if existing is not None else False,
+                "requirements": existing.requirements if existing is not None else [],
+            }
+            # Cached manifest MD5 only (exact identity match); no extra
+            # API calls and no guaranteed hash when unavailable.
+            _attach_expected_md5(state, [download_info])
+            signed = (
+                SignedLink(key=info.key, expires=info.expires)
+                if info.has_credentials
+                else None
+            )
+
+            def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
+                if total_bytes > 0:
+                    pct = 0.2 + 0.6 * (bytes_dl / total_bytes)
+                    progress("download", pct, f"Downloading {mod_name}...")
+
+            progress("download", 0.2, f"Downloading {filename}...")
+            downloader = Downloader(self.api)
             try:
-                self._maybe_sync_tracked(state)
-            except Exception as e:
-                errors.append(f"Track sync failed: {e}")
+                path = downloader.download_mod(
+                    info.game_domain,
+                    download_info,
+                    target,
+                    on_progress=on_download_progress,
+                    signed=signed,
+                )
+            except DownloadError as e:
+                # State is untouched and any previous files are intact:
+                # a failed download never claims completion.
+                return self._nxm_failure(
+                    info, str(e), collection_dir=target,
+                    mod_name=mod_name, filename=filename,
+                )
 
-        still_pending = len(state.get_pending_mods())
-        progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")
+            extracted = False
+            if not no_extract and is_archive(path):
+                try:
+                    extract_archive(path, target)
+                    extracted = True
+                except ExtractionError as e:
+                    # Extraction failed: never claim completion. The
+                    # verified archive stays on disk and the entry stays
+                    # (or becomes) pending so `nexus-dl import` can finish
+                    # the job without another download.
+                    if existing is None:
+                        download_info["manual"] = True
+                        download_info["download_status"] = "pending_download"
+                        state.add_mod(download_info)
+                        state.mods[info.file_id].phase = 999
+                        state.save()
+                    return self._nxm_failure(
+                        info,
+                        f"Download succeeded but extraction failed: {e}. "
+                        f"The archive is kept at {path}; run 'nexus-dl "
+                        f"import {target}' to retry.",
+                        collection_dir=target,
+                        mod_name=mod_name,
+                        filename=filename,
+                    )
+                with contextlib.suppress(OSError):
+                    path.unlink()
 
-        return ImportResult(
-            matched=matched,
-            extracted=extracted,
-            still_pending=still_pending,
-            errors=errors,
-            load_order_files=load_order_files,
+            if existing is not None:
+                existing.download_status = "downloaded"
+                existing.browser_url = ""
+                existing.installed_at = datetime.now(timezone.utc).isoformat()
+                existing.filename = filename
+                if selected.get("version"):
+                    existing.version = selected.get("version")
+            else:
+                download_info["manual"] = True
+                download_info["download_status"] = "downloaded"
+                state.add_mod(download_info)
+                # State is keyed by file_id, not mod_id
+                state.mods[info.file_id].phase = 999
+            state.save()
+
+            # Same post-download steps as add/import: tracked-mod sync and
+            # load order regeneration. No deployment is ever triggered.
+            self._maybe_sync_tracked(state)
+            if not no_load_order:
+                progress("loadorder", 0.9, "Regenerating load order...")
+                self._regen_load_order_from_state(target, state)
+
+            progress("done", 1.0, f"Downloaded {mod_name}")
+            return NxmResult(
+                success=True,
+                status="downloaded",
+                game_domain=info.game_domain,
+                mod_id=info.mod_id,
+                file_id=info.file_id,
+                mod_name=mod_name,
+                filename=filename,
+                collection_dir=target,
+                extracted=extracted,
+            )
+
+    def _nxm_to_output(
+        self, info: NxmLinkInfo, output_dir: Path, progress: ProgressCallback
+    ) -> NxmResult:
+        """Standalone verified-archive drop: no state, no extraction.
+
+        The output directory must already exist; nothing else is created.
+        The download goes through the same integrity verification, and a
+        payload that is not real archive content is removed instead of
+        left behind.
+        """
+        if not output_dir.is_dir():
+            raise NxmRoutingError(f"{output_dir} is not an existing directory.")
+
+        progress("init", 0.05, "Validating API key...")
+        account_error = self._nxm_account_error(info)
+        if account_error:
+            return self._nxm_failure(info, account_error, re_click_required=True)
+
+        progress("fetch", 0.1, "Fetching file metadata...")
+        selected, meta_error = self._nxm_file_metadata(info)
+        if meta_error:
+            return self._nxm_failure(info, meta_error)
+        try:
+            filename = validate_download_filename(
+                selected.get("file_name") or selected.get("name")
+            )
+        except DownloadError as e:
+            return self._nxm_failure(info, str(e))
+
+        download_info = {
+            "mod_id": info.mod_id,
+            "mod_name": self._nxm_mod_name(info),
+            "file_id": info.file_id,
+            "filename": filename,
+            "version": selected.get("version", ""),
+            "size_bytes": int(selected.get("size_in_bytes") or 0),
+        }
+        signed = (
+            SignedLink(key=info.key, expires=info.expires)
+            if info.has_credentials
+            else None
         )
+
+        progress("download", 0.2, f"Downloading {filename}...")
+        downloader = Downloader(self.api)
+        try:
+            path = downloader.download_mod(
+                info.game_domain, download_info, output_dir, signed=signed
+            )
+        except DownloadError as e:
+            return self._nxm_failure(info, str(e), filename=filename)
+
+        # Archive-only drop: a payload without real archive magic (error
+        # page, loose file, truncated download) is removed, not left behind.
+        if sniff_archive_magic(path) is None:
+            with contextlib.suppress(OSError):
+                path.unlink()
+            return self._nxm_failure(
+                info,
+                f"{filename} is not valid archive content; --output only "
+                "saves verified mod archives. The file was removed.",
+                filename=filename,
+            )
+
+        progress("done", 1.0, f"Saved {filename}")
+        return NxmResult(
+            success=True,
+            status="saved_to_output",
+            game_domain=info.game_domain,
+            mod_id=info.mod_id,
+            file_id=info.file_id,
+            mod_name=download_info["mod_name"],
+            filename=filename,
+            output_path=path,
+        )
+
+    # -- nxm helpers (no locking here; callers hold the collection lock) --
+
+    def _nxm_failure(
+        self,
+        info: NxmLinkInfo,
+        error: str,
+        collection_dir: Path | None = None,
+        mod_name: str = "",
+        filename: str = "",
+        re_click_required: bool = False,
+    ) -> NxmResult:
+        """Build a failed NxmResult from safe components only."""
+        return NxmResult(
+            success=False,
+            status="error",
+            game_domain=info.game_domain,
+            mod_id=info.mod_id,
+            file_id=info.file_id,
+            mod_name=mod_name,
+            filename=filename,
+            collection_dir=collection_dir,
+            error=error,
+            re_click_required=re_click_required,
+        )
+
+    def _nxm_premium(self, user_info: dict) -> bool:
+        """Premium status honoring force_free and premium profile expiry."""
+        if self._force_free:
+            return False
+        if not user_info.get("is_premium", False):
+            return False
+        expiry = user_info.get("profile_expiry")
+        if (
+            isinstance(expiry, (int, float))
+            and not isinstance(expiry, bool)
+            and expiry > 0
+            and expiry <= time.time()
+        ):
+            return False  # premium lapsed: treat as a free account
+        return True
+
+    def _nxm_account_error(
+        self, info: NxmLinkInfo, collection_dir: Path | None = None
+    ) -> str | None:
+        """Validate the account against the link. Returns an error or None.
+
+        One network round trip (validate_key). The URI user_id is checked
+        against the API key's account and never forwarded to the API. A
+        free account without a website-issued key/expires pair cannot
+        redeem a direct link; the fix is a fresh click on the website (or
+        the browser-download + import workflow), never a silent fallback.
+        """
+        user_info = self.api.validate_key()
+        is_premium = self._nxm_premium(user_info)
+
+        if info.user_id is not None:
+            account_user = _as_int(user_info.get("user_id"))
+            if account_user is None:
+                account_user = _as_int(user_info.get("id"))
+            if account_user is not None and account_user != info.user_id:
+                return (
+                    "This download link was issued for a different Nexus "
+                    "account than the configured API key. Log in to the "
+                    "website with the account that owns this API key (or "
+                    "update NEXUS_API_KEY), then click the download "
+                    "button again."
+                )
+
+        if not info.has_credentials and not is_premium:
+            hint = (
+                f" and run 'nexus-dl import {collection_dir}'"
+                if collection_dir is not None
+                else ""
+            )
+            return (
+                "This link carries no download credentials, and free "
+                "accounts cannot request direct download links. On the "
+                "mod page, click 'Mod manager download' while logged in "
+                "to get a personalized link, or download the file in "
+                f"your browser{hint}."
+            )
+        return None
+
+    def _nxm_file_metadata(self, info: NxmLinkInfo) -> tuple[dict | None, str | None]:
+        """Fetch the file entry for the link's file_id from the mod's files."""
+        files = self.api.get_mod_files(info.game_domain, info.mod_id)
+        selected = next(
+            (f for f in files if _as_int(f.get("file_id")) == info.file_id), None
+        )
+        if selected is None:
+            return None, (
+                f"File {info.file_id} was not found on mod {info.mod_id} "
+                "(it may have been removed or archived)."
+            )
+        return selected, None
+
+    def _nxm_mod_name(self, info: NxmLinkInfo, existing: Any = None) -> str:
+        """Best-effort mod display name; never blocks the download."""
+        if existing is not None and getattr(existing, "name", ""):
+            return existing.name
+        with contextlib.suppress(NexusAPIError):
+            nexus_mod = self.api.get_mod_info(info.game_domain, info.mod_id)
+            if isinstance(nexus_mod, dict) and nexus_mod.get("name"):
+                return str(nexus_mod["name"])
+        return f"Mod {info.mod_id}"
 
     # -- internal helpers --
 

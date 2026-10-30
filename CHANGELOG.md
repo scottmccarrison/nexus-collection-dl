@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Native handling of `nxm://` individual-file links (the website's "Mod manager download" button) with a new `nexus-dl nxm` command and a `nexus-dl handler` group: `map`/`unmap` bind games to synced collection directories, `install`/`uninstall`/`status` manage an opt-in, user-level desktop entry that remembers the previous default handler and restores it on uninstall
+- `nxm` verifies downloads (exact size, manifest MD5 when known) before registering them, treats a proven local duplicate as a no-op with zero network, supports `--mods-dir`, standalone `--output` saves, `--no-extract`, `--no-load-order`, and desktop notifications for terminal-less launches (`--notify/--no-notify`)
+- Link credentials are handled strictly: the `key`/`expires` pair is forwarded to the download-link request only and never stored in state, results, logs, or error messages; the URI `user_id` is a local account identity check and is never sent to the API; expired or credential-less free links fail locally with re-click guidance and no writes; `nxm://` collection links are refused with guidance to use `sync`; nothing is ever deployed automatically
+
+### Changed
+
+- All mutating operations (`sync`, `update`, `add`, `add-local`, `import`, `track-sync enable/disable`, and `nxm` downloads) are now serialized per collection with the writer lock - a second concurrent operation fails fast with a busy error instead of racing; previously only deploy/undeploy were serialized. `track-sync push` remains read-only locally and unlocked
+- Signed download URLs and credentials are redacted from every error message and log path, and HTTP debug logging is suppressed around signed requests so link credentials cannot leak through urllib3/requests logs
+
 ## [0.2.1] - 2026-10-29
 
 ### Added

@@ -1,8 +1,12 @@
 """Nexus Mods API client for GraphQL and REST endpoints."""
 
+import contextlib
+import logging
 import os
+import re
 import time
-from typing import Any
+from typing import Any, Iterable
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -10,6 +14,75 @@ from . import __version__
 
 GRAPHQL_URL = "https://api.nexusmods.com/v2/graphql"
 REST_BASE_URL = "https://api.nexusmods.com/v1"
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def redact_url(url: str) -> str:
+    """Strip query and fragment from a URL for safe display.
+
+    Signed download credentials live in query strings, so error messages
+    and logs only ever carry scheme, host, and path.
+    """
+    try:
+        parts = urlsplit(str(url))
+    except ValueError:
+        return "[url redacted]"
+    if not parts.scheme and not parts.netloc and not parts.path:
+        return "[url redacted]"
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
+    """Remove literal credential values from text.
+
+    Defense in depth for error paths: a server that reflects a download
+    key in an error body or a hostile response URL can never surface the
+    credential. Values shorter than 6 characters are skipped so unrelated
+    text is not mangled.
+    """
+    out = str(text)
+    for secret in secrets:
+        if secret is None:
+            continue
+        value = str(secret)
+        if len(value) >= 6:
+            out = out.replace(value, "[redacted]")
+    return out
+
+
+def redact_secret_values(text: str, secrets: Iterable[Any]) -> str:
+    """Redact literal credential values, then strip any residual URLs.
+
+    Used for free-form exception text (downloaders, network errors) where
+    a URL with a signed query could appear anywhere in the message.
+    """
+    return _URL_RE.sub("[url redacted]", redact_literal_values(text, secrets))
+
+
+@contextlib.contextmanager
+def suppress_http_debug_logging():
+    """Keep DEBUG-level HTTP logging from writing signed URLs to logs.
+
+    urllib3 logs request lines (including query strings) at DEBUG level,
+    and download credentials live in query strings. The relevant loggers
+    are lifted to INFO for the duration of a signed request and restored
+    afterwards, so even an application running with DEBUG logging cannot
+    leak a credential through them.
+    """
+    loggers = [
+        logging.getLogger(name)
+        for name in ("urllib3", "requests", "urllib3.connectionpool")
+    ]
+    previous = [lg.level for lg in loggers]
+    try:
+        for lg in loggers:
+            if lg.level < logging.INFO:
+                lg.setLevel(logging.INFO)
+        yield
+    finally:
+        for lg, level in zip(loggers, previous):
+            lg.setLevel(level)
 
 
 class NexusAPIError(Exception):
@@ -57,22 +130,86 @@ class NexusAPI:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
 
-    def _handle_response(self, response: requests.Response) -> Any:
-        """Handle API response and raise appropriate errors."""
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 60))
+    def _handle_response(
+        self, response: requests.Response, secrets: tuple = ()
+    ) -> Any:
+        """Handle API response and raise appropriate errors.
+
+        Every error path is credential-safe: messages never embed the
+        response URL query (where signed download credentials live), the
+        raw response body, or the text of requests' own HTTPError (which
+        includes the full request URL). Known secret values are redacted
+        from whatever text is included.
+        """
+        status = response.status_code
+        if 200 <= status < 300:
+            return response.json()
+
+        if status == 429:
+            try:
+                retry_after = int(response.headers.get("Retry-After", 60))
+            except (TypeError, ValueError):
+                retry_after = 60
             raise NexusRateLimited(retry_after)
-        if response.status_code == 403:
-            data = response.json() if response.text else {}
-            if "premium" in str(data).lower():
+
+        if status == 403:
+            # The body is inspected privately for the premium hint but is
+            # never included in the message: a hostile or compromised
+            # endpoint could reflect credentials in it.
+            premium = False
+            try:
+                data = response.json() if response.text else {}
+                premium = "premium" in str(data).lower()
+            except ValueError:
+                premium = False
+            if premium:
                 raise NexusPremiumRequired(
                     "Premium membership required for direct download links."
                 )
-            raise NexusAPIError(f"Access forbidden: {data}")
-        if response.status_code == 404:
-            raise NexusAPIError(f"Resource not found: {response.url}")
-        response.raise_for_status()
-        return response.json()
+            raise NexusAPIError(
+                redact_literal_values(
+                    "Access forbidden by the Nexus API (HTTP 403).", secrets
+                )
+            )
+
+        if status == 404:
+            raise NexusAPIError(
+                redact_literal_values(
+                    f"Resource not found: {redact_url(response.url)}", secrets
+                )
+            )
+
+        if status == 401:
+            raise NexusAPIError(
+                redact_literal_values(
+                    "The Nexus API rejected the API key (HTTP 401). "
+                    "Check NEXUS_API_KEY.",
+                    secrets,
+                )
+            )
+
+        if status == 400:
+            raise NexusAPIError(
+                redact_literal_values(
+                    "The Nexus API rejected the request (HTTP 400).", secrets
+                )
+            )
+
+        if status == 410:
+            raise NexusAPIError(
+                redact_literal_values(
+                    "The requested resource is no longer available (HTTP 410).",
+                    secrets,
+                )
+            )
+
+        # Any other non-2xx: never propagate raise_for_status()'s text,
+        # which embeds the full request URL including signed query values.
+        raise NexusAPIError(
+            redact_literal_values(
+                f"The Nexus API returned an error (HTTP {status}).", secrets
+            )
+        )
 
     def graphql_query(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         """Execute a GraphQL query."""
@@ -207,20 +344,66 @@ class NexusAPI:
             "mods": mods,
         }
 
-    def get_download_url(self, game_domain: str, mod_id: int, file_id: int) -> str:
-        """
-        Get direct download URL for a mod file (requires Premium).
+    def get_download_url(
+        self,
+        game_domain: str,
+        mod_id: int,
+        file_id: int,
+        key: str | None = None,
+        expires: int | None = None,
+    ) -> str:
+        """Get direct download URL for a mod file.
 
-        Returns the download URL string.
+        ``key``/``expires`` are website-issued download credentials (the
+        pair an nxm:// link carries for free accounts). They are
+        forwarded as query parameters exactly as issued, always as a
+        pair, and are never minted here. A caller's ``user_id`` is an
+        identity check done elsewhere and is never sent to this endpoint.
+        Premium accounts may omit the pair entirely.
+
+        Credential handling on error paths: the response URL query, the
+        response body, and the credential values themselves are redacted
+        from every exception message, and DEBUG HTTP logging is
+        suppressed for the request so the signed query cannot leak
+        through logs. An invalid or expired pair is reported as an
+        actionable failure; it never falls back to an unsigned request.
         """
+        if (key is None) != (expires is None):
+            raise NexusAPIError(
+                "download_link requires the key/expires credential pair "
+                "together (or neither)."
+            )
         self._rate_limit_wait()
-        url = f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}/files/{file_id}/download_link.json"
-        response = self.session.get(url)
-        data = self._handle_response(response)
+        url = (
+            f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}"
+            f"/files/{file_id}/download_link.json"
+        )
+        params = {"key": key, "expires": expires} if key is not None else None
+        secrets: tuple = (key, expires) if key is not None else ()
 
-        if not data or not isinstance(data, list):
-            raise NexusAPIError(f"Unexpected download link response: {data}")
+        with suppress_http_debug_logging():
+            response = self.session.get(url, params=params)
 
+        try:
+            data = self._handle_response(response, secrets=secrets)
+        except (NexusPremiumRequired, NexusRateLimited):
+            raise
+        except NexusAPIError as e:
+            if key is not None:
+                raise NexusAPIError(
+                    f"{e} The download credentials in this link were rejected "
+                    "or have expired; click 'Mod manager download' on the "
+                    "Nexus website again to get a fresh link."
+                ) from None
+            raise
+
+        if not data or not isinstance(data, list) or not isinstance(data[0], dict):
+            raise NexusAPIError(
+                redact_literal_values(
+                    "Unexpected download link response from the Nexus API.",
+                    secrets,
+                )
+            )
         return data[0].get("URI")
 
     def get_mod_files(self, game_domain: str, mod_id: int) -> list[dict[str, Any]]:

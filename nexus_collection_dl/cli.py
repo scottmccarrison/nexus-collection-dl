@@ -5,17 +5,36 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
+from .downloader import DownloadError
+from .handler import (
+    DESKTOP_ENTRY_NAME,
+    HandlerError,
+    NxmRoutingError,
+    add_mapping,
+    notify as handler_notify,
+    remove_mapping,
+    sanitize_message,
+)
+from .handler import DesktopInstaller
+from .nxm import NxmCollectionLinkError, NxmParseError
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
 from .version_check import check_for_update
 from . import __version__
 
 console = Console()
+
+# Subcommands invoked by the desktop handler (nxm:// clicks) or used to
+# configure it: they must stay non-interactive and quiet - no banner, no
+# update check, no prompts - so a browser-launched process terminates with
+# useful output and failure codes instead of hanging on a prompt.
+_QUIET_SUBCOMMANDS = frozenset({"nxm", "handler"})
 
 
 @click.group()
@@ -39,18 +58,20 @@ console = Console()
 @click.pass_context
 def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check: bool) -> None:
     """Download mod collections from Nexus Mods."""
-    update_msg = check_for_update()
-    if update_msg:
-        console.print(f"[yellow]{update_msg}[/yellow]")
-    else:
-        console.print(f"[dim]nexus-dl v{__version__}[/dim]")
+    quiet = ctx.invoked_subcommand in _QUIET_SUBCOMMANDS
+    if not quiet:
+        update_msg = check_for_update()
+        if update_msg:
+            console.print(f"[yellow]{update_msg}[/yellow]")
+        else:
+            console.print(f"[dim]nexus-dl v{__version__}[/dim]")
 
     ctx.ensure_object(dict)
     ctx.obj["api_key"] = api_key
     ctx.obj["force_free"] = free
     ctx.obj["service"] = ModManagerService(api_key, force_free=free)
 
-    if not skip_update_check:
+    if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
         check_and_prompt_update(console)
 
@@ -648,6 +669,263 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     if force_free:
         console.print(f"[yellow]Free-user mode forced[/yellow]")
     create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
+
+
+def _notify_body(text: str) -> str:
+    """First line of a URL-sanitized message, safe for a desktop popup."""
+    cleaned = sanitize_message(str(text)).strip()
+    first = cleaned.splitlines()[0] if cleaned else ""
+    return first[:200] or "See the terminal output for details."
+
+
+@main.command()
+@click.argument("uri", metavar="NXM_URI")
+@click.option(
+    "--mods-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Collection directory to download into (overrides the game mapping)",
+)
+@click.option(
+    "--output",
+    "output_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Save the verified archive to this directory without touching any collection",
+)
+@click.option("--no-extract", is_flag=True, help="Keep the downloaded archive without extracting")
+@click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
+@click.option(
+    "--notify/--no-notify",
+    default=None,
+    help="Desktop notification (default: only when not attached to a terminal)",
+)
+@click.pass_context
+def nxm(
+    ctx: click.Context,
+    uri: str,
+    mods_dir: Path | None,
+    output_dir: Path | None,
+    no_extract: bool,
+    no_load_order: bool,
+    notify: bool | None,
+) -> None:
+    """
+    Handle an nxm:// download link from the Nexus website.
+
+    NXM_URI: link from 'Mod manager download', usually passed automatically
+    by the desktop handler installed with 'nexus-dl handler install'.
+    Link credentials are used for the request only and are never stored.
+    """
+    if mods_dir is not None and output_dir is not None:
+        console.print("[red]Error:[/red] --mods-dir and --output cannot be combined.")
+        sys.exit(1)
+
+    svc = ctx.obj["service"]
+    # Desktop-launched invocations have no terminal: notify by default so
+    # the outcome is visible. Terminal runs print to stdout instead.
+    want_notify = notify if notify is not None else (not sys.stdout.isatty())
+
+    def fail(message: str) -> None:
+        # escape(): messages may contain bracketed text (e.g. "[redacted]")
+        # that must print literally instead of being parsed as rich markup.
+        console.print(f"[red]Error:[/red] {escape(message)}")
+        if want_notify:
+            handler_notify("nexus-dl: download failed", _notify_body(message))
+        sys.exit(1)
+
+    try:
+        result = svc.add_nxm(
+            uri,
+            mods_dir=mods_dir,
+            output_dir=output_dir,
+            no_load_order=no_load_order,
+            no_extract=no_extract,
+            on_progress=_cli_progress,
+        )
+    except NxmCollectionLinkError as e:
+        # Recognized collection shape: helpful guidance, no unsafe URL.
+        console.print(f"[yellow]{escape(str(e))}[/yellow]")
+        if want_notify:
+            handler_notify(
+                "nexus-dl: collection link",
+                "Collection nxm:// links are not supported. Use nexus-dl sync with the collection URL.",
+            )
+        sys.exit(1)
+    except (NxmParseError, NxmRoutingError, HandlerError) as e:
+        fail(str(e))
+    except (NexusAPIError, DownloadError, StateError) as e:
+        fail(str(e))
+
+    if not result.success:
+        if result.error:
+            console.print(f"[red]Error:[/red] {escape(result.error)}")
+        if result.re_click_required:
+            console.print(
+                "[yellow]Click 'Mod manager download' on the Nexus website "
+                "again, then retry.[/yellow]"
+            )
+        if want_notify:
+            handler_notify("nexus-dl: download failed", _notify_body(result.error))
+        sys.exit(1)
+
+    if result.status == "already_downloaded":
+        console.print(
+            f"[green]'{escape(str(result.mod_name))}' (file {result.file_id}) is already "
+            f"downloaded in this collection.[/green]"
+        )
+        summary = f"Already downloaded: {result.mod_name}"
+    elif result.status == "saved_to_output":
+        console.print(f"[green]Saved {escape(str(result.output_path))}[/green]")
+        summary = f"Saved {result.filename}"
+    else:
+        where = (
+            f" into {escape(str(result.collection_dir))}" if result.collection_dir else ""
+        )
+        console.print(
+            f"[green]Downloaded '{escape(str(result.mod_name))}'{where}.[/green]"
+        )
+        if result.extracted:
+            console.print(
+                "[dim]Archive extracted. Run 'nexus-dl deploy' when ready; "
+                "nothing was deployed automatically.[/dim]"
+            )
+        summary = f"Downloaded {result.mod_name}"
+    if want_notify:
+        handler_notify("nexus-dl: download complete", summary)
+
+
+@main.group(name="handler")
+def handler_group():
+    """Configure nxm:// link handling (game mappings and desktop registration)."""
+
+
+@handler_group.command(name="map")
+@click.argument("game")
+@click.argument(
+    "collection_dir",
+    metavar="COLLECTION_DIR",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+def handler_map(game: str, collection_dir: Path) -> None:
+    """Map GAME to a synced COLLECTION_DIR for nxm:// downloads."""
+    try:
+        add_mapping(game, collection_dir)
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(
+        f"[green]Mapped '{escape(game.strip().lower())}' to "
+        f"{escape(str(collection_dir))}[/green]"
+    )
+
+
+@handler_group.command(name="unmap")
+@click.argument("game")
+def handler_unmap(game: str) -> None:
+    """Remove all mappings for GAME."""
+    try:
+        removed = remove_mapping(game)
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if removed:
+        console.print(f"[green]Removed mapping for '{escape(game.strip().lower())}'.[/green]")
+    else:
+        console.print(f"[yellow]No mapping exists for '{escape(game.strip().lower())}'.[/yellow]")
+
+
+@handler_group.command(name="status")
+def handler_status() -> None:
+    """Show game mappings and desktop handler status."""
+    try:
+        info = DesktopInstaller().status()
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+
+    if info["mappings"]:
+        table = Table(title="Game mappings")
+        table.add_column("Game", style="cyan")
+        table.add_column("Collection directory", style="green")
+        for game, dirs in sorted(info["mappings"].items()):
+            for directory in dirs:
+                table.add_row(game, directory)
+        console.print(table)
+    else:
+        console.print(
+            "No game mappings configured. Add one with:\n"
+            "  nexus-dl handler map GAME COLLECTION_DIR"
+        )
+
+    if info["entry_installed"]:
+        console.print(
+            f"[bold]Desktop entry:[/bold] {escape(str(info['entry_path']))} "
+            "[green](installed)[/green]"
+        )
+    else:
+        console.print(
+            f"[bold]Desktop entry:[/bold] not installed "
+            f"({escape(str(info['entry_path']))}). "
+            "Install with 'nexus-dl handler install'."
+        )
+    if info["executable"]:
+        if info["executable_exists"]:
+            console.print(f"[bold]Executable:[/bold] {escape(str(info['executable']))}")
+        else:
+            console.print(
+                f"[bold]Executable:[/bold] [red]{escape(str(info['executable']))} no longer "
+                "exists[/red] - the virtualenv may have moved or been "
+                "recreated. Re-run 'nexus-dl handler install'."
+            )
+    if info["is_default"]:
+        console.print(f"[bold]Default nxm handler:[/bold] [green]{DESKTOP_ENTRY_NAME}[/green]")
+    elif info["current_default"]:
+        console.print(
+            f"[bold]Default nxm handler:[/bold] "
+            f"{escape(str(info['current_default']))} (not nexus-dl)"
+        )
+    elif info["xdg_mime_available"]:
+        console.print("[bold]Default nxm handler:[/bold] none")
+    else:
+        console.print(
+            "[bold]Default nxm handler:[/bold] unknown (xdg-mime not available)"
+        )
+    if info["previous_default"]:
+        console.print(
+            f"[dim]Previous default (restored on uninstall): "
+            f"{escape(str(info['previous_default']))}[/dim]"
+        )
+
+
+@handler_group.command(name="install")
+def handler_install() -> None:
+    """Install the user desktop entry so nxm:// links open nexus-dl.
+
+    User-level only (XDG applications dir); remembers the previous
+    default handler so uninstall can restore it.
+    """
+    try:
+        entry = DesktopInstaller().install()
+    except (HandlerError, OSError) as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]NXM handler installed: {escape(str(entry))}[/green]")
+    console.print(
+        "[dim]'Mod manager download' links on Nexus Mods now open nexus-dl. "
+        "Map each game first with 'nexus-dl handler map GAME COLLECTION_DIR'.[/dim]"
+    )
+
+
+@handler_group.command(name="uninstall")
+def handler_uninstall() -> None:
+    """Remove the desktop entry; restores the previous default if ours."""
+    try:
+        message = DesktopInstaller().uninstall()
+    except (HandlerError, OSError) as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]{escape(message)}[/green]")
 
 
 if __name__ == "__main__":

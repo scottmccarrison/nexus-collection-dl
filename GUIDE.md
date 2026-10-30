@@ -315,6 +315,38 @@ nexus-dl undeploy ~/mods/bg3
 
 This removes every deployed symlink/copy, restores the backed-up originals (including your original `plugins.txt` and INI files), and cleans up the empty folders it created. If a path can't be removed safely (it was edited outside the tool, or its backup is missing), undeploy reports that path, keeps it tracked, and exits with an error so you know it's unfinished. Resolve the reported file and run undeploy again to complete the restore.
 
+## Downloading with "Mod manager download" links
+
+On each mod page, Nexus Mods shows a **Mod manager download** button next to every file. It produces an `nxm://` link, which is normally opened by a mod manager like Vortex. nexus-dl can handle these links itself.
+
+### One-time setup
+
+```bash
+# Tell nexus-dl which collection folder belongs to which game
+nexus-dl handler map starfield ~/mods/starfield
+
+# Optional: make nexus-dl open nxm:// links from your browser
+nexus-dl handler install
+```
+
+Both are opt-in. `handler install` only changes your own user's settings, remembers which app handled nxm:// links before, and `nexus-dl handler uninstall` puts that back. Check everything at any time with `nexus-dl handler status`.
+
+### What happens when you click the button
+
+Your browser hands the link to nexus-dl, which downloads that one file into the mapped collection folder, verifies it, extracts it, and updates the collection state. You get a desktop notification when it finishes (or an error explaining what went wrong). Nothing is deployed to your game - run `nexus-dl deploy` when you're ready, exactly as usual.
+
+You can also run a link yourself in the terminal:
+
+```bash
+nexus-dl nxm "nxm://starfield/mods/123/files/456?key=...&expires=...&user_id=..."
+```
+
+### When it asks you to click again
+
+The `key` and `expires` parts of a link are temporary credentials tied to your account. If a link has expired, was copied without its credentials, or belongs to a different Nexus account than your API key, nexus-dl refuses to download and tells you to click **Mod manager download** on the website again for a fresh link. Nothing is written when that happens.
+
+Collection links (`nxm://.../collections/...`) are not handled this way - use `nexus-dl sync` with the collection URL instead.
+
 ## Using the web UI
 
 If you do not want to memorize terminal commands, the web UI is probably the better option for day-to-day mod management. The CLI is faster for one-off operations and scripting, but the web UI lets you do almost everything from a browser with real-time progress feedback.

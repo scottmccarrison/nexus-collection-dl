@@ -22,17 +22,21 @@ class StateError(Exception):
 
 
 class StateBusyError(StateError):
-    """Raised when another deploy/undeploy holds the collection lock."""
+    """Raised when another nexus-dl operation holds the collection lock."""
     pass
 
 
 class CollectionLock:
-    """Advisory lock that serializes deploy/undeploy per state directory.
+    """Advisory lock that serializes state writers per collection directory.
 
-    Uses a non-blocking flock on a lock file inside the mods directory, so a
-    second concurrent deploy or undeploy for the same collection fails fast
-    with StateBusyError instead of interleaving mutations. The lock file
-    itself is never removed; it carries no state.
+    Uses a non-blocking flock on a lock file inside the mods directory, so
+    a second concurrent state-mutating operation (sync, update, add,
+    add-local, import, track-sync enable/disable, deploy, undeploy, nxm
+    download) for the same collection fails fast with StateBusyError
+    instead of interleaving mutations. Writers must load state only after
+    acquiring this lock, and no locked method may call another locked
+    method (the flock is not reentrant across separate opens). The lock
+    file itself is never removed; it carries no state.
     """
 
     def __init__(self, mods_dir: Path):
@@ -48,7 +52,7 @@ class CollectionLock:
         except OSError:
             os.close(fd)
             raise StateBusyError(
-                f"Another nexus-dl deploy/undeploy is already running for "
+                f"Another nexus-dl operation is already running for "
                 f"{self.lock_path.parent}. Wait for it to finish and try again."
             )
         self._fd = fd

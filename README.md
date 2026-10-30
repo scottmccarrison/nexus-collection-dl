@@ -184,6 +184,51 @@ Downloads a single mod and registers it as a "manual" mod. Manual mods are prote
 
 If the tool can't auto-select a file (no main file category), it lists all available files so you can re-run with `--file-id`.
 
+### nxm:// link handler
+
+Handle "Mod manager download" links from the Nexus website directly, without another mod manager:
+
+```bash
+# One-time setup: map each game to a synced collection directory
+nexus-dl handler map starfield ~/mods/starfield
+
+# Optional: register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
+nexus-dl handler install
+
+# Show mappings and desktop handler status
+nexus-dl handler status
+
+# Remove the desktop entry again (restores your previous default handler)
+nexus-dl handler uninstall
+```
+
+With the desktop handler installed, clicking "Mod manager download" on nexusmods.com runs:
+
+```bash
+nexus-dl nxm "nxm://starfield/mods/123/files/456?key=...&expires=...&user_id=..."
+```
+
+Useful flags when running `nxm` yourself:
+
+```bash
+# Choose the collection explicitly (overrides the game mapping)
+nexus-dl nxm "nxm://..." --mods-dir ~/mods/starfield
+
+# Save the verified archive to a folder without touching any collection
+nexus-dl nxm "nxm://..." --output ~/Downloads
+
+# Keep the archive intact / skip load order regeneration
+nexus-dl nxm "nxm://..." --no-extract --no-load-order
+```
+
+Notes:
+
+- The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
+- Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
+- Downloads are verified (exact size, manifest MD5 when known) before they are registered. A file already downloaded in the collection is a no-op with no network traffic.
+- `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
+- Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
+
 ### Register local mods
 
 ```bash
