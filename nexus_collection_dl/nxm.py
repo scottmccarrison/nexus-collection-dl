@@ -40,6 +40,9 @@ _PERCENT_RE = re.compile(r"%[0-9A-Fa-f]{2}")
 # survive the query split; '=' is allowed for base64 padding.)
 _KEY_CHARSET_RE = re.compile(r"^[!-~]{1,512}$")
 _SCHEME_RE = re.compile(r"^[nN][xX][mM]://")
+# Leading scheme token of a non-nxm input (e.g. "https:"). The charset is
+# strict, so echoing the matched token back in an error is always safe.
+_SCHEME_TOKEN_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 _GENERIC_ERROR = (
     "Unrecognized nxm:// link. Expected "
@@ -54,6 +57,29 @@ class NxmParseError(Exception):
     Messages are built from safe components only: they never include the
     raw URI, the credential key, or the expires value.
     """
+
+
+class NxmSchemeError(NxmParseError):
+    """Raised when the input carries a non-nxm scheme (e.g. an https:// URL).
+
+    The message explains that the link type is not usable here and how
+    to get an nxm:// link instead. Only the scheme token, matched from
+    a strict charset, is echoed; host, path, and query of the input are
+    never repeated, so a credential-bearing query string can never leak
+    through this error.
+    """
+
+    def __init__(self, scheme: str):
+        self.scheme = scheme
+        super().__init__(
+            f"This is a {scheme}:// link, not an nxm:// link, so this "
+            "link type is not usable with 'nexus-dl nxm'.\n"
+            "The 'Mod manager download' button on a Nexus Mods file page "
+            "is what produces an nxm:// link: right-click it and choose "
+            "copy link address to get the link for manual use.\n"
+            "To make that button hand links to nexus-dl directly, run "
+            "'nexus-dl handler install' once."
+        )
 
 
 class NxmCollectionLinkError(NxmParseError):
@@ -176,11 +202,18 @@ def parse_nxm_url(uri: str) -> NxmLinkInfo:
         raise NxmParseError("nxm:// link contains control characters.")
     if any(c.isspace() for c in uri):
         raise NxmParseError("nxm:// link contains whitespace.")
-    _validate_percent_encoding(uri)
 
+    # Scheme detection runs before percent validation: a non-nxm input
+    # (an https:// mod-page URL, say) gets the wrong-link-type guidance
+    # even when it also contains malformed percent escapes. Nothing is
+    # decoded before the scheme matches, so strictness is unchanged.
     scheme = _SCHEME_RE.match(uri)
     if not scheme:
+        token = _SCHEME_TOKEN_RE.match(uri)
+        if token and token.group(1).lower() != "nxm":
+            raise NxmSchemeError(token.group(1).lower())
         raise NxmParseError(_GENERIC_ERROR)
+    _validate_percent_encoding(uri)
     rest = uri[scheme.end():]
 
     if "#" in rest:

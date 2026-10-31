@@ -181,6 +181,47 @@ def test_404_message_carries_redacted_url_only(api):
     assert "?" not in message.split("Resource not found:")[1].split(" ")[0]
 
 
+API_KEY_SECRET = "ApiKeySentinelValue-abc123"
+
+
+def test_api_key_redacted_when_reflected_in_url_path():
+    """The apikey travels in a request header, but a hostile endpoint
+    could reflect it inside a URL path (redact_url keeps paths), so the
+    resolved API key itself must be in every literal redaction scope."""
+    client = NexusAPI(api_key=API_KEY_SECRET)
+    client._min_request_interval = 0
+    resp = make_response(
+        404, {}, url=f"https://api.nexusmods.com/v1/{API_KEY_SECRET}/x"
+    )
+    client.session = FakeSession([resp])
+    with pytest.raises(NexusAPIError) as excinfo:
+        client.get_download_url(GAME, 123, 456)
+    message = str(excinfo.value)
+    assert API_KEY_SECRET not in message
+    assert "[redacted]" in message
+
+
+def test_api_key_redacted_alongside_signed_pair():
+    """Signed request error paths redact the credential pair AND the
+    API key together, whichever the endpoint reflects."""
+    client = NexusAPI(api_key=API_KEY_SECRET)
+    client._min_request_interval = 0
+    resp = make_response(
+        500, {},
+        url=(
+            f"https://api.nexusmods.com/v1/{API_KEY_SECRET}/x"
+            f"?key={KEY}&expires={EXPIRES}"
+        ),
+    )
+    client.session = FakeSession([resp])
+    with pytest.raises(NexusAPIError) as excinfo:
+        client.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
+    message = str(excinfo.value)
+    assert API_KEY_SECRET not in message
+    assert KEY not in message
+    assert str(EXPIRES) not in message
+
+
 def test_unexpected_body_shape_error_is_sanitized(api):
     resp = make_response(200, {"URI": f"https://x/?key={KEY}"}, url=signed_url_with_query())
     api.session = FakeSession([resp])

@@ -17,11 +17,19 @@ from .handler import (
     HandlerError,
     NxmRoutingError,
     add_mapping,
+    append_nxm_log,
     notify as handler_notify,
     remove_mapping,
     sanitize_message,
 )
 from .handler import DesktopInstaller
+from .keystore import (
+    KeyStoreError,
+    api_key_path,
+    remove_api_key,
+    resolve_api_key,
+    store_api_key,
+)
 from .nxm import NxmCollectionLinkError, NxmParseError
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
@@ -41,7 +49,10 @@ _QUIET_SUBCOMMANDS = frozenset({"nxm", "handler"})
 @click.option(
     "--api-key",
     envvar="NEXUS_API_KEY",
-    help="Nexus Mods API key (or set NEXUS_API_KEY env var)",
+    help=(
+        "Nexus Mods API key. Falls back to NEXUS_API_KEY, then to the "
+        "key stored with 'nexus-dl handler set-api-key'."
+    ),
 )
 @click.option(
     "--free",
@@ -66,10 +77,31 @@ def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check:
         else:
             console.print(f"[dim]nexus-dl v{__version__}[/dim]")
 
+    # Key resolution precedence lives in keystore.resolve_api_key:
+    # explicit flag > NEXUS_API_KEY env > stored key. The option's
+    # envvar wiring hides where the value came from, so click's
+    # parameter source distinguishes the flag from the environment and
+    # the resolver re-reads the environment itself. Desktop-launched
+    # nxm:// clicks have no shell environment; the stored key is what
+    # authenticates them.
+    explicit = (
+        api_key
+        if ctx.get_parameter_source("api_key") is click.ParameterSource.COMMANDLINE
+        else None
+    )
+    try:
+        resolved_key, key_source = resolve_api_key(explicit)
+    except KeyStoreError as e:
+        # A broken key store must not break every command: warn and
+        # continue keyless. 'handler remove-api-key' can still clean up.
+        console.print(f"[yellow]Warning:[/yellow] {escape(str(e))}")
+        resolved_key, key_source = None, None
+
     ctx.ensure_object(dict)
-    ctx.obj["api_key"] = api_key
+    ctx.obj["api_key"] = resolved_key
+    ctx.obj["api_key_source"] = key_source
     ctx.obj["force_free"] = free
-    ctx.obj["service"] = ModManagerService(api_key, force_free=free)
+    ctx.obj["service"] = ModManagerService(resolved_key, force_free=free)
 
     if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
@@ -678,6 +710,44 @@ def _notify_body(text: str) -> str:
     return first[:200] or "See the terminal output for details."
 
 
+# Static reason codes for the nxm status log. Deliberately fixed
+# strings, never exception text: a log line must not carry free-form
+# message content that could hold a reflected URL or credential.
+# Order matters: subclasses are checked before their base classes.
+_NXM_REASON_BY_TYPE = (
+    (NxmCollectionLinkError, "collection_link"),
+    (NxmParseError, "parse"),
+    (NxmRoutingError, "routing"),
+    (HandlerError, "handler"),
+    (NexusAPIError, "api"),
+    (DownloadError, "download"),
+    (StateError, "state"),
+)
+
+
+def _nxm_reason(exc: BaseException) -> str:
+    """Map an exception to its static nxm-log reason code."""
+    for cls, code in _NXM_REASON_BY_TYPE:
+        if isinstance(exc, cls):
+            return code
+    return "error"
+
+
+def _nxm_ids(result) -> str:
+    """Safe 'mod=N file=N ' prefix for a log line ('' when unknown)."""
+    if result.mod_id is not None and result.file_id is not None:
+        return f"mod={result.mod_id} file={result.file_id} "
+    return ""
+
+
+def _log_nxm(outcome: str, detail: str = "") -> None:
+    """Record one status line in the nxm log; must never fail the command."""
+    try:
+        append_nxm_log(outcome, detail)
+    except Exception:
+        pass  # best-effort logging: a broken log must never break nxm
+
+
 @main.command()
 @click.argument("uri", metavar="NXM_URI")
 @click.option(
@@ -719,6 +789,7 @@ def nxm(
     """
     if mods_dir is not None and output_dir is not None:
         console.print("[red]Error:[/red] --mods-dir and --output cannot be combined.")
+        _log_nxm("error", "reason=usage")
         sys.exit(1)
 
     svc = ctx.obj["service"]
@@ -746,6 +817,7 @@ def nxm(
     except NxmCollectionLinkError as e:
         # Recognized collection shape: helpful guidance, no unsafe URL.
         console.print(f"[yellow]{escape(str(e))}[/yellow]")
+        _log_nxm("error", "reason=collection_link")
         if want_notify:
             handler_notify(
                 "nexus-dl: collection link",
@@ -753,11 +825,15 @@ def nxm(
             )
         sys.exit(1)
     except (NxmParseError, NxmRoutingError, HandlerError) as e:
+        _log_nxm("error", f"reason={_nxm_reason(e)}")
         fail(str(e))
     except (NexusAPIError, DownloadError, StateError) as e:
+        _log_nxm("error", f"reason={_nxm_reason(e)}")
         fail(str(e))
 
     if not result.success:
+        reason = "re_click_required" if result.re_click_required else "rejected"
+        _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
         if result.error:
             console.print(f"[red]Error:[/red] {escape(result.error)}")
         if result.re_click_required:
@@ -795,6 +871,12 @@ def nxm(
     # order): truthful warnings, still a success exit.
     for warning in result.warnings:
         console.print(f"[yellow]Warning:[/yellow] {escape(str(warning))}")
+    # One status line for the after-the-fact trail: ids and the fixed
+    # status token only, never names, URIs, or credentials.
+    _log_nxm(
+        "warn" if result.warnings else "success",
+        f"{_nxm_ids(result)}status={result.status}",
+    )
     if want_notify:
         handler_notify("nexus-dl: download complete", summary)
 
@@ -839,8 +921,55 @@ def handler_unmap(game: str) -> None:
         console.print(f"[yellow]No mapping exists for '{escape(game.strip().lower())}'.[/yellow]")
 
 
+@handler_group.command(name="set-api-key")
+def handler_set_api_key() -> None:
+    """Store the Nexus API key for browser-launched downloads.
+
+    The key is read from hidden input (never a command-line argument,
+    never echoed) and stored with owner-only permissions, so nxm://
+    clicks authenticate even though desktop-launched processes cannot
+    see NEXUS_API_KEY from your shell startup files.
+    """
+    # Hidden prompt: the value never appears on screen, in argv, or in
+    # shell history. click re-prompts on empty input and aborts on EOF.
+    key = click.prompt("Nexus API key", hide_input=True)
+    try:
+        path = store_api_key(key)
+    except KeyStoreError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]API key stored in {escape(str(path))} (0600).[/green]")
+    console.print(
+        "[dim]'Mod manager download' clicks now authenticate with this "
+        "key. 'nexus-dl handler status' shows the active key source; "
+        "'nexus-dl handler remove-api-key' deletes it.[/dim]"
+    )
+
+
+@handler_group.command(name="remove-api-key")
+def handler_remove_api_key() -> None:
+    """Delete the stored API key.
+
+    Removes only the key file; game mappings and the desktop handler
+    record are left untouched.
+    """
+    try:
+        removed = remove_api_key()
+    except KeyStoreError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if removed:
+        console.print(
+            f"[green]Removed the stored API key from "
+            f"{escape(str(api_key_path()))}.[/green]"
+        )
+    else:
+        console.print("[yellow]No stored API key to remove.[/yellow]")
+
+
 @handler_group.command(name="status")
-def handler_status() -> None:
+@click.pass_context
+def handler_status(ctx: click.Context) -> None:
     """Show game mappings and desktop handler status."""
     try:
         info = DesktopInstaller().status()
@@ -899,6 +1028,26 @@ def handler_status() -> None:
         console.print(
             f"[dim]Previous default (restored on uninstall): "
             f"{escape(str(info['previous_default']))}[/dim]"
+        )
+
+    # API key availability: source only, never the value. The main
+    # group callback resolved it once, so this reports exactly what the
+    # commands in this run will use.
+    source = (ctx.obj or {}).get("api_key_source")
+    if source == "flag":
+        console.print("[bold]API key:[/bold] available (from the --api-key flag)")
+    elif source == "env":
+        console.print("[bold]API key:[/bold] available (from NEXUS_API_KEY)")
+    elif source == "stored":
+        console.print(
+            f"[bold]API key:[/bold] available (stored: "
+            f"{escape(str(api_key_path()))})"
+        )
+    else:
+        console.print(
+            "[bold]API key:[/bold] not set - store one with 'nexus-dl handler "
+            "set-api-key' for click-through downloads, export NEXUS_API_KEY, "
+            "or pass --api-key"
         )
 
 

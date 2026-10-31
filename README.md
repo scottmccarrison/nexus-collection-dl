@@ -64,6 +64,8 @@ pip install -e .
 export NEXUS_API_KEY="your-api-key-here"
 ```
 
+Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
+
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
 
 ## Web UI
@@ -186,29 +188,45 @@ If the tool can't auto-select a file (no main file category), it lists all avail
 
 ### nxm:// link handler
 
-Handle "Mod manager download" links from the Nexus website directly, without another mod manager:
+Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button, your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. When the download finishes, the process exits.
+
+One catch: a browser-launched process sees your desktop session's environment, not your shell's, so a `NEXUS_API_KEY` exported in `.bashrc` never reaches it. Store the key once instead. The prompt is hidden: the key is never echoed, never lands in shell history, and never appears in the process list:
 
 ```bash
-# One-time setup: map each game to its SYNCED COLLECTION directory - the
-# subfolder created by 'nexus-dl sync' that contains .nexus-state.json
-# (use $HOME, not a quoted ~: the shell only expands ~ when unquoted)
-nexus-dl handler map starfield "$HOME/mods/starfield/My Collection"
+nexus-dl handler set-api-key
+```
 
-# Optional: register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
+Every command resolves the key in this order: `--api-key` flag, then `NEXUS_API_KEY`, then the stored key. `nexus-dl handler status` shows which source is active (never the value), and `nexus-dl handler remove-api-key` deletes the stored key.
+
+**Full setup, start to finish** (from a source checkout; this is also the smoke test):
+
+```bash
+# 1. Install dependencies (use --extra dev if you want to run the tests)
+uv sync
+uv sync --extra dev
+
+# 2. Create a disposable collection with sync. sync creates the
+#    per-collection subfolder holding .nexus-state.json that the
+#    handler downloads into.
+nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" "$HOME/mods/nxm-smoke"
+
+# 3. Store your API key for browser-launched clicks (hidden prompt)
+nexus-dl handler set-api-key
+
+# 4. Map the game to the SYNCED COLLECTION directory: the subfolder
+#    created by sync that contains .nexus-state.json, not its parent.
+#    (Use $HOME, not a quoted ~: the shell only expands ~ when unquoted)
+nexus-dl handler map starfield "$HOME/mods/nxm-smoke/My Collection"
+
+# 5. Register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
 nexus-dl handler install
-
-# Show mappings and desktop handler status
-nexus-dl handler status
-
-# Remove the desktop entry again (restores your previous default handler)
-nexus-dl handler uninstall
 ```
 
-With the desktop handler installed, clicking "Mod manager download" on nexusmods.com runs:
+Now click **Mod manager download** once on any mod file page for that game:
 
-```bash
-nexus-dl nxm "nxm://starfield/mods/123/files/456?key=...&expires=...&user_id=..."
-```
+- The first click downloads that one file into the mapped collection, verifies it, extracts it, and ends with a desktop notification. Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
+- Clicking again for the same file is a no-op: nexus-dl recognizes the download as already present and skips it without re-downloading.
+- `nexus-dl handler uninstall` removes the desktop entry and restores whichever app handled nxm:// links before.
 
 Useful flags when running `nxm` yourself:
 
@@ -223,11 +241,21 @@ nexus-dl nxm "nxm://..." --output ~/Downloads
 nexus-dl nxm "nxm://..." --no-extract --no-load-order
 ```
 
+Advanced footnote: run a copied link manually without putting its credentials in shell history. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (Pasting the link onto the `read` command line just hangs, because `read` waits for a newline before it returns.)
+
+```bash
+read -s -r NXM_LINK
+# paste the nxm:// link here, then press Enter
+nexus-dl nxm "$NXM_LINK" --output "$HOME/Downloads"
+```
+
 Notes:
 
 - `handler map` requires an already-synced collection: the directory must contain `.nexus-state.json` (the collection subfolder created by `nexus-dl sync`, not its parent), and its game must match the mapping key.
+- The stored API key lives in `~/.config/nexus-dl/api-key` with owner-only (0600) permissions. No command ever prints its value.
 - The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
 - Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
+- Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: the nxm:// link comes from the "Mod manager download" button (right-click it and copy the link address).
 - Downloads are verified (exact size, manifest MD5 when known) before they are registered. A file already downloaded in the collection is a no-op with no network traffic. With `--no-extract` the verified archive stays in the collection folder, and re-running the same link is a no-op (proven duplicate).
 - `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
 - Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.

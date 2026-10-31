@@ -134,6 +134,18 @@ Now the key will be set automatically every time you open a terminal.
 
 **Note:** If your terminal uses `zsh` instead of `bash` (you can check with `echo $SHELL`), use `~/.zshrc` instead of `~/.bashrc`.
 
+### Stored method (needed for click-through downloads)
+
+Environment variables belong to your shell. When your browser launches nexus-dl for an `nxm://` link, that process sees your desktop session's environment instead, so it never sees `NEXUS_API_KEY` from `.bashrc`. If you want "Mod manager download" clicks to work, store the key with nexus-dl itself:
+
+```bash
+nexus-dl handler set-api-key
+```
+
+It asks for the key with hidden input (nothing is echoed, nothing lands in your shell history or the process list) and saves it to `~/.config/nexus-dl/api-key`, readable only by your user. `nexus-dl handler remove-api-key` deletes it again, and `nexus-dl handler status` tells you whether a key is available without ever showing it.
+
+nexus-dl checks keys in this order: `--api-key` flag first, then `NEXUS_API_KEY`, then the stored key.
+
 ## Your first download
 
 ### Finding a collection URL
@@ -322,27 +334,45 @@ On each mod page, Nexus Mods shows a **Mod manager download** button next to eve
 ### One-time setup
 
 ```bash
+# Store your API key so browser-launched downloads can authenticate.
+# The prompt is hidden: nothing is echoed, and nothing lands in your
+# shell history. (A browser-launched process cannot see the
+# NEXUS_API_KEY from your .bashrc.)
+nexus-dl handler set-api-key
+
 # Tell nexus-dl which synced collection folder belongs to which game.
 # Use the collection subfolder created by 'nexus-dl sync' - the one
 # containing .nexus-state.json, not its parent folder. Use $HOME, not a
 # quoted ~: the shell only expands ~ when it is unquoted.
 nexus-dl handler map starfield "$HOME/mods/starfield/My Collection"
 
-# Optional: make nexus-dl open nxm:// links from your browser
+# Make nexus-dl open nxm:// links from your browser
 nexus-dl handler install
 ```
 
-Both are opt-in. `handler install` only changes your own user's settings, remembers which app handled nxm:// links before, and `nexus-dl handler uninstall` puts that back. Check everything at any time with `nexus-dl handler status`.
+All three steps are opt-in and touch only your own user's settings. `handler install` writes a small `.desktop` file and remembers which app handled nxm:// links before; `nexus-dl handler uninstall` puts that back. Check everything at any time with `nexus-dl handler status`.
+
+If you are testing this for the first time, a good disposable target is a fresh collection: run `nexus-dl sync "<collection-url>" "$HOME/mods/nxm-smoke"`, map the game to the subfolder sync prints, and work there. (If you cloned the source and installed with `uv sync`, run `uv sync --extra dev` too when you want to run the test suite.)
 
 ### What happens when you click the button
 
-Your browser hands the link to nexus-dl, which downloads that one file into the mapped collection folder, verifies it, extracts it, and updates the collection state. You get a desktop notification when it finishes (or an error explaining what went wrong). Nothing is deployed to your game - run `nexus-dl deploy` when you're ready, exactly as usual.
+No daemon or background service runs anywhere. Your browser asks the desktop environment to open the nxm:// link, the desktop environment looks up the registered handler, and it launches nexus-dl as a normal short-lived process with the link as its argument. nexus-dl downloads that one file into the mapped collection folder, verifies it, extracts it, and updates the collection state. You get a desktop notification when it finishes (or an error explaining what went wrong), and then the process exits. Nothing is deployed to your game - run `nexus-dl deploy` when you're ready, exactly as usual.
 
-You can also run a link yourself in the terminal:
+Clicking the button again for a file you already have is a no-op: nexus-dl recognizes the download and skips it without any network traffic.
+
+A full smoke test looks like this: finish the setup above, click **Mod manager download** once on a mod file page, check for the notification and the extracted mod in your collection folder, click again to see the "already downloaded" dedupe, and run `nexus-dl handler uninstall` when you want your previous handler back.
+
+### Running a link yourself (advanced)
+
+You can also run a copied link in the terminal. To keep the link's temporary credentials out of your shell history, use a hidden read. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (If you paste the link onto the same line as the `read` command, it looks like it hung - `read` is just waiting for you to press Enter.)
 
 ```bash
-nexus-dl nxm "nxm://starfield/mods/123/files/456?key=...&expires=...&user_id=..."
+read -s -r NXM_LINK
+# now paste the nxm:// link and press Enter
+nexus-dl nxm "$NXM_LINK" --output "$HOME/Downloads"
 ```
+
+An `nxm://` link only works with `nexus-dl nxm`. Pasting an `https://` mod-page URL there is refused with an explanation of how to get the nxm:// link instead (right-click the **Mod manager download** button and copy the link address).
 
 ### When it asks you to click again
 
@@ -451,6 +481,8 @@ Nexus Mods limits how many requests you can make per hour. If you hit this, wait
 ### "NEXUS_API_KEY not set"
 
 You need to set your API key. See [Setting your API key](#setting-your-api-key) above. If you set it with the permanent method, make sure you ran `source ~/.bashrc` or opened a new terminal.
+
+If this happens when you click a **Mod manager download** link, remember that browser-launched runs cannot see your shell's environment variables at all: store the key with `nexus-dl handler set-api-key` and try the click again.
 
 ### Mods downloaded but game doesn't see them
 

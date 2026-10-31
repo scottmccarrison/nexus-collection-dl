@@ -171,9 +171,16 @@ class NexusAPI:
         response URL query (where signed download credentials live), the
         raw response body, or the text of requests' own HTTPError (which
         includes the full request URL). Known secret values are redacted
-        from whatever text is included.
+        from whatever text is included. The API key itself (resolved
+        from the --api-key flag, the environment, or the machine-local
+        key store) joins every redaction scope built here: it travels
+        in a request header, and a hostile or compromised endpoint could
+        reflect it back inside a URL or body.
         """
         status = response.status_code
+        # redact_literal_values skips None/empty values, so a missing
+        # key costs nothing here.
+        redaction = tuple(secrets) + (self.api_key,)
         if 200 <= status < 300:
             try:
                 return response.json()
@@ -186,7 +193,7 @@ class NexusAPI:
                         f"The Nexus API returned a non-JSON response "
                         f"(HTTP {status}); a proxy or network middleware "
                         "may be intercepting the request.",
-                        secrets,
+                        redaction,
                     )
                 )
 
@@ -213,14 +220,14 @@ class NexusAPI:
                 )
             raise NexusAPIError(
                 redact_literal_values(
-                    "Access forbidden by the Nexus API (HTTP 403).", secrets
+                    "Access forbidden by the Nexus API (HTTP 403).", redaction
                 )
             )
 
         if status == 404:
             raise NexusAPIError(
                 redact_literal_values(
-                    f"Resource not found: {redact_url(response.url)}", secrets
+                    f"Resource not found: {redact_url(response.url)}", redaction
                 )
             )
 
@@ -229,14 +236,14 @@ class NexusAPI:
                 redact_literal_values(
                     "The Nexus API rejected the API key (HTTP 401). "
                     "Check NEXUS_API_KEY.",
-                    secrets,
+                    redaction,
                 )
             )
 
         if status == 400:
             raise NexusAPIError(
                 redact_literal_values(
-                    "The Nexus API rejected the request (HTTP 400).", secrets
+                    "The Nexus API rejected the request (HTTP 400).", redaction
                 )
             )
 
@@ -244,7 +251,7 @@ class NexusAPI:
             raise NexusAPIError(
                 redact_literal_values(
                     "The requested resource is no longer available (HTTP 410).",
-                    secrets,
+                    redaction,
                 )
             )
 
@@ -252,7 +259,7 @@ class NexusAPI:
         # which embeds the full request URL including signed query values.
         raise NexusAPIError(
             redact_literal_values(
-                f"The Nexus API returned an error (HTTP {status}).", secrets
+                f"The Nexus API returned an error (HTTP {status}).", redaction
             )
         )
 
@@ -436,7 +443,12 @@ class NexusAPI:
             f"/files/{file_id}/download_link.json"
         )
         params = {"key": key, "expires": expires} if key is not None else None
-        secrets: tuple = (key, expires) if key is not None else ()
+        # The API key joins the local redaction scope alongside the
+        # signed pair: it is a secret wherever it could be echoed, and
+        # redact_literal_values ignores None/empty values.
+        secrets: tuple = (
+            (key, expires, self.api_key) if key is not None else (self.api_key,)
+        )
 
         with suppress_http_debug_logging():
             # allow_redirects=False: this request carries the apikey header

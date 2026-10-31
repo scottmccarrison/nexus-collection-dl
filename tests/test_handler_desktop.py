@@ -544,16 +544,25 @@ def test_resolve_filters_stale_mapping(tmp_path, monkeypatch, cfg_path):
 def test_xdg_dirs_respect_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     assert config_dir() == tmp_path / "cfg" / "nexus-dl"
     assert applications_dir() == tmp_path / "data" / "applications"
+    assert handler_module.state_dir() == tmp_path / "state" / "nexus-dl"
+    assert handler_module.nxm_log_path() == (
+        tmp_path / "state" / "nexus-dl" / "nxm.log"
+    )
 
 
 def test_xdg_dirs_default_to_home(tmp_path, monkeypatch):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     assert config_dir() == tmp_path / ".config" / "nexus-dl"
     assert applications_dir() == tmp_path / ".local" / "share" / "applications"
+    assert handler_module.state_dir() == (
+        tmp_path / ".local" / "state" / "nexus-dl"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -686,3 +695,65 @@ def test_relative_config_entries_are_dropped(tmp_path, cfg_path, monkeypatch):
     make_collection(tmp_path)                       # valid, but not validly mapped
     with pytest.raises(NxmRoutingError, match="handler map"):
         resolve_collection_dir(GAME)
+
+
+# ---------------------------------------------------------------------------
+# nxm status log: XDG state dir, 0600, redacted by construction, best-effort
+# ---------------------------------------------------------------------------
+
+def test_append_nxm_log_writes_0600_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    ok = handler_module.append_nxm_log(
+        "success", "mod=1 file=2 status=downloaded"
+    )
+    assert ok is True
+    log_file = tmp_path / "state" / "nexus-dl" / "nxm.log"
+    assert log_file.exists()
+    assert log_file.stat().st_mode & 0o777 == 0o600
+    # Per-app state directory is private (no group/other bits).
+    assert log_file.parent.stat().st_mode & 0o077 == 0
+    lines = log_file.read_text().splitlines()
+    assert len(lines) == 1
+    assert " success mod=1 file=2 status=downloaded" in lines[0]
+    # UTC timestamp prefix
+    assert lines[0][:4].isdigit() and "Z success" in lines[0]
+
+
+def test_append_nxm_log_appends_without_clobbering(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    handler_module.append_nxm_log("success", "mod=1 file=2")
+    handler_module.append_nxm_log("error", "reason=api")
+    lines = (tmp_path / "state" / "nexus-dl" / "nxm.log").read_text().splitlines()
+    assert len(lines) == 2
+    assert " success " in lines[0]
+    assert " error reason=api" in lines[1]
+
+
+def test_append_nxm_log_strips_urls_and_restricts_charset(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    handler_module.append_nxm_log(
+        "error",
+        "reason=x https://evil.example/?key=SECRETVALUE1 a[b]c\nd=e",
+    )
+    content = (tmp_path / "state" / "nexus-dl" / "nxm.log").read_text()
+    assert "evil.example" not in content
+    assert "SECRETVALUE1" not in content
+    assert "[" not in content and "]" not in content
+    # An injected newline cannot forge a second log line.
+    assert content.count("\n") == 1
+
+
+def test_append_nxm_log_coerces_unknown_outcome(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    handler_module.append_nxm_log("bogus", "reason=x")
+    content = (tmp_path / "state" / "nexus-dl" / "nxm.log").read_text()
+    assert " error " in content
+    assert "bogus" not in content
+
+
+def test_append_nxm_log_best_effort_on_os_failure(tmp_path, monkeypatch):
+    """A state dir that cannot be created returns False, never raises."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("XDG_STATE_HOME", str(blocker))
+    assert handler_module.append_nxm_log("success", "mod=1 file=2") is False

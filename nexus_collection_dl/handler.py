@@ -73,6 +73,72 @@ def applications_dir() -> Path:
     return Path.home() / ".local" / "share" / "applications"
 
 
+def state_dir() -> Path:
+    """XDG-aware state directory for nexus-dl (per-user logs)."""
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base) / CONFIG_DIR_NAME
+    return Path.home() / ".local" / "state" / CONFIG_DIR_NAME
+
+
+NXM_LOG_FILENAME = "nxm.log"
+_NXM_LOG_OUTCOMES = frozenset({"success", "warn", "error"})
+_NXM_LOG_MAX_DETAIL = 120
+# Detail text is rebuilt from this bounded charset: alphanumerics plus a
+# few separators. Anything else (quotes, brackets, percent signs,
+# newlines, decoded credential bytes) becomes '_', so a log line can
+# never carry a URI fragment or secret even if a caller passes one.
+_NXM_LOG_DETAIL_EXTRA = " =-_."
+
+
+def nxm_log_path() -> Path:
+    """Location of the browser-launch status log."""
+    return state_dir() / NXM_LOG_FILENAME
+
+
+def append_nxm_log(outcome: str, detail: str = "") -> bool:
+    """Append one redacted status line to the nxm log. Best-effort.
+
+    Browser-launched downloads may have no visible terminal, so the log
+    gives a minimal after-the-fact trail of what a click did. A line is
+    a UTC timestamp, an outcome token (success/warn/error; anything
+    else is recorded as error), and a short safe detail built from
+    caller-provided mod/file ids or static reason codes. Detail text is
+    URL-stripped and charset-restricted before the write: never a raw
+    URI, query value, or credential. Returns True when the line was
+    written; every failure returns False instead of raising, so logging
+    can never fail a download.
+    """
+    token = outcome if outcome in _NXM_LOG_OUTCOMES else "error"
+    cleaned = sanitize_message(str(detail))
+    safe = "".join(
+        c if (c.isalnum() or c in _NXM_LOG_DETAIL_EXTRA) else "_"
+        for c in cleaned
+    )[:_NXM_LOG_MAX_DETAIL].strip()
+    line = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line += f" {token}"
+    if safe:
+        line += f" {safe}"
+    line += "\n"
+    path = nxm_log_path()
+    try:
+        # XDG convention: the per-app state directory is private.
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # O_APPEND keeps concurrent clicks from interleaving partial
+        # lines; the explicit fchmod holds 0600 even if the file
+        # already existed with looser permissions.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        # Best-effort by contract: a broken log must never break nxm.
+        return False
+    return True
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write a text file atomically (temp file + fsync + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)

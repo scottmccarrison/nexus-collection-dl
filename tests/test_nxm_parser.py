@@ -15,6 +15,7 @@ from nexus_collection_dl.nxm import (
     NxmCollectionLinkError,
     NxmLinkInfo,
     NxmParseError,
+    NxmSchemeError,
     parse_nxm_url,
 )
 
@@ -109,6 +110,63 @@ def test_oversize_link_is_rejected_for_length():
 def test_reject_non_string():
     with pytest.raises(NxmParseError):
         parse_nxm_url(None)
+
+
+# ---------------------------------------------------------------------------
+# Non-nxm inputs: wrong link type gets actionable guidance, never an echo
+# ---------------------------------------------------------------------------
+
+def test_non_nxm_scheme_error_explains_link_type():
+    url = "https://www.nexusmods.com/skyrim/mods/1?tab=files&tok=SUPERSECRET123"
+    with pytest.raises(NxmSchemeError) as excinfo:
+        parse_nxm_url(url)
+    err = excinfo.value
+    assert err.scheme == "https"
+    message = str(err)
+    assert "not an nxm:// link" in message
+    assert "not usable" in message
+    assert "Mod manager download" in message   # where nxm:// links come from
+    assert "copy link address" in message      # right-click copy
+    assert "handler install" in message        # click-through registration
+    # The raw URI is never echoed: no host, path, or query values.
+    assert url not in message
+    assert "nexusmods.com" not in message
+    assert "SUPERSECRET123" not in message
+    assert "tab=files" not in message
+
+
+def test_non_nxm_scheme_variants():
+    with pytest.raises(NxmSchemeError) as excinfo:
+        parse_nxm_url("http://example.com/x")
+    assert excinfo.value.scheme == "http"
+    with pytest.raises(NxmSchemeError) as excinfo:
+        parse_nxm_url("HTTPS://example.com/x")  # token normalized to lowercase
+    assert excinfo.value.scheme == "https"
+    with pytest.raises(NxmSchemeError) as excinfo:
+        parse_nxm_url("ftp://example.invalid/mod.zip")
+    assert excinfo.value.scheme == "ftp"
+    assert "example.invalid" not in str(excinfo.value)
+
+
+def test_malformed_nxm_forms_are_not_scheme_errors():
+    # A broken nxm shape keeps the generic parse error, never the
+    # wrong-link-type guidance (which would claim a different scheme).
+    with pytest.raises(NxmParseError) as excinfo:
+        parse_nxm_url("nxm:/skyrimspecialedition/mods/1/files/2")
+    assert not isinstance(excinfo.value, NxmSchemeError)
+    with pytest.raises(NxmParseError) as excinfo:
+        parse_nxm_url("not-a-link-at-all")
+    assert not isinstance(excinfo.value, NxmSchemeError)
+
+
+def test_non_nxm_scheme_wins_over_percent_validation():
+    # An https URL with malformed percent escapes still gets the
+    # wrong-link-type guidance (scheme detection runs first), and the
+    # hostile query value is never echoed.
+    with pytest.raises(NxmSchemeError) as excinfo:
+        parse_nxm_url("https://example.com/a%zz?key=SUPERSECRET123")
+    assert "SUPERSECRET123" not in str(excinfo.value)
+    assert "example.com" not in str(excinfo.value)
 
 
 @pytest.mark.parametrize("bad", [
