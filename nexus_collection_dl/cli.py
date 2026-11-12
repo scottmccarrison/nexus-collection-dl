@@ -1,9 +1,7 @@
 """Command-line interface for nexus-collection-dl."""
 
-import re
 import sys
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
 
 import click
 from rich.console import Console
@@ -12,8 +10,6 @@ from rich.table import Table
 
 from .api import (
     NexusAPIError,
-    redact_encoded_secret_forms,
-    redact_literal_values,
 )
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
@@ -40,6 +36,12 @@ from .keystore import (
     store_api_key,
 )
 from .nxm import NxmCollectionLinkError, NxmParseError
+from .redaction import (
+    MIN_REDACT_SECRET_LEN,
+    boundary_redact,
+    merge_secrets,
+    uri_query_secrets,
+)
 from .service import ModManagerService, PendingDownload, _select_mod_file
 from .state import StateError
 from .version_check import check_for_update
@@ -50,8 +52,10 @@ console = Console()
 # Subcommands invoked by the desktop handler (nxm:// clicks) or used to
 # configure it: they must stay non-interactive and quiet - no banner, no
 # update check, no prompts - so a browser-launched process terminates with
-# useful output and failure codes instead of hanging on a prompt.
-_QUIET_SUBCOMMANDS = frozenset({"nxm", "handler"})
+# useful output and failure codes instead of hanging on a prompt. The
+# interactive shell is quiet too: its own greeting replaces the banner and
+# an update prompt would fight the REPL for input.
+_QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
 
 
 @click.group()
@@ -723,6 +727,28 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
 
 
+@main.command(name="shell")
+@click.argument(
+    "root_dir",
+    metavar="ROOT_DIR",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.pass_context
+def shell_cmd(ctx: click.Context, root_dir: Path | None) -> None:
+    """
+    Open an interactive shell over the service layer.
+
+    ROOT_DIR: Directory holding the collections to browse (default: the
+    current directory). Type /help inside for the command list.
+    """
+    from .shell import run_shell
+
+    svc = ctx.obj["service"]
+    root = root_dir if root_dir is not None else Path.cwd()
+    sys.exit(run_shell(svc, root, console=console))
+
+
 def _notify_body(text: str) -> str:
     """First line of a URL-sanitized message, safe for a desktop popup."""
     cleaned = sanitize_message(str(text)).strip()
@@ -771,76 +797,21 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
 def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
     """Literal secrets to redact from text leaving the nxm error boundary.
 
-    Query extraction mirrors the nxm parser's acceptance rules rather
-    than parse_qs: parameter names are percent-decoded once and
-    case-folded (so 'KEY=' and '%6bey=' are both the 'key' parameter),
-    and values are percent-decoded once while a literal '+' stays a '+'
-    (parse_qs would turn it into a space, putting a value that is not
-    the real credential in scope and leaving the real one out). Both
-    the raw and the decoded value join the scope. Values are never
-    displayed, only used for replacement.
+    Thin wrapper over redaction.merge_secrets/uri_query_secrets so the
+    nxm boundary and the interactive shell share ONE redaction helper
+    (see redaction.py for the query-extraction rules; they mirror the
+    nxm parser's acceptance rules rather than parse_qs).
     """
-    base: list = []
     api_key = (ctx.obj or {}).get("api_key")
-    if api_key:
-        base.append(api_key)
-    try:
-        query = urlsplit(uri).query
-    except ValueError:
-        query = ""
-    for segment in query.split("&"):
-        if not segment or "=" not in segment:
-            continue
-        raw_name, raw_value = segment.split("=", 1)
-        if unquote(raw_name).lower() not in ("key", "expires"):
-            continue
-        for value in (raw_value, unquote(raw_value)):
-            if value:
-                base.append(value)
-    unique: list = []
-    for value in base:
-        if value not in unique:
-            unique.append(value)
-    return tuple(unique)
+    return merge_secrets(
+        [api_key] if api_key else [],
+        uri_query_secrets(uri),
+    )
 
 
-# Floor for BARE-LITERAL prose replacement at typed-error boundaries
-# only. Real API keys and link credentials are long opaque strings (the
-# key store enforces the same 8-character minimum), while replacing a
-# one-character literal would mangle ordinary guidance words like
-# "link". This exemption NEVER applies to percent-encoded runs or to
-# occurrences inside URI query strings, where a short credential cannot
-# be ordinary prose. Accepted residual risk (see _boundary_redact): a
-# short-but-valid credential reflected bare in prose survives
-# typed-branch redaction; the catch-all branch applies no floor.
-_MIN_REDACT_SECRET_LEN = 8
-
-# Any-scheme URI, for confining short-secret bare-literal redaction to
-# query strings.
-_ANY_URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
-
-
-def _redact_secrets_in_uri_queries(text: str, secrets: tuple) -> str:
-    """Bare-literal redaction of short scoped secrets inside URI queries.
-
-    Only the part after the first '?' of each URI is touched; URIs
-    without a query are left alone. Inside a query string even a short
-    credential cannot be ordinary prose, so the length floor does not
-    apply there.
-    """
-
-    def scrub(match: "re.Match[str]") -> str:
-        uri = match.group(0)
-        head, sep, query = uri.partition("?")
-        if not sep:
-            return uri
-        for value in secrets:
-            query = re.sub(
-                re.escape(value), "[redacted]", query, flags=re.IGNORECASE
-            )
-        return head + sep + query
-
-    return _ANY_URI_RE.sub(scrub, text)
+# Floor for bare-literal prose replacement at typed-error boundaries;
+# the rationale lives at redaction.MIN_REDACT_SECRET_LEN.
+_MIN_REDACT_SECRET_LEN = MIN_REDACT_SECRET_LEN
 
 
 def _boundary_redact(
@@ -852,23 +823,15 @@ def _boundary_redact(
 ) -> str:
     """Full redaction scope for text leaving through the nxm boundary.
 
-    Every scoped secret (API key, link key/expires in raw and decoded
-    form) is redacted in raw and percent-encoded shapes. When
-    ``min_secret_len`` is set (typed domain-error branches), secrets
-    shorter than it are exempted from bare-literal prose replacement
-    only: they are still redacted in percent-encoded runs and inside
-    URI query strings. Typed branches also skip URI stripping because
-    their messages are redacted at the source and may deliberately
-    carry a redacted API URL or the nxm:// scheme name in guidance.
+    Thin wrapper over redaction.boundary_redact binding the secret scope
+    for one request (API key plus the link's query credentials).
     """
-    secrets = _boundary_secrets(ctx, uri)
-    long_secrets = tuple(s for s in secrets if len(s) >= min_secret_len)
-    short_secrets = tuple(s for s in secrets if len(s) < min_secret_len)
-    out = redact_literal_values(text, long_secrets)
-    if short_secrets:
-        out = redact_encoded_secret_forms(out, short_secrets)
-        out = _redact_secrets_in_uri_queries(out, short_secrets)
-    return sanitize_message(out) if strip_uris else out
+    return boundary_redact(
+        text,
+        _boundary_secrets(ctx, uri),
+        strip_uris=strip_uris,
+        min_secret_len=min_secret_len,
+    )
 
 
 @main.command()
