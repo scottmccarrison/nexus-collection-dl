@@ -26,6 +26,18 @@ class StateBusyError(StateError):
     pass
 
 
+class LoadOrderRegenError(StateError):
+    """Raised when load order regeneration fails after a state change.
+
+    The underlying state change (a removal, an import, a download) is
+    already persisted when this fires: callers report it as a warning or
+    error on their result instead of rolling back. Subclasses StateError
+    so every CLI/web surface that already handles state failures handles
+    regeneration failures cleanly too.
+    """
+    pass
+
+
 class CollectionLock:
     """Advisory lock that serializes state writers per collection directory.
 

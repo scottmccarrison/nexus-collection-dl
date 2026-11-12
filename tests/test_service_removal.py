@@ -4,11 +4,15 @@ list_collections/list_mods are read-only local scans (no network), and
 remove_mod drops state entries only: payload files on disk are never
 touched, saves are atomic under the collection lock, and a load order
 regeneration failure after the save is reported as a warning instead of
-masking the completed removal. Everything runs in tmp_path; all state is
-built locally and no network is ever reached.
+masking the completed removal. Regeneration failures are exercised via
+real output write failures (load-order.txt pre-created as a directory),
+never by monkeypatching the regeneration helper away. Everything runs
+in tmp_path; all state is built locally and no network is ever reached.
 """
 
+import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -23,6 +27,7 @@ from nexus_collection_dl.service import (
 from nexus_collection_dl.state import (
     CollectionLock,
     CollectionState,
+    LoadOrderRegenError,
     StateBusyError,
     StateError,
     STATE_FILENAME,
@@ -71,6 +76,13 @@ def cached_manifest() -> dict:
         plugin_rules=[],
         mod_phases={100: 0, 200: 0},
     ).to_dict()
+
+
+def make_zip_bytes(name="Data/test.txt", payload=b"hello mods") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(name, payload)
+    return buf.getvalue()
 
 
 @pytest.fixture()
@@ -310,7 +322,7 @@ def test_removal_regenerates_load_order_from_cached_manifest(svc, tmp_path):
     assert (cdir / "payload.bin").read_bytes() == b"keep me"
 
 
-def test_regen_failure_after_save_warns_but_keeps_removal(svc, tmp_path, monkeypatch):
+def test_regen_write_failure_after_save_warns_but_keeps_removal(svc, tmp_path):
     cdir = write_state(tmp_path / "col", mods=[
         mod_entry(555, 100, "Alpha Mod"),
         mod_entry(777, 200, "Beta Mod"),
@@ -319,11 +331,9 @@ def test_regen_failure_after_save_warns_but_keeps_removal(svc, tmp_path, monkeyp
     state.load()
     state.manifest_data = cached_manifest()
     state.save()
-
-    def boom(self, mods_dir, state):
-        raise RuntimeError("injected regen failure")
-
-    monkeypatch.setattr(ModManagerService, "_regen_load_order_from_state", boom)
+    # Real output write failure: load-order.txt exists as a directory, so
+    # the generator's write fails on the actual regen path.
+    (cdir / "load-order.txt").mkdir()
 
     result = svc.remove_mod(cdir, mod_id=100)
 
@@ -338,6 +348,45 @@ def test_regen_failure_after_save_warns_but_keeps_removal(svc, tmp_path, monkeyp
     state = CollectionState(cdir)
     state.load()
     assert set(state.mods) == {777}
+
+
+def test_regen_helper_raises_on_output_write_failure(svc, tmp_path):
+    # The helper surfaces real generation/write failures as
+    # LoadOrderRegenError (a StateError) instead of silently returning [].
+    cdir = write_state(tmp_path / "col", mods=[
+        mod_entry(555, 100, "Alpha Mod"),
+    ])
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = cached_manifest()
+    state.save()
+    (cdir / "load-order.txt").mkdir()
+
+    with pytest.raises(LoadOrderRegenError):
+        svc._regen_load_order_from_state(cdir, state)
+
+
+def test_import_reports_regen_write_failure_honestly(svc, tmp_path):
+    # import commits the imported mod first, then reports a real
+    # regeneration failure on its result instead of swallowing it.
+    cdir = write_state(tmp_path / "col", mods=[
+        mod_entry(555, 100, "Alpha Mod", filename="AlphaMod.zip",
+                  download_status="pending_download"),
+    ])
+    (cdir / "AlphaMod.zip").write_bytes(make_zip_bytes())
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = cached_manifest()
+    state.save()
+    (cdir / "load-order.txt").mkdir()
+
+    result = svc.import_downloads(cdir)
+
+    assert result.matched == 1
+    assert any("Load order regeneration failed" in e for e in result.errors)
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[555].download_status == "downloaded"
 
 
 # ---------------------------------------------------------------------------

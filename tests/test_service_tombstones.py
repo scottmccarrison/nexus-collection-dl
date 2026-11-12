@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from nexus_collection_dl import service as service_module
+from nexus_collection_dl import state as state_module
 from nexus_collection_dl.manifest import CollectionManifest
 from nexus_collection_dl.service import ModManagerService
 from nexus_collection_dl.state import CollectionState, STATE_FILENAME
@@ -331,6 +332,31 @@ def test_sync_premium_empty_state_downloads_only_live_mods(svc, tmp_path,
     state = reload_state(cdir)
     assert set(state.mods) == {777}
     assert state.mods[777].download_status == "downloaded"
+    assert state.is_removed(MOD_ID)              # tombstone survives sync
+
+
+def test_sync_premium_nonempty_state_skips_tombstoned_mod(svc, tmp_path,
+                                                          monkeypatch):
+    # The other premium branch: state already has mods, so sync compares
+    # against the collection. The comparison must see the same filtered
+    # manifest input as every other consumer.
+    cdir = _state_with_live_mod_and_tombstone(tmp_path / "Test Collection")
+    mods = [
+        manifest_entry(123, 999, "Test Mod"),
+        manifest_entry(200, 777, "Other Mod"),
+        manifest_entry(300, 888, "New Mod"),
+    ]
+    svc._api = FakeNexusAPI(is_premium=True, collection=collection_data(mods))
+    recorded = patch_download_mods(monkeypatch)
+
+    result = svc.sync(COLLECTION_URL, tmp_path, no_load_order=True)
+
+    assert result.removed_skipped == 1
+    assert [m["file_id"] for m in recorded] == [888]   # only the new mod
+    state = reload_state(cdir)
+    assert set(state.mods) == {777, 888}
+    assert all(ms.mod_id != 123 for ms in state.mods.values())
+    assert state.is_removed(MOD_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +588,96 @@ def test_add_nxm_output_clears_nothing(svc, tmp_path, monkeypatch):
     assert reload_state(cdir).is_removed(MOD_ID)
 
 
+def _failing_save(captured):
+    """CollectionState.save replacement: records the state, then fails."""
+
+    def boom(self):
+        captured.append(self)
+        raise OSError(28, "injected disk full")
+
+    return boom
+
+
+def test_add_nxm_regression_save_failure_restores_status_and_tombstone(
+        svc, tmp_path, monkeypatch):
+    # Extraction-failure regression commit + save failure: the entry is
+    # flipped downloaded -> pending in memory, but the save fails, so BOTH
+    # the status and the tombstone are restored in memory and the on-disk
+    # state stands. The result reports failure and never claims success.
+    zip_bytes = make_zip()
+    cdir = write_state(tmp_path / "col", mods=[
+        state_entry(download_status="downloaded", filename="TestMod-1.0.zip"),
+    ])
+    # No archive on disk: the flag alone must not short-circuit dedupe, so
+    # the link re-downloads and the extraction failure takes the regression
+    # branch.
+    state = reload_state(cdir)
+    state.mark_removed(MOD_ID, "Test Mod")       # crafted stale combo
+    state.save()
+    before = state_raw(cdir)
+
+    svc._api = FakeNexusAPI(files=[{
+        "file_id": FILE_ID, "name": "Main File",
+        "file_name": "TestMod-1.0.zip", "version": "1.0",
+        "size_in_bytes": len(zip_bytes), "category_id": 1,
+    }])
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(path, target):
+        raise service_module.ExtractionError("boom")
+
+    monkeypatch.setattr(service_module, "extract_archive", boom)
+    captured: list = []
+    monkeypatch.setattr(state_module.CollectionState, "save",
+                        _failing_save(captured))
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success and result.status == "error"
+    assert "extraction failed" in result.error
+    assert "remains marked as downloaded" in result.error
+    assert state_raw(cdir) == before             # prior state bytes stand
+    assert len(captured) == 1                    # exactly the one failed save
+    st = captured[0]
+    assert st.mods[FILE_ID].download_status == "downloaded"   # restored
+    assert st.is_removed(MOD_ID)                              # restored
+
+
+def test_add_nxm_pending_commit_save_failure_returns_error(svc, tmp_path,
+                                                           monkeypatch):
+    # The new-entry pending commit guards its save like the sibling
+    # branches: a save failure returns a failed NxmResult instead of
+    # raising a raw error out of add_nxm, and says that import cannot see
+    # an unrecorded download.
+    zip_bytes = make_zip()
+    cdir = write_state(tmp_path / "col")
+    state = reload_state(cdir)
+    state.mark_removed(MOD_ID, "Test Mod")
+    state.save()
+    before = state_raw(cdir)
+
+    svc._api = FakeNexusAPI(files=[{
+        "file_id": FILE_ID, "name": "Main File",
+        "file_name": "TestMod-1.0.zip", "version": "1.0",
+        "size_in_bytes": len(zip_bytes), "category_id": 1,
+    }])
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(path, target):
+        raise service_module.ExtractionError("boom")
+
+    monkeypatch.setattr(service_module, "extract_archive", boom)
+    monkeypatch.setattr(state_module.CollectionState, "save", _failing_save([]))
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success and result.status == "error"
+    assert "extraction failed" in result.error
+    assert "could not be updated" in result.error
+    assert "click the download link again" in result.error
+    assert state_raw(cdir) == before             # prior state bytes stand
+
+
 # ---------------------------------------------------------------------------
 # (q) Import never resurrects tombstoned mods, but completes recovery for
 #     a pending entry committed by an extraction-failed re-click (whose
@@ -682,18 +798,29 @@ def test_stale_pending_plus_tombstone_handled(svc, tmp_path):
 #     excludes removed mods from generated metadata
 # ---------------------------------------------------------------------------
 
-def _manifest_dict():
-    return {
-        "mod_rules": [],
-        "plugins": [{"filename": "Core.esm", "enabled": True}],
-        "plugin_rules": [],
-        "mod_phases": {"100": 0, "200": 0, "300": 0},
-    }
+def plugin_lines(text):
+    """Non-comment, non-empty lines of a generated plugins.txt."""
+    return [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
 
 
 def test_load_order_regen_excludes_removed_mods(svc, tmp_path, monkeypatch):
+    # plugins.txt is NOT mod-scoped (documented behavior): collection.json
+    # plugin entries carry no mod identity (loadorder._write_plugins lists
+    # manifest.plugins filenames only), so a removed mod's plugins
+    # legitimately persist there, and mod-level exclusion is guaranteed
+    # for load-order.txt (asserted below). What the regen run guarantees
+    # for plugins.txt is a rebuild from the CURRENT collection metadata,
+    # asserted below by changing the manifest's plugin list and requiring
+    # the output to follow instead of keeping stale content.
+    manifest_holder = {"plugins": [{"filename": "Core.esm", "enabled": True}]}
+
     def fake_fetch(url, session=None):
-        return CollectionManifest.from_dict(_manifest_dict())
+        return CollectionManifest.from_dict({
+            "mod_rules": [],
+            "plugins": manifest_holder["plugins"],
+            "plugin_rules": [],
+            "mod_phases": {"100": 0, "200": 0, "300": 0},
+        })
 
     monkeypatch.setattr(
         service_module, "download_and_parse_manifest", fake_fetch
@@ -713,6 +840,7 @@ def test_load_order_regen_excludes_removed_mods(svc, tmp_path, monkeypatch):
     svc.sync(COLLECTION_URL, tmp_path)
     load_order = (cdir / "load-order.txt").read_text()
     assert "[100:555]" in load_order and "[200:777]" in load_order
+    assert plugin_lines((cdir / "plugins.txt").read_text()) == ["*Core.esm"]
 
     # remove_mod's own post-save regen uses the remaining state mods.
     svc.remove_mod(cdir, mod_id=100)
@@ -723,6 +851,10 @@ def test_load_order_regen_excludes_removed_mods(svc, tmp_path, monkeypatch):
 
     # sync/update regen reads the FILTERED manifest input, so the removed
     # page stays out even though the manifest still lists it.
+    manifest_holder["plugins"] = [
+        {"filename": "Core.esm", "enabled": True},
+        {"filename": "Late.esp", "enabled": True},
+    ]
     mods = [
         manifest_entry(100, 555, "Alpha Mod"),
         manifest_entry(200, 777, "Beta Mod"),
@@ -738,12 +870,12 @@ def test_load_order_regen_excludes_removed_mods(svc, tmp_path, monkeypatch):
     assert "[100:555]" not in load_order
     assert "Alpha Mod" not in load_order
 
-    # The plugins output is regenerated from the same filtered run and
-    # carries plugin filenames only (no mod identity exists for plugins
-    # in collection.json), so it never names the removed mod either.
-    plugins = (cdir / "plugins.txt").read_text()
-    assert "Core.esm" in plugins
-    assert "Alpha Mod" not in plugins
+    # plugins.txt was rebuilt from THIS run's collection metadata (the
+    # plugin list changed between runs): that rebuild is the real
+    # regeneration guarantee for the plugins output.
+    assert plugin_lines((cdir / "plugins.txt").read_text()) == [
+        "*Core.esm", "*Late.esp",
+    ]
 
 
 # ---------------------------------------------------------------------------

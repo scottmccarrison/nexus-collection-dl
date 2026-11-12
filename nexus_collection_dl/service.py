@@ -44,7 +44,13 @@ from .loot_sort import (
 )
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
 from .nxm import NxmLinkInfo, parse_nxm_url
-from .state import CollectionState, CollectionLock, StateError, STATE_FILENAME
+from .state import (
+    CollectionState,
+    CollectionLock,
+    LoadOrderRegenError,
+    StateError,
+    STATE_FILENAME,
+)
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
 
@@ -1361,7 +1367,14 @@ class ModManagerService:
 
             if not no_load_order:
                 progress("loadorder", 0.95, "Regenerating load order...")
-                self._regen_load_order_from_state(mods_dir, state)
+                try:
+                    self._regen_load_order_from_state(mods_dir, state)
+                except LoadOrderRegenError:
+                    # The add is already committed and AddResult has no
+                    # warning channel: a regeneration failure must not turn
+                    # a committed add into a claimed failure. Kept silent
+                    # as before; 'nexus-dl load-order' retries.
+                    pass
 
             progress("done", 1.0, f"Added {mod_name}")
             return AddResult(
@@ -1399,7 +1412,13 @@ class ModManagerService:
             state.save()
 
             if not no_load_order:
-                self._regen_load_order_from_state(mods_dir, state)
+                try:
+                    self._regen_load_order_from_state(mods_dir, state)
+                except LoadOrderRegenError:
+                    # The registration is already committed and add_local
+                    # returns only the synthetic id: same silent-tolerated
+                    # contract as add_mod, retried via 'nexus-dl load-order'.
+                    pass
 
             return synthetic_id
 
@@ -2521,7 +2540,29 @@ class ModManagerService:
                         # same commit so `nexus-dl import` can finish the
                         # recovery (import skips tombstoned entries).
                         state.clear_removed(info.mod_id)
-                        state.save()
+                        try:
+                            state.save()
+                        except (OSError, StateError) as save_exc:
+                            # Same honest handling as the sibling branches:
+                            # return a failed NxmResult instead of raising
+                            # raw past the caller. No pending entry was
+                            # recorded, so import cannot see this download;
+                            # the kept archive is re-click recovery instead.
+                            return self._nxm_failure(
+                                info,
+                                f"Download succeeded but extraction "
+                                f"failed: {e}. The archive is kept at "
+                                f"{path}, but the collection state could "
+                                f"not be updated ({save_exc}), so nothing "
+                                f"was recorded and 'nexus-dl import' "
+                                f"cannot see it. Fix the underlying "
+                                f"problem (permissions, disk space), then "
+                                f"move the archive aside and click the "
+                                f"download link again.",
+                                collection_dir=target,
+                                mod_name=mod_name,
+                                filename=filename,
+                            )
                     elif existing.download_status == "downloaded":
                         # Recover a previously-downloaded entry: without
                         # this regression the fresh archive would strand
@@ -2949,7 +2990,14 @@ class ModManagerService:
         return written_files
 
     def _regen_load_order_from_state(self, mods_dir: Path, state: CollectionState) -> list[str]:
-        """Regenerate load order from cached manifest + current state mods."""
+        """Regenerate load order from cached manifest + current state mods.
+
+        Raises LoadOrderRegenError when generation or writing the output
+        files fails: the caller's state change is already persisted at
+        that point, and callers surface the failure as a warning or error
+        on their result (or, for the explicit load-order command, as a
+        clean StateError). Failures are never silently swallowed here.
+        """
         if not state.manifest_data:
             return []
 
@@ -2988,8 +3036,10 @@ class ModManagerService:
         try:
             written = generator.generate(mods_dir)
             written_files = [p.name for p in written]
-        except Exception:
-            return []
+        except Exception as e:
+            raise LoadOrderRegenError(
+                f"Load order generation failed: {e}"
+            ) from e
 
         if is_bethesda_game(state.game_domain) and is_loot_available():
             loot_sorted = sort_plugins_with_loot(state.game_domain, mods_dir, None)
