@@ -570,6 +570,111 @@ def _resolve_import_match(
     return None, ambiguous, []
 
 
+@dataclass
+class CollectionSummary:
+    """One collection discovered by a local scan (see list_collections)."""
+
+    name: str
+    game_domain: str
+    mod_count: int
+    pending_count: int
+    path: Path
+
+
+@dataclass
+class ModSummary:
+    """One tracked mod file from local state (see list_mods)."""
+
+    file_id: int
+    mod_id: int
+    name: str
+    version: str
+    filename: str
+    download_status: str
+
+
+@dataclass
+class RemoveModResult:
+    """Outcome of ModManagerService.remove_mod.
+
+    removed_file_ids/removed_mod_ids report exactly what left the state
+    file; warnings carry non-fatal follow-up failures (e.g. load order
+    regeneration) after the removal itself was already persisted.
+    """
+
+    removed_file_ids: list[int]
+    removed_mod_ids: list[int]
+    warnings: list[str]
+
+
+def list_collections(root: Path) -> list[CollectionSummary]:
+    """List collections under root from local state only (read-only).
+
+    Scans root itself plus its immediate subdirectories for
+    .nexus-state.json files, so both a collections root and a single
+    collection directory are valid inputs. Invalid or unreadable state
+    files are skipped silently: one broken collection must never hide
+    the healthy ones. Never touches the network. Sorted by name.
+    """
+    root = Path(root)
+    candidates: list[Path] = []
+    if (root / STATE_FILENAME).is_file():
+        candidates.append(root)
+    if root.is_dir():
+        candidates.extend(
+            child
+            for child in sorted(root.iterdir())
+            if child.is_dir() and (child / STATE_FILENAME).is_file()
+        )
+
+    summaries: list[CollectionSummary] = []
+    for cdir in candidates:
+        try:
+            state = CollectionState(cdir)
+            state.load()
+        except Exception:
+            # Unreadable, malformed, or partially hand-edited state:
+            # skip this collection silently. (load() can surface
+            # StateError, OSError, or int()/type errors on bad keys.)
+            continue
+        summaries.append(
+            CollectionSummary(
+                name=state.collection_name or cdir.name,
+                game_domain=state.game_domain,
+                mod_count=len(state.mods),
+                pending_count=len(state.get_pending_mods()),
+                path=cdir,
+            )
+        )
+    summaries.sort(key=lambda s: (s.name.lower(), str(s.path)))
+    return summaries
+
+
+def list_mods(mods_dir: Path) -> list[ModSummary]:
+    """List tracked mods from local state only (read-only, no network).
+
+    Unlike get_status this never contacts the API: it reflects exactly
+    what .nexus-state.json tracks right now. Sorted by name (ties break
+    by file_id for determinism). Removed mods are absent because removal
+    deletes their state entries.
+    """
+    state = CollectionState(mods_dir)
+    state.load()
+    summaries = [
+        ModSummary(
+            file_id=ms.file_id,
+            mod_id=ms.mod_id,
+            name=ms.name,
+            version=ms.version,
+            filename=ms.filename,
+            download_status=ms.download_status,
+        )
+        for ms in state.mods.values()
+    ]
+    summaries.sort(key=lambda m: (m.name.lower(), m.file_id))
+    return summaries
+
+
 class ModManagerService:
     """Business logic for managing Nexus Mods collections."""
 
@@ -1217,6 +1322,87 @@ class ModManagerService:
                 self._regen_load_order_from_state(mods_dir, state)
 
             return synthetic_id
+
+    def remove_mod(
+        self,
+        mods_dir: Path,
+        *,
+        file_id: int | None = None,
+        mod_id: int | None = None,
+        no_load_order: bool = False,
+    ) -> RemoveModResult:
+        """Remove one mod from collection state (safe removal).
+
+        Exactly one of file_id/mod_id must be given (ValueError
+        otherwise); file_id resolves to its mod_id, and ALL state entries
+        of that mod are removed. Unknown ids raise StateError before
+        anything is mutated.
+
+        This never touches payload files on disk: extracted content and
+        retained archives stay exactly as they are (cleaning up deployed
+        files is undeploy's job). State is updated atomically under the
+        collection lock; a save failure raises StateError with the prior
+        state file left standing. Afterwards the load order is
+        regenerated from the remaining mods unless no_load_order is set;
+        a regeneration failure after the save is reported as a warning
+        because the removal itself is already persisted.
+        """
+        if (file_id is None) == (mod_id is None):
+            raise ValueError("exactly one of file_id or mod_id is required")
+
+        warnings: list[str] = []
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+
+            if file_id is not None:
+                entry = state.get_file(file_id)
+                if entry is None:
+                    raise StateError(
+                        f"No mod file with file_id {file_id} in {mods_dir}"
+                    )
+                target_mod_id = entry.mod_id
+            else:
+                if state.get_mod(mod_id) is None:
+                    raise StateError(
+                        f"No mod with mod_id {mod_id} in {mods_dir}"
+                    )
+                target_mod_id = mod_id
+
+            removed_file_ids = sorted(
+                fid
+                for fid, ms in state.mods.items()
+                if ms.mod_id == target_mod_id
+            )
+            state.remove_mod(target_mod_id)
+            try:
+                state.save()
+            except Exception as e:
+                # CollectionState.save() is atomic (temp file + rename):
+                # the prior state file stands unchanged on any failure.
+                raise StateError(
+                    f"Failed to save state after removing mod "
+                    f"{target_mod_id}: {e}"
+                ) from e
+
+            if not no_load_order:
+                try:
+                    self._regen_load_order_from_state(mods_dir, state)
+                except Exception as e:
+                    # Truthful partial success: the removal is persisted
+                    # and only the load order regeneration failed.
+                    warnings.append(
+                        f"Mod {target_mod_id} was removed and the removal "
+                        f"was saved, but load order regeneration failed: "
+                        f"{e}. Run 'nexus-dl load-order {mods_dir}' to "
+                        f"retry."
+                    )
+
+        return RemoveModResult(
+            removed_file_ids=removed_file_ids,
+            removed_mod_ids=[target_mod_id],
+            warnings=warnings,
+        )
 
     def get_mod_files(self, mod_url: str) -> list[ModFileInfo]:
         """Get available files for a mod by URL."""
