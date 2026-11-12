@@ -93,6 +93,12 @@ _HELP_LINES = (
 # and Ctrl-C, aborts with no change.
 _CONFIRM_YES = "yes"
 
+# Consecutive input-read failures tolerated before the shell gives up on
+# its input stream. One bad read is recoverable (a non-UTF-8 byte on
+# piped stdin, a hiccuping tty); a stream that cannot produce a single
+# line must end the session cleanly instead of spinning forever.
+_MAX_INPUT_FAILURES = 3
+
 
 class _Quit(Exception):
     """Control flow for /quit: unwinds to run(), which exits 0."""
@@ -212,6 +218,7 @@ class _ShellSession:
         self._emit(
             "nexus-dl shell. Type /help for commands, /quit to exit."
         )
+        input_failures = 0
         while True:
             try:
                 line = self.input_fn("nexus-dl> ")
@@ -223,9 +230,23 @@ class _ShellSession:
                 # Ctrl-C at the prompt cancels the pending line only.
                 self._emit("Cancelled.")
                 continue
+            except Exception as e:
+                # Any other input failure (non-UTF-8 bytes on piped
+                # stdin, a broken tty) is reported through the redacted
+                # failure path and retried; a stream that keeps failing
+                # ends the session cleanly instead of spinning forever.
+                input_failures += 1
+                self._emit_failure(
+                    str(e) or f"input failed ({type(e).__name__})"
+                )
+                if input_failures >= _MAX_INPUT_FAILURES:
+                    self._emit("Input is unusable; goodbye.")
+                    return 0
+                continue
 
-            self._absorb_secrets(line)
+            input_failures = 0
             try:
+                self._absorb_secrets(line)
                 self._run_line(line)
             except _Quit:
                 self._emit("Goodbye.")
@@ -481,7 +502,10 @@ class _ShellSession:
         self._emit(f"Added '{result.mod_name}' as manual mod (phase 999).")
 
     def _report_nxm(self, result: NxmResult) -> None:
-        if not result.success:
+        # "error" status is a failure even when the success flag claims
+        # otherwise: an internally inconsistent result must never render
+        # as success text.
+        if not result.success or result.status == "error":
             self._emit_failure(result.error or "the download did not complete.")
             if result.re_click_required:
                 self._emit(
@@ -585,19 +609,37 @@ class _ShellSession:
         # instead of prompting for a removal that cannot happen.
         result = self.svc.remove_mod(current.path, file_id=file_id, mod_id=mod_id)
         name = summary.name if summary is not None else f"mod {mod_id or file_id}"
-        removed_ids = ", ".join(str(i) for i in result.removed_file_ids) or "-"
+        # Render the summary from the result defensively: join the id
+        # lists instead of indexing, so an empty-ids result (which the
+        # real service never returns) still renders after the removal
+        # rather than failing on a list index.
+        removed_mods = ", ".join(str(i) for i in result.removed_mod_ids) or "-"
+        removed_files = (
+            ", ".join(str(i) for i in result.removed_file_ids) or "-"
+        )
         self._emit(
-            f"Removed '{name}' (mod_id {result.removed_mod_ids[0]}); "
-            f"file(s) {removed_ids} left the collection."
+            f"Removed '{name}' (mod_id {removed_mods}); "
+            f"file(s) {removed_files} left the collection."
         )
         for warning in result.warnings:
             self._emit_warning(warning)
 
     def _confirm(self, prompt: str) -> str:
-        """Read a confirmation line; Ctrl-C or Ctrl-D aborts (returns 'no')."""
+        """Read a confirmation line; anything but a clean "yes" aborts.
+
+        Ctrl-C, Ctrl-D, and any other input failure all abort (return
+        "no"): a broken input stream must never confirm a destructive
+        action. Failures are rendered through the redacted path so they
+        stay visible.
+        """
         try:
             return self.input_fn(prompt).strip().lower()
         except (KeyboardInterrupt, EOFError):
+            return "no"
+        except Exception as e:
+            self._emit_failure(
+                str(e) or f"input failed ({type(e).__name__})"
+            )
             return "no"
 
     def _cmd_status(self, rest: str) -> None:

@@ -24,7 +24,7 @@ from nexus_collection_dl.service import (
     PendingDownload,
     SyncResult,
 )
-from nexus_collection_dl.shell import run_shell
+from nexus_collection_dl.shell import _MAX_INPUT_FAILURES, run_shell
 from nexus_collection_dl.state import (
     CollectionState,
     StateBusyError,
@@ -229,18 +229,31 @@ def run_cli(root: Path, input_text: str, monkeypatch=None,
 def run_direct(svc, root: Path, script):
     """Call run_shell with an injected input_fn for interrupt scripting.
 
-    ``script`` items are either input lines or exception instances to
-    raise. Returns (exit_code, captured_output).
+    ``script`` items are input lines, exception instances to raise, or
+    callables run as side effects before the next line is served (for
+    mutating state between commands). Returns (exit_code,
+    captured_output).
     """
     buf = io.StringIO()
     console = Console(file=buf, width=200, force_terminal=False)
     steps = iter(script)
 
     def input_fn(prompt):
-        item = next(steps)
-        if isinstance(item, BaseException):
-            raise item
-        return item
+        while True:
+            try:
+                item = next(steps)
+            except StopIteration:
+                # Script exhausted behaves like end of input, same as
+                # the real input() on a closed stream.
+                raise EOFError from None
+            if isinstance(item, BaseException):
+                raise item
+            if callable(item):
+                # Side effect between commands (e.g. corrupt a state
+                # file so the next command hits a real error path).
+                item()
+                continue
+            return item
 
     code = run_shell(svc, root, input_fn=input_fn, console=console)
     return code, buf.getvalue()
@@ -331,6 +344,80 @@ def test_remove_ctrl_c_at_confirm_makes_no_change(shell_env, tmp_path):
     state = reload_state(cdir)
     assert 456 in state.mods
     assert not state.is_removed(123)
+
+
+# ---------------------------------------------------------------------------
+# prompt and input-stream resilience: the loop never dies
+# ---------------------------------------------------------------------------
+
+def test_ctrl_c_at_main_prompt_cancels_line_and_continues(
+    shell_env, tmp_path
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    svc = ModManagerService(api_key="unused-key")
+
+    code, out = run_direct(svc, root, [
+        KeyboardInterrupt(),  # Ctrl-C at the main prompt
+        "/help",
+        "/quit",
+    ])
+    assert code == 0
+    assert "Cancelled." in out
+    # The loop kept going: /help ran after the interrupt.
+    assert out.index("Cancelled.") < out.index("Shell commands")
+
+
+def test_non_utf8_stdin_does_not_traceback(shell_env, tmp_path):
+    """A decode failure on piped stdin renders as an error and the shell
+    exits cleanly instead of escaping run_shell as a traceback."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+
+    result = run_cli(root, b"\xff\xfe garbage\n")
+    assert result.exit_code == 0
+    assert result.exception is None
+    out = result.output
+    assert "UnicodeDecodeError" in out or "codec can't decode" in out
+    assert "Traceback" not in out
+
+
+def test_input_failure_renders_error_and_recovers(shell_env, tmp_path):
+    """One bad read is survivable: the failure renders through the
+    redacted path and later lines still run."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    svc = ModManagerService(api_key="unused-key")
+
+    code, out = run_direct(svc, root, [
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        "/help",
+        "/quit",
+    ])
+    assert code == 0
+    assert "codec can't decode" in out
+    assert out.index("codec can't decode") < out.index("Shell commands")
+
+
+def test_repeated_input_failures_exit_cleanly(shell_env, tmp_path):
+    """A stream that cannot produce a single line ends the session
+    cleanly after a bounded number of attempts, not an endless spin."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    svc = ModManagerService(api_key="unused-key")
+    buf = io.StringIO()
+    console = Console(file=buf, width=200, force_terminal=False)
+    reads = []
+
+    def broken_input(prompt):
+        reads.append(prompt)
+        raise OSError("Input/output error")
+
+    code = run_shell(svc, root, input_fn=broken_input, console=console)
+    out = buf.getvalue()
+    assert code == 0
+    # Bounded attempts, then a clean exit with no "Goodbye" (that
+    # belongs to the Ctrl-D/quit paths only).
+    assert len(reads) == _MAX_INPUT_FAILURES
+    assert "Input/output error" in out
+    assert "Input is unusable" in out
+    assert "Goodbye." not in out
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +754,26 @@ def test_remove_by_mod_id_prefix(shell_env, tmp_path, monkeypatch):
                       "file_id": None, "mod_id": 123}]
 
 
+def test_remove_empty_ids_result_still_renders(shell_env, tmp_path, monkeypatch):
+    """The removal summary renders from the result defensively: an
+    empty-ids result must not turn a completed removal into a
+    traceback."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    from nexus_collection_dl.service import RemoveModResult
+    FakeShellService.remove_result = RemoveModResult(
+        removed_file_ids=[], removed_mod_ids=[], warnings=[]
+    )
+
+    result = run_cli(
+        root, "/use 1\n/remove 456\nyes\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Removed 'Test Mod'" in out
+    assert "list index out of range" not in out
+
+
 def test_remove_unknown_id_surfaces_state_error(shell_env, tmp_path):
     root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
     cdir = root / "Test Collection"
@@ -723,14 +830,49 @@ def test_status_renders_revision_and_mod_table(
 # error resilience: the loop never dies
 # ---------------------------------------------------------------------------
 
-def test_domain_error_from_listing_keeps_loop_alive(shell_env, tmp_path):
-    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
-    cdir = root / "Test Collection"
-    (cdir / STATE_FILENAME).write_text("{ not json")
+def test_domain_error_mid_command_keeps_loop_alive(shell_env, tmp_path):
+    """A real domain error path: StateError from list_mods on a corrupt
+    state file renders and the loop keeps serving commands.
 
-    result = run_cli(root, "/collections\n/quit\n")
+    (Corrupting the listing is not enough: list_collections skips broken
+    state files internally, so the corruption must land after /use and
+    surface through a command that reads the state directly.)
+    """
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    state_file = root / "Test Collection" / STATE_FILENAME
+
+    def corrupt_state():
+        state_file.write_text("{ not json")
+
+    svc = ModManagerService(api_key="unused-key")
+    code, out = run_direct(svc, root, [
+        "/use 1",
+        corrupt_state,
+        "/mods",
+        "/help",
+        "/quit",
+    ])
+    assert code == 0
+    assert "Invalid state file" in out
+    # The loop kept going: /help ran after the failure.
+    assert out.index("Invalid state file") < out.index("Shell commands")
+
+
+def test_oserror_mid_command_renders_and_continues(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    FakeShellService.status_error = OSError("No such device or address")
+
+    result = run_cli(
+        root, "/use 1\n/status\n/help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
     assert result.exit_code == 0
-    assert "Goodbye." in result.output
+    out = result.output
+    assert "No such device or address" in out
+    # The loop kept going: /help ran after the failure.
+    assert out.index("No such device or address") < out.index("Shell commands")
 
 
 def test_add_rejects_unsupported_scheme(shell_env, tmp_path, monkeypatch):
@@ -765,6 +907,29 @@ def test_nxm_result_failure_renders_before_success_text(
     assert "again, then retry" in out
     assert "Downloaded" not in out
     assert "SUPERSECRETVALUE" not in out
+
+
+def test_nxm_error_status_never_renders_as_success(
+    shell_env, tmp_path, monkeypatch
+):
+    """An internally inconsistent result (success=True with an "error"
+    status) must never print success text."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    FakeShellService.nxm_result = NxmResult(
+        success=True, status="error", game_domain=GAME,
+        mod_id=1, file_id=2,
+        error="rejected by the server",
+    )
+
+    result = run_cli(
+        root, f"/use 1\n{HOSTILE_URI}\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "rejected by the server" in out
+    assert "Downloaded" not in out
+    assert "already downloaded" not in out
 
 
 def test_nxm_success_warnings_render(shell_env, tmp_path, monkeypatch):
