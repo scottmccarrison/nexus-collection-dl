@@ -107,6 +107,11 @@ def cli_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "handler_notify",
                         lambda summary, body="": notifications.append((summary, body)))
     monkeypatch.setattr(cli_module, "ModManagerService", FakeService)
+    # Deterministic daemon probe: tests must never spawn real gdbus /
+    # dbus-send / notify-send probes on the host session. Individual
+    # tests override this to exercise the warning paths.
+    monkeypatch.setattr(cli_module, "notification_daemon_available",
+                        lambda: True)
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     # Pin the state dir too: nxm runs append their status log there, and
@@ -420,6 +425,7 @@ def no_host_subprocesses(monkeypatch):
         raise FileNotFoundError(argv[0])
 
     monkeypatch.setattr(_handler_module, "_default_runner", refuse)
+    monkeypatch.setattr(_handler_module, "_notify_runner", refuse)
 
 
 def test_nxm_success_prints_warnings_and_still_succeeds(cli_env):
@@ -812,3 +818,72 @@ def test_nxm_unexpected_failure_logs_generic_reason_redacted(cli_env):
     summary, body = cli_env["notifications"][0]
     assert summary == "nexus-dl: download failed"
     assert "SECRETVALUE9" not in body
+
+
+# ---------------------------------------------------------------------------
+# Install-time notification self-test and every-outcome notifications
+# ---------------------------------------------------------------------------
+
+def test_handler_install_warns_without_notification_daemon(cli_env, monkeypatch):
+    monkeypatch.setattr(cli_module, "DesktopInstaller", FakeInstaller)
+    monkeypatch.setattr(cli_module, "notification_daemon_available", lambda: False)
+    result = invoke(["handler", "install"])
+    assert result.exit_code == 0, result.output
+    assert "NXM handler installed" in result.output
+    assert "no notification daemon" in result.output
+    assert "nxm.log" in result.output                  # log fallback shown
+
+
+def test_handler_install_silent_when_probe_unavailable(cli_env, monkeypatch):
+    """Missing probe tooling skips silently: never a warning, never a failure."""
+    monkeypatch.setattr(cli_module, "DesktopInstaller", FakeInstaller)
+    monkeypatch.setattr(cli_module, "notification_daemon_available", lambda: None)
+    result = invoke(["handler", "install"])
+    assert result.exit_code == 0, result.output
+    assert "NXM handler installed" in result.output
+    assert "Warning" not in result.output
+
+
+def test_handler_install_no_warning_when_daemon_present(cli_env, monkeypatch):
+    monkeypatch.setattr(cli_module, "DesktopInstaller", FakeInstaller)
+    monkeypatch.setattr(cli_module, "notification_daemon_available", lambda: True)
+    result = invoke(["handler", "install"])
+    assert result.exit_code == 0, result.output
+    assert "no notification daemon" not in result.output
+
+
+def test_nxm_usage_error_notifies_with_default_notify(cli_env):
+    """Every error outcome notifies when notifications are on, including
+    the usage refusal before the service ever runs."""
+    tmp_path = cli_env["tmp_path"]
+    mods = tmp_path / "mods"
+    out = tmp_path / "out"
+    mods.mkdir()
+    out.mkdir()
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2",
+                     "--mods-dir", str(mods), "--output", str(out)])
+    assert result.exit_code == 1
+    assert "cannot be combined" in result.output
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert "cannot be combined" in body
+    content = nxm_log_file(cli_env).read_text()
+    assert "reason=usage" in content
+
+
+def test_nxm_routing_error_notifies_with_default_notify(cli_env):
+    """Unmapped-game routing failures notify by default (desktop launch
+    simulation: stdout is not a TTY)."""
+    FakeService.error = None
+    from nexus_collection_dl.handler import NxmRoutingError
+    FakeService.error = NxmRoutingError(
+        "No collection directory is mapped for 'skyrimspecialedition'. "
+        "Map one with:\n  nexus-dl handler map ..."
+    )
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2"])
+    assert result.exit_code == 1
+    assert "No collection directory" in result.output
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert "No collection directory" in body
+    assert "reason=routing" in nxm_log_file(cli_env).read_text()

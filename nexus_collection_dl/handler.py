@@ -391,9 +391,13 @@ def escape_exec_argument(value: str) -> str:
 def build_desktop_entry_content(executable: Path | str) -> str:
     """Build the .desktop entry content for the nxm scheme handler.
 
-    ``%u`` must stay a standalone unquoted field code (the desktop
-    launcher substitutes the clicked URI there), so only the executable
-    path is ever quoted or escaped.
+    The entry runs headless (``Terminal=false``): a launched click never
+    opens a terminal window, so the outcome must be visible another way.
+    The Exec line therefore passes ``--notify`` explicitly, making the
+    desktop notification deterministic instead of dependent on whether
+    stdout happens to be a TTY. ``%u`` must stay a standalone unquoted
+    field code (the desktop launcher substitutes the clicked URI there),
+    so only the executable path is ever quoted or escaped.
     """
     exe = str(Path(executable))
     if not os.path.isabs(exe):
@@ -405,8 +409,8 @@ def build_desktop_entry_content(executable: Path | str) -> str:
         "Version=1.0\n"
         "Name=nexus-dl NXM handler\n"
         "Comment=Download Nexus Mods files from nxm:// links\n"
-        f"Exec={escaped} nxm %u\n"
-        "Terminal=true\n"
+        f"Exec={escaped} nxm %u --notify\n"
+        "Terminal=false\n"
         "NoDisplay=true\n"
         "StartupNotify=false\n"
         f"MimeType={NXM_MIME_TYPE};\n"
@@ -425,11 +429,30 @@ def _default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
     )
 
 
+# Seconds: hard bound for notification subprocesses. A hung or broken
+# notification daemon must never delay a command's exit by more than this.
+NOTIFY_TIMEOUT = 3
+
+
+def _notify_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run notify-send (or a daemon probe) under the hard NOTIFY_TIMEOUT."""
+    return subprocess.run(
+        list(argv),
+        shell=False,
+        capture_output=True,
+        text=True,
+        timeout=NOTIFY_TIMEOUT,
+    )
+
+
 def notify(summary: str, body: str = "", runner: Callable | None = None) -> bool:
     """Best-effort desktop notification via notify-send. Never raises.
 
     Messages are URL-stripped so a signed link can never reach the
-    notification daemon even if a caller passes one by mistake.
+    notification daemon even if a caller passes one by mistake. The
+    subprocess is hard-bounded to NOTIFY_TIMEOUT seconds; a missing
+    tool, a timeout, or a non-zero exit all report False instead of
+    failing the caller or delaying its exit.
     """
     if shutil.which("notify-send") is None:
         return False
@@ -439,10 +462,60 @@ def notify(summary: str, body: str = "", runner: Callable | None = None) -> bool
     if body:
         argv.append(sanitize_message(body))
     try:
-        (runner or _default_runner)(argv)
+        proc = (runner or _notify_runner)(argv)
     except Exception:
         return False
-    return True
+    # A non-zero exit means the daemon rejected or never received the
+    # notification: report the failure honestly, still without raising.
+    return getattr(proc, "returncode", 1) == 0
+
+
+def notification_daemon_available(runner: Callable | None = None) -> bool | None:
+    """Best-effort: is a notification daemon reachable in this session?
+
+    Returns True or False when a probe produced a definitive answer, and
+    None when no probe tooling exists (callers must skip silently: a
+    missing probe is never an install failure). Probes, in order: gdbus
+    or dbus-send asking the session bus who owns
+    org.freedesktop.Notifications, then a timed notify-send whose exit
+    status reflects daemon reachability. Never raises.
+    """
+    run = runner or _notify_runner
+    for tool in ("gdbus", "dbus-send"):
+        path = shutil.which(tool)
+        if not path:
+            continue
+        if tool == "gdbus":
+            argv = [
+                path, "call", "--session",
+                "--dest", "org.freedesktop.DBus",
+                "--object-path", "/org/freedesktop/DBus",
+                "--method", "org.freedesktop.DBus.GetNameOwner",
+                "org.freedesktop.Notifications",
+            ]
+        else:
+            argv = [
+                path, "--session", "--print-reply",
+                "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus.GetNameOwner",
+                "string:org.freedesktop.Notifications",
+            ]
+        try:
+            proc = run(argv)
+        except Exception:
+            continue  # a broken probe tool must not decide the answer
+        # GetNameOwner exits non-zero when the name is unowned (or there
+        # is no session bus at all): either way no daemon is reachable.
+        return getattr(proc, "returncode", 1) == 0
+    if shutil.which("notify-send") is not None:
+        # No bus tooling: fall back to a real (visible, harmless)
+        # notify-send whose exit status reflects daemon reachability.
+        return notify(
+            "nexus-dl: notification test",
+            "If you can see this, nxm:// click outcomes will notify you.",
+            runner=runner,
+        )
+    return None
 
 
 class DesktopInstaller:

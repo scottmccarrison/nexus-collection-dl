@@ -188,7 +188,7 @@ If the tool can't auto-select a file (no main file category), it lists all avail
 
 ### nxm:// link handler
 
-Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button, your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. When the download finishes, the process exits.
+Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button (and accept the browser's first-run "Launch application" confirmation for nxm:// links), your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. The click runs headless (no terminal window); the outcome arrives as a desktop notification, and every run appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` as the diagnostic fallback. When the download finishes, the process exits.
 
 One catch: a browser-launched process sees your desktop session's environment, not your shell's, so a `NEXUS_API_KEY` exported in `.bashrc` never reaches it. Store the key once instead. The prompt is hidden: the key is never echoed, never lands in shell history, and never appears in the process list:
 
@@ -224,9 +224,9 @@ nexus-dl handler install
 
 Now click **Mod manager download** once on any mod file page for that game:
 
-- The first click downloads that one file into the mapped collection, verifies it, extracts it, and ends with a desktop notification. Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
-- Clicking again for the same file is a no-op: nexus-dl recognizes the download as already present and skips it without re-downloading.
-- `nexus-dl handler uninstall` removes the desktop entry and restores whichever app handled nxm:// links before.
+- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
+- Clicking again for the same file re-downloads and re-verifies it: the default flow deletes the archive after extracting, so there is nothing left to dedupe against. The zero-network no-op applies when the verified archive is retained (for example with `--no-extract`). Every click also appends a redacted line to `~/.local/state/nexus-dl/nxm.log`.
+- `nexus-dl handler uninstall` removes the desktop entry and restores the app that handled nxm:// links before, when one was recorded and nexus-dl is still the default.
 
 Useful flags when running `nxm` yourself:
 
@@ -256,7 +256,9 @@ Notes:
 - The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
 - Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
 - Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: the nxm:// link comes from the "Mod manager download" button (right-click it and copy the link address).
-- Downloads are verified (exact size, manifest MD5 when known) before they are registered. A file already downloaded in the collection is a no-op with no network traffic. With `--no-extract` the verified archive stays in the collection folder, and re-running the same link is a no-op (proven duplicate).
+- Downloads are verified before they are published (exact size, manifest MD5 when known); a file with neither a positive expected size nor a known checksum is refused with nothing written. When the verified archive is still on disk (retained with `--no-extract`, or kept after a failed extraction), re-running the same link is a no-op with zero network traffic; the default flow deletes the archive after a successful extraction, so a re-click then re-downloads and re-verifies it.
+- Re-running `handler install` is idempotent: the desktop entry is always rewritten (refreshing entries from older versions), and install performs a best-effort notification-daemon self-test, warning visibly and pointing at `~/.local/state/nexus-dl/nxm.log` when no daemon is reachable.
+- Platform caveats: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox; GNOME and KDE are untested. Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported: use a native browser build or run `nexus-dl nxm` on a copied link.
 - `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
 - Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
 

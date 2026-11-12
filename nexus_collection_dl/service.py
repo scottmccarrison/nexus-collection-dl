@@ -1851,7 +1851,13 @@ class ModManagerService:
                         collection_dir=target,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
-                # flag; fall through and re-download.
+                # flag; fall through and re-download. Note this is the
+                # normal path for a re-click after a successful download:
+                # the default flow deletes the archive once extraction is
+                # persisted, so a downloaded+extracted entry re-downloads
+                # (with full verification). The zero-network no-op above
+                # applies only while a valid archive is retained on disk
+                # (e.g. --no-extract runs or a failed extraction).
 
             progress("init", 0.05, "Validating API key...")
             account_error = self._nxm_account_error(info, collection_dir=target)
@@ -2004,8 +2010,11 @@ class ModManagerService:
                     elif existing.download_status == "downloaded":
                         # Recover a previously-downloaded entry: without
                         # this regression the fresh archive would strand
-                        # forever - re-clicks dedupe to already_downloaded
-                        # and import only processes pending entries. Going
+                        # forever. A failed extraction retains the archive
+                        # on disk, and a retained valid archive is exactly
+                        # what the dedupe check keys on, so re-clicks would
+                        # return already_downloaded with zero network while
+                        # import only processes pending entries. Going
                         # back to pending lets either path finish the
                         # extraction. Best-effort save under the already-
                         # held collection lock: a save failure must not

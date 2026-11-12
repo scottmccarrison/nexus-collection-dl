@@ -159,7 +159,11 @@ def test_unrepresentable_paths_rejected_safely(bad):
 def test_entry_content_exec_line(exe):
     content = build_desktop_entry_content(exe)
     exec_line = next(l for l in content.splitlines() if l.startswith("Exec="))
-    assert exec_line == f"Exec={exe} nxm %u"
+    assert exec_line == f"Exec={exe} nxm %u --notify"
+    # Headless: no terminal window for a click, and the notification is
+    # baked into the Exec line so it never depends on stdout being a TTY.
+    assert "Terminal=false" in content
+    assert "Terminal=true" not in content
     assert f"MimeType={NXM_MIME_TYPE};" in content
     assert "[Desktop Entry]" in content
     assert "Type=Application" in content
@@ -171,9 +175,9 @@ def test_entry_content_percent_u_unquoted_with_quoted_exe(tmp_path):
     tricky.write_text("#!/bin/sh\n")
     content = build_desktop_entry_content(tricky)
     exec_line = next(l for l in content.splitlines() if l.startswith("Exec="))
-    # Executable part quoted; %u standalone, unquoted, last token
-    assert exec_line.endswith(" nxm %u")
-    assert '"%' not in exec_line and "%u\"" not in exec_line
+    # Executable part quoted; %u standalone and unquoted (--notify follows)
+    assert exec_line.endswith(" nxm %u --notify")
+    assert '"%' not in exec_line and '%u"' not in exec_line
     quoted = exec_line[len("Exec="):]
     assert quoted.startswith('"') and quoted.count('"') == 2  # only around the exe
     assert "\\$100%%" in quoted and "it's" in quoted and "my apps" in quoted
@@ -806,3 +810,143 @@ def test_resolve_mapped_empty_game_domain_rejected(tmp_path, monkeypatch, cfg_pa
         resolve_collection_dir(GAME)
     assert "no game domain" in str(excinfo.value)
     assert str(cdir) in str(excinfo.value)         # says which dir to fix
+
+
+# ---------------------------------------------------------------------------
+# Notification hardening: bounded notify, honest results, daemon probing
+# ---------------------------------------------------------------------------
+
+def _notify_send_only(monkeypatch):
+    monkeypatch.setattr(
+        handler_module.shutil, "which",
+        lambda name: "/usr/bin/notify-send" if name == "notify-send" else None,
+    )
+
+
+def test_notify_nonzero_exit_reports_false(monkeypatch):
+    """A daemon that rejects the notification is reported honestly."""
+    _notify_send_only(monkeypatch)
+    runner = FakeRunner(fail={"notify-send"})
+    assert notify("sum", "body", runner=runner) is False
+
+
+def test_notify_hang_is_time_bounded_and_false(monkeypatch):
+    """A hanging notifier never blocks the caller beyond the timeout."""
+    _notify_send_only(monkeypatch)
+
+    def hanging_runner(argv):
+        raise subprocess.TimeoutExpired(
+            cmd=argv[0], timeout=handler_module.NOTIFY_TIMEOUT
+        )
+
+    assert notify("sum", "body", runner=hanging_runner) is False
+    assert handler_module.NOTIFY_TIMEOUT <= 3          # hard, short bound
+
+
+def test_notify_default_runner_uses_hard_timeout(monkeypatch):
+    _notify_send_only(monkeypatch)
+    seen = {}
+
+    def recording_run(argv, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(handler_module.subprocess, "run", recording_run)
+    assert notify("sum") is True
+    assert seen["timeout"] == handler_module.NOTIFY_TIMEOUT
+    assert seen["shell"] is False
+
+
+def test_daemon_probe_gdbus_owner_found(monkeypatch):
+    monkeypatch.setattr(
+        handler_module.shutil, "which",
+        lambda name: "/usr/bin/gdbus" if name == "gdbus" else None,
+    )
+    runner = FakeRunner()                              # exit 0
+    assert handler_module.notification_daemon_available(runner=runner) is True
+    call = runner.calls[0]
+    assert call[0] == "/usr/bin/gdbus"
+    assert "org.freedesktop.DBus.GetNameOwner" in call
+    assert "org.freedesktop.Notifications" in call
+
+
+def test_daemon_probe_gdbus_no_owner(monkeypatch):
+    monkeypatch.setattr(
+        handler_module.shutil, "which",
+        lambda name: "/usr/bin/gdbus" if name == "gdbus" else None,
+    )
+    runner = FakeRunner(fail={"/usr/bin/gdbus"})       # name unowned
+    assert handler_module.notification_daemon_available(runner=runner) is False
+
+
+def test_daemon_probe_falls_back_to_dbus_send(monkeypatch):
+    monkeypatch.setattr(
+        handler_module.shutil, "which",
+        lambda name: "/usr/bin/dbus-send" if name == "dbus-send" else None,
+    )
+    runner = FakeRunner(fail={"/usr/bin/dbus-send"})
+    assert handler_module.notification_daemon_available(runner=runner) is False
+    assert runner.calls[0][0] == "/usr/bin/dbus-send"
+
+
+def test_daemon_probe_notify_send_last_resort(monkeypatch):
+    _notify_send_only(monkeypatch)
+    assert handler_module.notification_daemon_available(
+        runner=FakeRunner()
+    ) is True
+    assert handler_module.notification_daemon_available(
+        runner=FakeRunner(fail={"notify-send"})
+    ) is False
+
+
+def test_daemon_probe_no_tooling_is_none(monkeypatch):
+    """Missing probe tools skip silently: never an install failure."""
+    monkeypatch.setattr(handler_module.shutil, "which", lambda name: None)
+    assert handler_module.notification_daemon_available(
+        runner=FakeRunner()
+    ) is None
+
+
+def test_daemon_probe_broken_tool_skips_silently(monkeypatch):
+    monkeypatch.setattr(
+        handler_module.shutil, "which",
+        lambda name: "/usr/bin/gdbus" if name == "gdbus" else None,
+    )
+
+    def exploding(argv):
+        raise subprocess.TimeoutExpired(cmd=argv[0], timeout=3)
+
+    # gdbus times out, no other tool exists: no answer, no failure
+    assert handler_module.notification_daemon_available(runner=exploding) is None
+
+
+# ---------------------------------------------------------------------------
+# Install idempotence: a stale entry from an older version is rewritten
+# ---------------------------------------------------------------------------
+
+def test_install_rerun_rewrites_stale_entry(exe, cfg_path, tmp_path):
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    stale = apps / DESKTOP_ENTRY_NAME
+    stale.write_text(
+        "[Desktop Entry]\nType=Application\n"
+        "Exec=/old/venv/bin/nexus-dl nxm %u\nTerminal=true\n"
+    )
+    runner = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    cfg = HandlerConfig(cfg_path)
+    cfg.desktop = {"installed": True, "entry_path": str(stale),
+                   "executable": "/old/venv/bin/nexus-dl",
+                   "previous_default": None}
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=apps, executable=exe)
+
+    entry = inst.install()
+
+    content = entry.read_text()
+    assert content == build_desktop_entry_content(exe.resolve())
+    assert "Terminal=true" not in content              # stale shape gone
+    assert "Terminal=false" in content
+    assert "--notify" in content
+    assert "/old/venv" not in content
+    # The saved previous default survives the reinstall untouched
+    assert cfg.desktop["previous_default"] is None

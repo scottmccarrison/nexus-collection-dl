@@ -18,7 +18,9 @@ from .handler import (
     NxmRoutingError,
     add_mapping,
     append_nxm_log,
+    notification_daemon_available,
     notify as handler_notify,
+    nxm_log_path,
     remove_mapping,
     sanitize_message,
 )
@@ -798,14 +800,26 @@ def nxm(
     by the desktop handler installed with 'nexus-dl handler install'.
     Link credentials are used for the request only and are never stored.
     """
+    # Notification policy: an explicit --notify/--no-notify flag wins;
+    # otherwise notify unless stdout is a terminal, so a paste-run in a
+    # terminal prints inline instead of popping up. The desktop-handler
+    # path is deterministic regardless of stdout: its Exec line passes
+    # --notify and the entry runs headless (Terminal=false), so every
+    # launched outcome notifies. Do NOT infer "no terminal" from the
+    # launch context: the old Terminal=true entry made a launched run's
+    # stdout a TTY, and the default then suppressed the very
+    # notification the click needed (disproven by live smoke testing).
+    want_notify = notify if notify is not None else (not sys.stdout.isatty())
+
     if mods_dir is not None and output_dir is not None:
         console.print("[red]Error:[/red] --mods-dir and --output cannot be combined.")
         _log_nxm("error", "reason=usage")
+        if want_notify:
+            handler_notify(
+                "nexus-dl: download failed",
+                "--mods-dir and --output cannot be combined.",
+            )
         sys.exit(1)
-
-    # Desktop-launched invocations have no terminal: notify by default so
-    # the outcome is visible. Terminal runs print to stdout instead.
-    want_notify = notify if notify is not None else (not sys.stdout.isatty())
 
     def fail(message: str) -> None:
         # escape(): messages may contain bracketed text (e.g. "[redacted]")
@@ -1080,7 +1094,9 @@ def handler_install() -> None:
     """Install the user desktop entry so nxm:// links open nexus-dl.
 
     User-level only (XDG applications dir); remembers the previous
-    default handler so uninstall can restore it.
+    default handler so uninstall can restore it. Re-running is
+    idempotent: the entry is always rewritten, so stale entries from
+    older versions are replaced.
     """
     try:
         entry = DesktopInstaller().install()
@@ -1092,6 +1108,17 @@ def handler_install() -> None:
         "[dim]'Mod manager download' links on Nexus Mods now open nexus-dl. "
         "Map each game first with 'nexus-dl handler map GAME COLLECTION_DIR'.[/dim]"
     )
+    # Best-effort notification self-test: launched clicks run headless and
+    # report outcomes as notifications, so a session without a reachable
+    # daemon deserves a visible warning pointing at the log fallback. A
+    # missing probe tool skips silently and never fails the install.
+    if notification_daemon_available() is False:
+        console.print(
+            "[yellow]Warning:[/yellow] no notification daemon was detected "
+            "on this session, so click outcomes may not be visible as "
+            "notifications. Each click still appends a status line to "
+            f"{escape(str(nxm_log_path()))}; check that log after clicking."
+        )
 
 
 @handler_group.command(name="uninstall")

@@ -582,10 +582,12 @@ def test_extraction_failure_regresses_downloaded_entry_to_pending(
     """A previously-downloaded entry must not strand a fresh archive.
 
     The entry says 'downloaded' but its artifact is gone, so the link
-    re-downloads and extraction then fails. Without the regression to
-    pending, the entry would stay 'downloaded' with an unextracted
-    archive: import only processes pending entries, and re-clicks would
-    dedupe to already_downloaded forever.
+    re-downloads and extraction then fails. A failed extraction retains
+    the archive on disk, and dedupe to already_downloaded applies only
+    to such retained valid archives: without the regression to pending,
+    the entry would stay 'downloaded' with an unextracted archive,
+    re-clicks would dedupe to already_downloaded forever (zero network,
+    nothing extracted), and import only processes pending entries.
     """
     zip_bytes = make_zip()
     entry = pending_entry()
@@ -1305,3 +1307,68 @@ def test_service_side_empty_domain_check_fails_closed(svc, tmp_path, monkeypatch
     assert "no game domain" in result.error
     assert "nexus-dl sync" in result.error
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Re-click behavior, end to end: the default flow deletes the extracted
+# archive, so a re-click re-downloads (verified); the zero-network
+# already_downloaded dedupe applies only to retained archives.
+# ---------------------------------------------------------------------------
+
+def test_reclick_after_extraction_redownloads_verified(svc, tmp_path, monkeypatch):
+    """Default flow: download + extract deletes the archive, so the same
+    link clicked again performs a fresh verified download instead of
+    deduping. State stays consistent across both runs."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    session = patch_downloader(monkeypatch, zip_bytes)
+
+    first = svc.add_nxm(uri(), mods_dir=cdir)
+    assert first.success and first.status == "downloaded"
+    assert first.extracted is True
+    assert not (cdir / "TestMod-1.0.zip").exists()      # archive deleted
+    assert (cdir / "Data" / "test.txt").exists()
+    downloads_after_first = fake.calls.count("get_download_url")
+    sessions_after_first = len(session.calls)
+    assert downloads_after_first == 1
+
+    second = svc.add_nxm(uri(), mods_dir=cdir)
+    assert second.success, second.error
+    # NOT a dedupe: a real second download happened and was verified
+    assert second.status == "downloaded"
+    assert fake.calls.count("get_download_url") == downloads_after_first + 1
+    assert len(session.calls) == sessions_after_first + 1
+    assert (cdir / "Data" / "test.txt").read_bytes() == b"hello mods"
+    assert not (cdir / "TestMod-1.0.zip").exists()      # cleaned up again
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+
+
+def test_reclick_with_retained_archive_dedupes_zero_network(
+    svc, tmp_path, monkeypatch
+):
+    """--no-extract retains the verified archive, so the second click is
+    the real dedupe path: already_downloaded with zero network calls."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    session = patch_downloader(monkeypatch, zip_bytes)
+
+    first = svc.add_nxm(uri(), mods_dir=cdir, no_extract=True)
+    assert first.success and first.status == "downloaded"
+    assert first.extracted is False
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes  # retained
+    calls_after_first = list(fake.calls)
+    sessions_after_first = len(session.calls)
+
+    second = svc.add_nxm(uri(), mods_dir=cdir)
+    assert second.success
+    assert second.status == "already_downloaded"
+    assert fake.calls == calls_after_first              # zero further calls
+    assert len(session.calls) == sessions_after_first   # zero CDN traffic
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
