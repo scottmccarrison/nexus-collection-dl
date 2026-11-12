@@ -759,18 +759,20 @@ class DesktopInstaller:
                 # TimeoutExpired and other subprocess failures become
                 # domain errors so the rollback below runs and the CLI
                 # prints an actionable message instead of a traceback.
-                kind = "timed out" if isinstance(e, subprocess.TimeoutExpired) else "failed"
+                # The message states only what is known HERE; what the
+                # rollback actually did is reported by the outer handler,
+                # because a timeout may end in a kept entry rather than
+                # a removal.
                 if isinstance(e, subprocess.TimeoutExpired):
-                    # The registration may or may not have applied before
-                    # the timeout: rollback treats the outcome as
-                    # indeterminate instead of assuming "not registered".
                     registration_uncertain = True
+                    raise DesktopEntryError(
+                        "Registering the nxm:// default handler timed out"
+                        f" ({type(e).__name__}). Whether the registration "
+                        "applied before the timeout is unknown."
+                    )
                 raise DesktopEntryError(
-                    f"Registering the nxm:// default handler {kind}"
-                    f" ({type(e).__name__}). The desktop entry was rolled "
-                    "back; you can retry 'nexus-dl handler install' or "
-                    f"register {self.entry_path} with your desktop "
-                    "environment manually."
+                    "Registering the nxm:// default handler failed"
+                    f" ({type(e).__name__})."
                 )
             if getattr(proc, "returncode", 0) != 0:
                 detail = (getattr(proc, "stderr", "") or "").strip()
@@ -793,28 +795,64 @@ class DesktopInstaller:
                 wrote_entry, prior_content, current,
                 registered, registration_uncertain,
             )
+            base = sanitize_message(str(e)).strip()
+            if base and not base.endswith("."):
+                base += "."
             if kept:
-                # The default points at the entry this run wrote and
-                # could not be moved elsewhere, so the entry was kept.
-                # Report the real failure and the kept state honestly,
-                # including what removal can and cannot do.
+                # The effective default points at the entry this run
+                # wrote (or, after a timeout, could not be confirmed to
+                # point elsewhere), so the entry was kept. State exactly
+                # which situation applies and what uninstall will and
+                # will not clear.
+                if registered:
+                    registration_note = (
+                        "the effective nxm:// default points at it"
+                    )
+                else:
+                    registration_note = (
+                        "the registration attempt timed out, so whether "
+                        "the default points at it could not be confirmed "
+                        "either way"
+                    )
+                prior = desktop.get("previous_default")
+                if isinstance(prior, str) and prior:
+                    uninstall_note = (
+                        "it removes the entry and restores the recorded "
+                        f"previous default ('{prior}') as long as "
+                        "nexus-dl is still the current one."
+                    )
+                else:
+                    uninstall_note = (
+                        "it removes the entry, and because no previous "
+                        "default was recorded the nxm:// registration "
+                        "will remain as an inert reference to the removed "
+                        "entry (launchers ignore missing entries) until "
+                        "another handler is chosen or nexus-dl is "
+                        "reinstalled."
+                    )
                 raise DesktopEntryError(
-                    "The desktop entry was written and registered as the "
-                    "nxm:// handler, but the install did not complete: "
-                    f"{sanitize_message(str(e))}. The entry at "
-                    f"{self.entry_path} was KEPT because it is the "
-                    "registered default and xdg-mime cannot unset one; "
-                    "the handler configuration was not saved. Fix the "
-                    "underlying problem (permissions, disk space) and "
-                    "re-run 'nexus-dl handler install' to finish. To "
-                    "back out instead, run 'nexus-dl handler uninstall': "
-                    "it removes the entry, and since no previous default "
-                    "was recorded the nxm:// registration will remain as "
-                    "an inert reference to the removed entry (launchers "
-                    "ignore missing entries) until another handler is "
-                    "chosen or nexus-dl is reinstalled."
+                    f"The install did not complete: {base} The desktop "
+                    f"entry at {self.entry_path} was KEPT: "
+                    f"{registration_note}, and deleting the entry while "
+                    "the default may point at it would strand the "
+                    "registration with no handler to run (xdg-mime "
+                    "cannot unset a default). The handler configuration "
+                    "was not saved. Fix the underlying problem "
+                    "(permissions, disk space) and re-run 'nexus-dl "
+                    "handler install' to finish. To back out instead, "
+                    f"run 'nexus-dl handler uninstall': {uninstall_note}"
                 ) from e
-            raise
+            if wrote_entry:
+                outcome = (
+                    " The partial install was rolled back: the desktop "
+                    "entry was removed or restored to its prior contents, "
+                    "and the MIME default was restored toward the value "
+                    "found at the start of this run. Retry 'nexus-dl "
+                    "handler install' once the problem is fixed."
+                )
+            else:
+                outcome = " Nothing was written or registered."
+            raise DesktopEntryError(f"{base}{outcome}") from e
         return self.entry_path
 
     def uninstall(self) -> str:

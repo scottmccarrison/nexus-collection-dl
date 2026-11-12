@@ -1,5 +1,6 @@
 """Command-line interface for nexus-collection-dl."""
 
+import re
 import sys
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -9,7 +10,11 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from .api import NexusAPIError, redact_literal_values
+from .api import (
+    NexusAPIError,
+    redact_encoded_secret_forms,
+    redact_literal_values,
+)
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
@@ -762,7 +767,7 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
         pass  # best-effort logging: a broken log must never break nxm
 
 
-def _boundary_secrets(ctx: click.Context, uri: str, min_length: int = 0) -> tuple:
+def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
     """Literal secrets to redact from text leaving the nxm error boundary.
 
     Query extraction mirrors the nxm parser's acceptance rules rather
@@ -771,16 +776,8 @@ def _boundary_secrets(ctx: click.Context, uri: str, min_length: int = 0) -> tupl
     and values are percent-decoded once while a literal '+' stays a '+'
     (parse_qs would turn it into a space, putting a value that is not
     the real credential in scope and leaving the real one out). Both
-    the raw and the decoded value join the scope; redact_literal_values
-    matches every case and percent-encoding variant of each. Values are
-    never displayed, only used for replacement.
-
-    ``min_length`` drops short values from the scope: typed domain-error
-    messages contain deliberate guidance prose, and replacing a one or
-    two character "secret" would mangle ordinary words. Real Nexus API
-    keys and link credentials are long opaque strings (the key store
-    enforces the same 8-character floor), so the guard only ever skips
-    values that cannot be meaningful credentials.
+    the raw and the decoded value join the scope. Values are never
+    displayed, only used for replacement.
     """
     base: list = []
     api_key = (ctx.obj or {}).get("api_key")
@@ -801,15 +798,48 @@ def _boundary_secrets(ctx: click.Context, uri: str, min_length: int = 0) -> tupl
                 base.append(value)
     unique: list = []
     for value in base:
-        if len(value) >= min_length and value not in unique:
+        if value not in unique:
             unique.append(value)
     return tuple(unique)
 
 
-# Same floor as keystore.MIN_KEY_LENGTH: real API keys and link
-# credentials are long opaque strings, so variant redaction of anything
-# shorter only risks mangling guidance prose, never protects a secret.
+# Floor for BARE-LITERAL prose replacement at typed-error boundaries
+# only. Real API keys and link credentials are long opaque strings (the
+# key store enforces the same 8-character minimum), while replacing a
+# one-character literal would mangle ordinary guidance words like
+# "link". This exemption NEVER applies to percent-encoded runs or to
+# occurrences inside URI query strings, where a short credential cannot
+# be ordinary prose. Accepted residual risk (see _boundary_redact): a
+# short-but-valid credential reflected bare in prose survives
+# typed-branch redaction; the catch-all branch applies no floor.
 _MIN_REDACT_SECRET_LEN = 8
+
+# Any-scheme URI, for confining short-secret bare-literal redaction to
+# query strings.
+_ANY_URI_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+
+
+def _redact_secrets_in_uri_queries(text: str, secrets: tuple) -> str:
+    """Bare-literal redaction of short scoped secrets inside URI queries.
+
+    Only the part after the first '?' of each URI is touched; URIs
+    without a query are left alone. Inside a query string even a short
+    credential cannot be ordinary prose, so the length floor does not
+    apply there.
+    """
+
+    def scrub(match: "re.Match[str]") -> str:
+        uri = match.group(0)
+        head, sep, query = uri.partition("?")
+        if not sep:
+            return uri
+        for value in secrets:
+            query = re.sub(
+                re.escape(value), "[redacted]", query, flags=re.IGNORECASE
+            )
+        return head + sep + query
+
+    return _ANY_URI_RE.sub(scrub, text)
 
 
 def _boundary_redact(
@@ -821,16 +851,22 @@ def _boundary_redact(
 ) -> str:
     """Full redaction scope for text leaving through the nxm boundary.
 
-    Literal secrets (API key and link credentials, in every case and
-    percent-encoding variant) are redacted. URI stripping additionally
-    applies to free-form unexpected text; typed domain errors skip it
-    because their messages are redacted at the source and may
-    deliberately carry a redacted API URL or mention the nxm:// scheme
-    in guidance.
+    Every scoped secret (API key, link key/expires in raw and decoded
+    form) is redacted in raw and percent-encoded shapes. When
+    ``min_secret_len`` is set (typed domain-error branches), secrets
+    shorter than it are exempted from bare-literal prose replacement
+    only: they are still redacted in percent-encoded runs and inside
+    URI query strings. Typed branches also skip URI stripping because
+    their messages are redacted at the source and may deliberately
+    carry a redacted API URL or the nxm:// scheme name in guidance.
     """
-    out = redact_literal_values(
-        text, _boundary_secrets(ctx, uri, min_length=min_secret_len)
-    )
+    secrets = _boundary_secrets(ctx, uri)
+    long_secrets = tuple(s for s in secrets if len(s) >= min_secret_len)
+    short_secrets = tuple(s for s in secrets if len(s) < min_secret_len)
+    out = redact_literal_values(text, long_secrets)
+    if short_secrets:
+        out = redact_encoded_secret_forms(out, short_secrets)
+        out = _redact_secrets_in_uri_queries(out, short_secrets)
     return sanitize_message(out) if strip_uris else out
 
 

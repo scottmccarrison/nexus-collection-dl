@@ -1238,3 +1238,40 @@ def test_sanitize_message_nxm_scheme_boundary():
     )
     assert "nxm://" not in out
     assert out.count("[url redacted]") == 3
+
+
+def test_timeout_keep_message_is_internally_consistent(exe, cfg_path, tmp_path):
+    """Timeout with an unavailable query: rollback keeps the entry, and
+    the message must say exactly that - no premature 'rolled back'
+    claim, no confirmed-registration claim, and honest uninstall scope."""
+
+    class TimeoutThenBlindRunner:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, argv):
+            self.calls.append(list(argv))
+            if argv[:3] == ["xdg-mime", "query", "default"]:
+                raise FileNotFoundError("xdg-mime")   # query unavailable
+            if argv[:2] == ["xdg-mime", "default"]:
+                raise subprocess.TimeoutExpired(cmd=argv[0], timeout=30)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner = TimeoutThenBlindRunner()
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+
+    with pytest.raises(DesktopEntryError) as excinfo:
+        inst.install()
+
+    entry = tmp_path / "apps" / DESKTOP_ENTRY_NAME
+    assert entry.exists()                     # kept: outcome indeterminate
+    msg = str(excinfo.value)
+    assert "timed out" in msg
+    assert "KEPT" in msg
+    assert "could not be confirmed" in msg    # uncertain registration stated
+    assert "was rolled back" not in msg       # the old false claim is gone
+    assert "inert reference" in msg           # honest uninstall outcome
+    assert "handler uninstall" in msg
+    assert not cfg_path.exists()              # config never saved

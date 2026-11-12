@@ -1075,3 +1075,35 @@ def test_boundary_secrets_mirror_parser_query_acceptance():
     # The raw still-encoded value is in scope too
     assert "Fake+Key%2FOne" in secrets
     assert "1893456000" in secrets
+
+
+def test_nxm_typed_error_redacts_short_scoped_secret(cli_env):
+    """A short-but-valid link key (the parser allows 1-512 chars) is
+    exempt from bare-prose replacement at typed branches, but must still
+    be redacted inside a URI query and in percent-encoded runs."""
+    short_key = "a+B/9"                       # obviously fake fixture
+    hostile = (
+        f"nxm://{GAME}/mods/1/files/2?key={short_key}&expires=1893456000"
+    )
+    encoded = "a%2BB%2F9"
+    FakeService.error = NexusAPIError(
+        f"reflected {hostile} plus encoded {encoded} plus bare {short_key}"
+    )
+    result = invoke(["nxm", hostile])
+    assert result.exit_code == 1
+    assert f"key={short_key}" not in result.output    # URI query scrubbed
+    assert encoded not in result.output               # encoded run scrubbed
+    assert encoded.lower() not in result.output
+    assert "1893456000" not in result.output          # expires scrubbed
+    # Accepted residual, documented at cli._MIN_REDACT_SECRET_LEN: the
+    # bare prose occurrence of a sub-floor secret survives typed-branch
+    # redaction (the catch-all branch applies no floor). Asserted here
+    # so the exemption stays visible and deliberate.
+    assert f"plus bare {short_key}" in result.output
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert f"key={short_key}" not in body
+    assert encoded not in body
+    content = nxm_log_file(cli_env).read_text()
+    assert "reason=api" in content
+    assert short_key not in content and encoded not in content

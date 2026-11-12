@@ -583,3 +583,58 @@ def test_redact_literal_values_catches_case_and_encoding_variants():
     assert "[redacted]" in out
     # Benign labels around the secrets survive
     assert "raw=" in out and "mixed=" in out
+
+
+# ---------------------------------------------------------------------------
+# Delta re-review follow-ups: case-swapped encodings, multi-byte sequences,
+# encoded-only redaction for short secrets
+# ---------------------------------------------------------------------------
+
+def test_redact_literal_values_catches_other_case_encodings():
+    """A secret letter reflected as the percent-encoding of its OTHER
+    case ('B' as %62, 'K' as %6b) must still be redacted: per-character
+    alternatives cover the encodings of both case forms."""
+    from nexus_collection_dl.api import redact_literal_values
+
+    secret = "FakeKey-aB"                     # obviously fake fixture
+    text = (
+        "reflected FakeKey-a%62 and Fake%6bey-aB and FAKEKEY-A%62 "
+        "and FakeKey-a%42 too"
+    )
+    out = redact_literal_values(text, (secret,))
+    assert "%62" not in out                   # encoding of the other case
+    assert "%6b" not in out
+    assert "%42" not in out                   # same-case encoding still works
+    assert "FakeKey" not in out               # every occurrence consumed
+    assert "FAKEKEY" not in out
+    assert out.count("[redacted]") == 4
+
+
+def test_redact_literal_values_multibyte_full_encoded_sequence():
+    """A multi-byte character must match its COMPLETE consecutive
+    percent-encoded byte sequence (%c3%a9 for e-acute), in either hex
+    case; per-byte alternation cannot align across char positions."""
+    from nexus_collection_dl.api import redact_literal_values
+
+    secret = "Clé-FakeKey"                    # obviously fake fixture
+    lower_hex = "Cl%c3%a9-FakeKey"
+    upper_hex = "Cl%C3%A9-FakeKey"
+    text = f"enc={lower_hex} upper={upper_hex} raw={secret}"
+    out = redact_literal_values(text, (secret,))
+    assert lower_hex not in out
+    assert upper_hex not in out
+    assert secret not in out
+    assert out.count("[redacted]") == 3
+    # Benign labels survive
+    assert "enc=" in out and "upper=" in out and "raw=" in out
+
+
+def test_redact_encoded_secret_forms_leaves_bare_prose():
+    """require_encoded mode: encoded runs of even a very short secret are
+    redacted, while its bare literal spelling in prose is untouched."""
+    from nexus_collection_dl.api import redact_encoded_secret_forms
+
+    out = redact_encoded_secret_forms("bare k9 and enc %6b9 end", ("k9",))
+    assert "bare k9" in out                   # prose not mangled
+    assert "%6b9" not in out                  # encoded run redacted
+    assert "[redacted]" in out

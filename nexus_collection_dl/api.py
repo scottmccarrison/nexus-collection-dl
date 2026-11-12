@@ -46,25 +46,52 @@ def redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def _secret_pattern(secret: str) -> "re.Pattern[str]":
+def _secret_pattern(secret: str, require_encoded: bool = False) -> "re.Pattern[str]":
     """Regex matching one secret in any case or percent-encoding mix.
 
     Per character the pattern accepts the literal character (matched
-    case-insensitively) or the percent-encoding of each of its UTF-8
-    bytes (either hex case, covered by the same flag). Together this
-    catches the raw value, fully encoded forms in both hex cases, and
-    arbitrary mixed encoded/literal forms, which exact case-sensitive
-    literal replacement misses. Credentials are long opaque strings, so
-    a false match on ordinary prose is not a practical concern, and any
-    match errs toward more redaction.
+    case-insensitively) and the FULL percent-encoded byte sequence of
+    every case form of that character (lower and upper where they
+    differ), so a reflected '%61' matches a secret 'A' and vice versa,
+    and a multi-byte UTF-8 character matches its complete consecutive
+    %XX%XX... encoding rather than one byte per character position. Hex
+    letter case is covered by the IGNORECASE flag. Together this catches
+    the raw value, fully encoded forms, and arbitrary mixed
+    encoded/literal forms, which exact case-sensitive literal
+    replacement misses. Credentials are long opaque strings, so a false
+    match on ordinary prose is not a practical concern, and any match
+    errs toward more redaction.
+
+    With ``require_encoded``, a match must use the percent-encoded form
+    at one or more character positions: this redacts encoded runs of
+    even very short secrets without ever matching their bare literal
+    spelling in ordinary prose.
     """
-    parts = []
+    char_alts: list[tuple[str, list[str]]] = []
     for ch in secret:
-        alts = [re.escape(ch)]
-        for byte in ch.encode("utf-8"):
-            alts.append(f"%{byte:02x}")
-        parts.append("(?:" + "|".join(alts) + ")")
-    return re.compile("".join(parts), re.IGNORECASE)
+        encodings: list[str] = []
+        for form in {ch, ch.lower(), ch.upper()}:
+            encoded = "".join(f"%{byte:02x}" for byte in form.encode("utf-8"))
+            if encoded not in encodings:
+                encodings.append(encoded)
+        char_alts.append((re.escape(ch), encodings))
+
+    full = [
+        "(?:" + "|".join([lit] + encs) + ")" for lit, encs in char_alts
+    ]
+    if not require_encoded:
+        return re.compile("".join(full), re.IGNORECASE)
+
+    # At least one position must use its encoded form: a union over
+    # which position that is. Only used for short secrets, so the
+    # quadratic expansion stays tiny.
+    alternatives = []
+    for i, (_lit, encs) in enumerate(char_alts):
+        encoded_group = "(?:" + "|".join(encs) + ")"
+        alternatives.append(
+            "".join(full[:i]) + encoded_group + "".join(full[i + 1:])
+        )
+    return re.compile("(?:" + "|".join(alternatives) + ")", re.IGNORECASE)
 
 
 def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
@@ -85,6 +112,27 @@ def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
         value = str(secret)
         if value and not value.isspace():
             out = _secret_pattern(value).sub("[redacted]", out)
+    return out
+
+
+def redact_encoded_secret_forms(text: str, secrets: Iterable[Any]) -> str:
+    """Redact percent-encoded occurrences of each secret, any length.
+
+    A match must contain at least one percent-encoded character
+    position, so bare-literal spellings are never touched: this is the
+    length-independent companion to redact_literal_values for callers
+    that must not mangle ordinary prose with short secrets (an encoded
+    run like '%6b%39' cannot be ordinary prose).
+    """
+    out = str(text)
+    for secret in secrets:
+        if secret is None:
+            continue
+        value = str(secret)
+        if value and not value.isspace():
+            out = _secret_pattern(value, require_encoded=True).sub(
+                "[redacted]", out
+            )
     return out
 
 
