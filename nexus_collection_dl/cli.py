@@ -2,13 +2,14 @@
 
 import sys
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import click
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from .api import NexusAPIError
+from .api import NexusAPIError, redact_literal_values
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
@@ -761,6 +762,27 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
         pass  # best-effort logging: a broken log must never break nxm
 
 
+def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
+    """Literal secrets to redact from unexpected-exception text.
+
+    The catch-all boundary prints and notifies free-form exception text,
+    which could embed the resolved API key or the raw URI's key/expires
+    query values verbatim. Both join the redaction scope here; values are
+    never displayed, only used for replacement.
+    """
+    secrets: list = []
+    api_key = (ctx.obj or {}).get("api_key")
+    if api_key:
+        secrets.append(api_key)
+    try:
+        query = urlsplit(uri).query
+        for name in ("key", "expires"):
+            secrets.extend(v for v in parse_qs(query).get(name, []) if v)
+    except ValueError:
+        pass
+    return tuple(secrets)
+
+
 @main.command()
 @click.argument("uri", metavar="NXM_URI")
 @click.option(
@@ -863,10 +885,15 @@ def nxm(
         # Outer boundary: any failure not matched above (including the
         # deferred service construction) still leaves one redacted status
         # line and the notification instead of an invisible traceback.
-        # The log carries a static reason code only; the printed text is
-        # URL-stripped in case an unexpected exception embeds one.
+        # The log carries a static reason code only. The printed text goes
+        # through the full redaction scope: known literal secrets first
+        # (API key, raw URI key/expires values), then URL/URI stripping
+        # covering ANY scheme with a query (a raw nxm:// link embeds its
+        # credentials there; the http-only pattern would miss it).
         _log_nxm("error", "reason=error")
-        detail = sanitize_message(str(e)).strip()
+        detail = sanitize_message(
+            redact_literal_values(str(e), _boundary_secrets(ctx, uri))
+        ).strip()
         fail(detail or f"Unexpected failure ({type(e).__name__}).")
 
     if not result.success:
@@ -889,6 +916,13 @@ def nxm(
             f"downloaded in this collection.[/green]"
         )
         summary = f"Already downloaded: {result.mod_name}"
+    elif result.status == "extracted_from_archive":
+        console.print(
+            f"[green]Finished '{escape(str(result.mod_name))}' (file "
+            f"{result.file_id}) by extracting the retained archive; no "
+            "download was needed.[/green]"
+        )
+        summary = f"Extracted {result.mod_name} from the retained archive"
     elif result.status == "saved_to_output":
         console.print(f"[green]Saved {escape(str(result.output_path))}[/green]")
         summary = f"Saved {result.filename}"

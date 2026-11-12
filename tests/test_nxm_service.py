@@ -1372,3 +1372,194 @@ def test_reclick_with_retained_archive_dedupes_zero_network(
     assert fake.calls == calls_after_first              # zero further calls
     assert len(session.calls) == sessions_after_first   # zero CDN traffic
     assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+
+
+# ---------------------------------------------------------------------------
+# C1: a malformed cached checksum never counts as a known MD5
+# ---------------------------------------------------------------------------
+
+def _state_with_manifest_md5(cdir: Path, md5: str) -> None:
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = {
+        "mod_rules": [{
+            "source": {
+                "modId": MOD_ID,
+                "fileID": FILE_ID,
+                "fileMD5": md5,
+                "logicalFileName": "TestMod-1.0.zip",
+            },
+        }]
+    }
+    state.save()
+
+
+def test_expected_md5_maps_skips_malformed_hashes():
+    good = "a" * 32
+    data = {
+        "mod_rules": [
+            {"source": {"modId": 1, "fileID": 2, "fileMD5": "not-a-hash",
+                        "logicalFileName": "bad.zip"}},
+            {"source": {"modId": 3, "fileID": 4, "fileMD5": good.upper(),
+                        "logicalFileName": "good.zip"}},
+        ]
+    }
+    by_identity, by_name = service_module._expected_md5_maps(data)
+    assert by_identity == {(3, 4): good}        # malformed dropped, case folded
+    assert by_name == {"good.zip": good}
+
+
+def test_zero_size_with_malformed_md5_refused_without_writes(
+    svc, tmp_path, monkeypatch
+):
+    """size=0 + fileMD5='not-a-hash' must refuse: a malformed hash would
+    be silently skipped by the downloader, publishing unchecked content."""
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    _state_with_manifest_md5(cdir, "not-a-hash")
+    meta = files_meta(make_zip())
+    meta[0]["size_in_bytes"] = 0
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    patch_downloader(monkeypatch, make_zip())
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be verified" in result.error
+    assert "nothing was written" in result.error
+    assert "get_download_url" not in fake.calls
+    assert state_raw(cdir) == before
+    assert not (cdir / "TestMod-1.0.zip").exists()
+
+
+def test_malformed_md5_with_positive_size_proceeds_on_size(
+    svc, tmp_path, monkeypatch
+):
+    """A malformed cached hash is ignored (never enforced as a checksum);
+    the positive byte size alone verifies the download."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    _state_with_manifest_md5(cdir, "not-a-hash")
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))    # size = len(zip_bytes)
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "downloaded"
+
+
+def test_zero_size_md5_mismatch_refused(svc, tmp_path, monkeypatch):
+    """MD5-only verification is real: wrong content under a well-formed
+    cached hash is refused, not published."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    _state_with_manifest_md5(cdir, hashlib.md5(zip_bytes).hexdigest())
+    meta = files_meta(zip_bytes)
+    meta[0]["size_in_bytes"] = 0                        # size check off
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    tampered = make_zip(payload=b"tampered payload")
+    patch_downloader(monkeypatch, tampered)             # serves wrong content
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "MD5 mismatch" in result.error
+    assert state_raw(cdir) == before
+    assert not (cdir / "TestMod-1.0.zip").exists()
+
+
+# ---------------------------------------------------------------------------
+# C3: re-click recovery for a pending entry with a retained archive
+# ---------------------------------------------------------------------------
+
+def test_pending_retained_archive_completes_extraction_zero_network(
+    svc, tmp_path, monkeypatch
+):
+    """A failed extraction leaves the entry pending with the verified
+    archive retained; a re-click must finish the extraction from that
+    archive with zero network instead of re-downloading into the strict
+    no-clobber refusal."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)   # retained archive
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    session = patch_downloader(monkeypatch, zip_bytes)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "extracted_from_archive"
+    assert result.extracted is True
+    assert fake.calls == []                             # zero API calls
+    assert session.calls == []                          # zero CDN calls
+    assert (cdir / "Data" / "test.txt").read_bytes() == b"hello mods"
+    # The archive was not downloaded by this run, so it is kept; the entry
+    # is now downloaded and a further re-click dedupes with zero network.
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"
+
+    second = svc.add_nxm(uri(), mods_dir=cdir)
+    assert second.success
+    assert second.status == "already_downloaded"
+    assert fake.calls == []
+
+
+def test_pending_retained_corrupt_archive_refused_with_guidance(
+    svc, tmp_path, monkeypatch
+):
+    """A retained archive that fails sanity is never extracted and never
+    overwritten: the download path's strict no-clobber publish refuses
+    with actionable guidance and the file stays byte-identical."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(b"garbage-not-a-zip")
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert "Remove the file" in result.error
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == b"garbage-not-a-zip"
+    assert state_raw(cdir) == before                    # still pending
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+
+
+def test_pending_retained_archive_extraction_failure_stays_pending(
+    svc, tmp_path, monkeypatch
+):
+    """When the retained archive itself fails to extract, the entry stays
+    pending, the archive is kept, and the error points at import."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def boom(path, target):
+        raise service_module.ExtractionError("codec exploded")
+
+    monkeypatch.setattr(service_module, "extract_archive", boom)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be extracted" in result.error
+    assert "codec exploded" in result.error
+    assert f"nexus-dl import {cdir}" in result.error
+    assert fake.calls == []                             # still zero network
+    assert state_raw(cdir) == before
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes

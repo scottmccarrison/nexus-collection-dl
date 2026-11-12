@@ -887,3 +887,64 @@ def test_nxm_routing_error_notifies_with_default_notify(cli_env):
     assert summary == "nexus-dl: download failed"
     assert "No collection directory" in body
     assert "reason=routing" in nxm_log_file(cli_env).read_text()
+
+
+# ---------------------------------------------------------------------------
+# C2: the unexpected-error boundary redacts nxm:// URIs and literal secrets
+# ---------------------------------------------------------------------------
+
+def test_nxm_unexpected_failure_redacts_nxm_uri_and_literal_secrets(cli_env):
+    """Free-form exception text reaches the terminal and the notification
+    at the catch-all boundary, so the full redaction scope must run: the
+    raw nxm:// URI (any-scheme, with query), the resolved API key, and
+    the bare link key value must all be gone."""
+    link_key = "LinkKeySentinel-abc123"
+    api_key_value = "ApiKeySentinelValue-xyz789"
+    hostile = f"nxm://{GAME}/mods/1/files/2?key={link_key}&expires=1893456000"
+    FakeService.error = RuntimeError(
+        f"unexpected boom uri={hostile} apikey={api_key_value} key={link_key}"
+    )
+    result = CliRunner().invoke(
+        cli_module.main, ["--api-key", api_key_value, "nxm", hostile]
+    )  # default notify: CliRunner stdout is not a TTY
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    # Terminal output is clean
+    assert link_key not in result.output
+    assert api_key_value not in result.output
+    assert "1893456000" not in result.output
+    assert "nxm://" not in result.output
+    assert "[url redacted]" in result.output
+    assert "[redacted]" in result.output
+    # Notification body is clean
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert link_key not in body and api_key_value not in body
+    assert "nxm://" not in body and "1893456000" not in body
+    # Status log line carries the static reason only
+    content = nxm_log_file(cli_env).read_text()
+    assert " error " in content and "reason=error" in content
+    assert link_key not in content and api_key_value not in content
+
+
+# ---------------------------------------------------------------------------
+# C3: the extracted_from_archive outcome prints and notifies
+# ---------------------------------------------------------------------------
+
+def test_nxm_extracted_from_archive_prints_and_notifies(cli_env):
+    FakeService.result = NxmResult(
+        success=True, status="extracted_from_archive", game_domain=GAME,
+        mod_id=1, file_id=2, mod_name="Test Mod", filename="TestMod.zip",
+        collection_dir=cli_env["tmp_path"] / "col", extracted=True,
+    )
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2", "--notify"])
+    assert result.exit_code == 0, result.output
+    assert "retained archive" in result.output
+    assert "no download was needed" in result.output
+    assert cli_env["notifications"] == [
+        ("nexus-dl: download complete",
+         "Extracted Test Mod from the retained archive")
+    ]
+    content = nxm_log_file(cli_env).read_text()
+    assert " success " in content
+    assert "status=extracted_from_archive" in content   # same log shape

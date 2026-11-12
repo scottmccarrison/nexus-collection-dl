@@ -950,3 +950,84 @@ def test_install_rerun_rewrites_stale_entry(exe, cfg_path, tmp_path):
     assert "/old/venv" not in content
     # The saved previous default survives the reinstall untouched
     assert cfg.desktop["previous_default"] is None
+
+
+# ---------------------------------------------------------------------------
+# C2: sanitize_message strips any-scheme URIs carrying a query
+# ---------------------------------------------------------------------------
+
+def test_sanitize_message_strips_nxm_uri_with_query():
+    text = "boom nxm://skyrimspecialedition/mods/1/files/2?key=SECRETVALUE&expires=9 end"
+    out = handler_module.sanitize_message(text)
+    assert "SECRETVALUE" not in out
+    assert "nxm://" not in out
+    assert "key=" not in out
+    assert out == "boom [url redacted] end"
+
+
+def test_sanitize_message_keeps_bare_scheme_mentions():
+    text = "Collection nxm:// links are not supported."
+    assert handler_module.sanitize_message(text) == text
+
+
+def test_sanitize_message_strips_http_urls_as_before():
+    assert handler_module.sanitize_message(
+        "see https://x.example/page and http://y.example"
+    ) == "see [url redacted] and [url redacted]"
+
+
+# ---------------------------------------------------------------------------
+# C4: a failed reinstall over a working installation preserves it
+# ---------------------------------------------------------------------------
+
+class FailOnDefaultRunner(FakeRunner):
+    """Query succeeds; the 'xdg-mime default' registration step fails."""
+
+    def __call__(self, argv):
+        if argv[:2] == ["xdg-mime", "default"]:
+            self.calls.append(list(argv))
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+        return super().__call__(argv)
+
+
+def test_reinstall_failure_preserves_working_installation(exe, cfg_path, tmp_path):
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    entry_file = apps / DESKTOP_ENTRY_NAME
+    prior_content = build_desktop_entry_content("/usr/bin/nexus-dl")
+    entry_file.write_text(prior_content)
+    cfg = HandlerConfig(cfg_path)
+    cfg.desktop = {"installed": True, "entry_path": str(entry_file),
+                   "executable": "/usr/bin/nexus-dl",
+                   "previous_default": "vortex-nxm.desktop"}
+    runner = FailOnDefaultRunner(query_default=DESKTOP_ENTRY_NAME)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=apps, executable=exe)
+
+    with pytest.raises(DesktopEntryError):
+        inst.install()
+
+    # The working entry is restored to its prior contents, not deleted
+    assert entry_file.exists()
+    assert entry_file.read_text() == prior_content
+    # The MIME default was NOT flipped to the recorded previous handler:
+    # every 'xdg-mime default' call targets our entry (left as found).
+    default_calls = [c for c in runner.calls if c[:2] == ["xdg-mime", "default"]]
+    assert default_calls
+    assert all(c[2] == DESKTOP_ENTRY_NAME for c in default_calls)
+    assert "vortex-nxm.desktop" not in [c[2] for c in default_calls]
+    # Nothing persisted from the failed run
+    assert not cfg_path.exists()
+
+
+def test_fresh_install_failure_still_removes_entry(exe, cfg_path, tmp_path):
+    """Regression pin: with no prior entry, rollback still deletes the
+    entry this run created and restores the default found at start."""
+    runner = FakeRunner(query_default="vortex-nxm.desktop", fail={"xdg-mime"})
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+    with pytest.raises(DesktopEntryError):
+        inst.install()
+    assert not (tmp_path / "apps" / DESKTOP_ENTRY_NAME).exists()
+    assert not cfg_path.exists()

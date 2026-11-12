@@ -35,6 +35,11 @@ SUBPROCESS_TIMEOUT = 30
 
 _GAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _URL_RE = re.compile(r"https?://\S+")
+# Any-scheme URI carrying a query string: a raw nxm:// link embeds its
+# key/expires credentials there, so scheme-agnostic stripping is needed
+# wherever free-form exception text can reach the user (the http(s)
+# pattern above never matched nxm:// URIs).
+_SCHEME_URI_QUERY_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*\?\S*")
 
 # Characters the Desktop Entry Specification reserves in Exec values.
 _EXEC_RESERVED = set(" \t\n\"'\\><~|&;$*?#()`")
@@ -53,8 +58,15 @@ class DesktopEntryError(HandlerError):
 
 
 def sanitize_message(text: str) -> str:
-    """Strip URL-looking text so signed links never reach logs or notify."""
-    return _URL_RE.sub("[url redacted]", str(text))
+    """Strip URL-looking text so signed links never reach logs or notify.
+
+    Two patterns are removed: http(s) URLs (query or not) and any-scheme
+    URIs that carry a query string, notably raw nxm:// links whose query
+    holds the key/expires credentials. A bare scheme mention without a
+    query ("nxm:// links ...") is left intact.
+    """
+    out = _URL_RE.sub("[url redacted]", str(text))
+    return _SCHEME_URI_QUERY_RE.sub("[url redacted]", out)
 
 
 def config_dir() -> Path:
@@ -589,15 +601,34 @@ class DesktopInstaller:
         except (FileNotFoundError, subprocess.SubprocessError, OSError):
             pass
 
-    def _rollback(self, wrote_entry: bool) -> None:
-        """Undo a partial install: entry file out, default left as found."""
-        prior = self.config.desktop.get("previous_default")
-        if isinstance(prior, str) and prior:
+    def _rollback(
+        self,
+        wrote_entry: bool,
+        prior_content: str | None = None,
+        default_at_start: str | None = None,
+    ) -> None:
+        """Undo a partial install, leaving the system as this run found it.
+
+        The MIME default is restored to the value observed when THIS
+        install began (best-effort), never to the recorded previous
+        default: a reinstall over a working installation of ours must not
+        flip the default away on failure. An entry file that already
+        existed is restored to its prior contents, so a failed re-run
+        cannot destroy a working entry; only an entry this run created is
+        deleted.
+        """
+        if isinstance(default_at_start, str) and default_at_start:
             with contextlib.suppress(Exception):
-                self._runner(["xdg-mime", "default", prior, NXM_MIME_TYPE])
+                self._runner(
+                    ["xdg-mime", "default", default_at_start, NXM_MIME_TYPE]
+                )
         if wrote_entry:
-            with contextlib.suppress(OSError):
-                self.entry_path.unlink()
+            if prior_content is not None:
+                with contextlib.suppress(Exception):
+                    _atomic_write_text(self.entry_path, prior_content)
+            else:
+                with contextlib.suppress(OSError):
+                    self.entry_path.unlink()
 
     def install(self) -> Path:
         """Install the desktop entry and register it as the nxm handler.
@@ -612,6 +643,14 @@ class DesktopInstaller:
         self.entry_dir.mkdir(parents=True, exist_ok=True)
 
         current = self._query_default()
+        # Capture what a re-run must not destroy: the existing entry's
+        # contents and the default as found. Rollback restores exactly
+        # these, so a failed reinstall over a working installation leaves
+        # the working entry in place and the MIME default unchanged.
+        prior_content: str | None = None
+        if self.entry_path.exists():
+            with contextlib.suppress(OSError):
+                prior_content = self.entry_path.read_text()
         desktop = self.config.desktop
         # Save the previous default exactly once: a reinstall while we are
         # already the default must not record ourselves as "previous".
@@ -660,7 +699,7 @@ class DesktopInstaller:
             )
             self.config.save()
         except (DesktopEntryError, HandlerError, OSError, subprocess.SubprocessError):
-            self._rollback(wrote_entry)
+            self._rollback(wrote_entry, prior_content, current)
             raise
         return self.entry_path
 

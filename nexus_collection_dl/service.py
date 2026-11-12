@@ -176,7 +176,9 @@ class NxmResult:
     """
 
     success: bool
-    status: str  # downloaded, already_downloaded, saved_to_output, error
+    status: str
+    # downloaded, already_downloaded, extracted_from_archive,
+    # saved_to_output, error
     game_domain: str
     mod_id: int
     file_id: int
@@ -321,6 +323,19 @@ def _browser_suffix_match(logical_name: str, mod_id: Any, version: Any, stem: st
     return file_version[0].isdigit()
 
 
+# Same shape the downloader enforces (downloader._MD5_RE): only a
+# well-formed 32-hex-digit MD5 ever counts as a known checksum. A
+# malformed value would be silently skipped downstream, turning
+# "verify or refuse" into "publish unverified", so it is dropped at
+# ingestion instead of being carried around as if it were a hash.
+_MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+
+def _is_wellformed_md5(value: Any) -> bool:
+    """True only for a 32-hex-digit MD5 the downloader would enforce."""
+    return isinstance(value, str) and bool(_MD5_RE.match(value.strip()))
+
+
 def _expected_md5_maps(
     manifest_data: Any,
 ) -> tuple[dict[tuple[int, int], str], dict[str, str]]:
@@ -357,7 +372,10 @@ def _expected_md5_maps(
                 if isinstance(value, str) and value.strip():
                     md5 = value.strip().lower()
                     break
-            if not md5:
+            # A malformed hash is worse than no hash: downstream it would
+            # silently disable verification, so drop it here and treat the
+            # file as having no known checksum.
+            if not _is_wellformed_md5(md5):
                 continue
             mod_id = _as_int(entry.get("modId")) or _as_int(entry.get("modID"))
             file_id = _as_int(entry.get("fileID")) or _as_int(entry.get("fileId"))
@@ -387,7 +405,9 @@ def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
             continue
         key = (_as_int(mod.get("mod_id")), _as_int(mod.get("file_id")))
         md5 = by_identity.get(key)
-        if md5:
+        # Defense in depth: only a well-formed hash is ever attached, so a
+        # malformed value can never masquerade as a known checksum.
+        if _is_wellformed_md5(md5):
             mod["expected_md5"] = md5
 
 
@@ -1855,9 +1875,103 @@ class ModManagerService:
                 # normal path for a re-click after a successful download:
                 # the default flow deletes the archive once extraction is
                 # persisted, so a downloaded+extracted entry re-downloads
-                # (with full verification). The zero-network no-op above
-                # applies only while a valid archive is retained on disk
-                # (e.g. --no-extract runs or a failed extraction).
+                # (with full verification). Zero-network handling of a
+                # retained sane archive lives above (downloaded entries:
+                # already_downloaded no-op) and below (pending entries:
+                # extraction is completed from the archive).
+
+            if (
+                existing is not None
+                and existing.download_status == "pending_download"
+                and existing.filename
+                and not no_extract
+            ):
+                archive = target / existing.filename
+                if archive.is_file() and (
+                    archive.suffix.lower() not in _MAGIC_VERIFIED_SUFFIXES
+                    or sniff_archive_magic(archive) is not None
+                ):
+                    # Failed-extraction recovery with zero network: a
+                    # pending entry whose verified archive was retained on
+                    # disk finishes its extraction from that archive
+                    # instead of re-downloading into the strict no-clobber
+                    # refusal (the refusal would be guaranteed, because the
+                    # retained archive still occupies the destination).
+                    # This restores the recovery path a failed extraction
+                    # promises: "import or a re-click can finish the job".
+                    # The archive is kept, not deleted: this run did not
+                    # download it, and keeping it means a later re-click
+                    # dedupes to already_downloaded with zero network.
+                    progress(
+                        "extract", 0.5,
+                        f"Extracting retained archive {archive.name}...",
+                    )
+                    try:
+                        extract_archive(archive, target)
+                    except ExtractionError as e:
+                        # Entry stays pending and the archive stays put:
+                        # nothing was downloaded, nothing is overwritten.
+                        return self._nxm_failure(
+                            info,
+                            f"The retained archive at {archive} could not "
+                            f"be extracted: {e}. Run 'nexus-dl import "
+                            f"{target}' to retry, or remove the archive and "
+                            "click the download link again for a fresh "
+                            "copy.",
+                            collection_dir=target,
+                            mod_name=existing.name,
+                            filename=existing.filename,
+                        )
+                    existing.download_status = "downloaded"
+                    existing.browser_url = ""
+                    existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    try:
+                        state.save()
+                    except (OSError, StateError) as e:
+                        return self._nxm_failure(
+                            info,
+                            "Extraction from the retained archive succeeded "
+                            "but the collection state could not be saved: "
+                            f"{e}. Extracted files were left in place and "
+                            f"the archive is kept at {archive}. Fix the "
+                            "underlying problem (permissions, disk space) "
+                            f"and run 'nexus-dl import {target}'.",
+                            collection_dir=target,
+                            mod_name=existing.name,
+                            filename=existing.filename,
+                        )
+                    # Same post-save follow-ups as the download path:
+                    # truthful warnings on an otherwise successful result.
+                    warnings: list[str] = []
+                    try:
+                        self._maybe_sync_tracked(state)
+                    except Exception as e:
+                        warnings.append(f"Tracked-mod sync failed: {e}")
+                    if not no_load_order:
+                        progress("loadorder", 0.9, "Regenerating load order...")
+                        try:
+                            self._regen_load_order_from_state(target, state)
+                        except Exception as e:
+                            warnings.append(
+                                f"Load order regeneration failed: {e}. Run "
+                                f"'nexus-dl load-order {target}' to retry."
+                            )
+                    progress("done", 1.0, f"Extracted {existing.name}")
+                    return NxmResult(
+                        success=True,
+                        status="extracted_from_archive",
+                        game_domain=info.game_domain,
+                        mod_id=info.mod_id,
+                        file_id=info.file_id,
+                        mod_name=existing.name,
+                        filename=existing.filename,
+                        collection_dir=target,
+                        extracted=True,
+                        warnings=warnings,
+                    )
+                # Retained archive failed the sanity checks: fall through
+                # to the download path, where the strict no-clobber
+                # publish refuses to replace it with actionable guidance.
 
             progress("init", 0.05, "Validating API key...")
             account_error = self._nxm_account_error(info, collection_dir=target)
@@ -1937,18 +2051,22 @@ class ModManagerService:
             # API calls and no guaranteed hash when unavailable.
             _attach_expected_md5(state, [download_info])
             # Verified-before-publish is only real when there is something
-            # to verify against: with no positive byte size and no cached
-            # manifest MD5 the downloader would publish whatever arrived.
-            # Refuse the download instead (nothing is written); the
-            # browser-download + import workflow stays available.
-            if size_bytes <= 0 and not download_info.get("expected_md5"):
+            # to verify against: with no positive byte size and no
+            # well-formed cached manifest MD5 the downloader would publish
+            # whatever arrived (a malformed hash is silently skipped
+            # downstream, not enforced). Refuse the download instead
+            # (nothing is written); the browser-download + import workflow
+            # stays available.
+            if size_bytes <= 0 and not _is_wellformed_md5(
+                download_info.get("expected_md5")
+            ):
                 return self._nxm_failure(
                     info,
                     "Nexus Mods provided no file size and this collection "
-                    "has no cached checksum for this file, so the download "
-                    "could not be verified and nothing was written. "
-                    "Download the file in your browser and run 'nexus-dl "
-                    f"import {target}', or retry the link later.",
+                    "has no usable cached checksum for this file, so the "
+                    "download could not be verified and nothing was "
+                    "written. Download the file in your browser and run "
+                    f"'nexus-dl import {target}', or retry the link later.",
                     collection_dir=target,
                     mod_name=mod_name,
                     filename=filename,

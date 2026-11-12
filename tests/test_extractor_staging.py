@@ -155,3 +155,52 @@ def test_extracts_into_directory_with_special_characters(tmp_path):
     assert files == [target / "Data" / "payload.txt"]
     assert (target / "Data" / "payload.txt").read_bytes() == b"ok"
     assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
+
+
+def test_mid_publication_failure_leaves_earlier_files_and_cleans_staging(
+    tmp_path, monkeypatch
+):
+    """Pinned limitation: publication moves staged files one by one, so a
+    failure partway leaves the already-moved files published while the
+    staging directory is cleaned up and the error surfaces. Re-running
+    extraction is safe: moves overwrite the earlier subset."""
+    archive = make_zip(
+        tmp_path / "Mod-1.0.zip",
+        {
+            "Data/one.txt": b"one",
+            "Data/two.txt": b"two",
+            "Data/three.txt": b"three",
+        },
+    )
+    target = tmp_path / "mods"
+    target.mkdir()
+
+    real_move = extractor.shutil.move
+    calls = []
+
+    def failing_move(src, dst):
+        calls.append((src, dst))
+        if len(calls) == 2:
+            raise OSError("device exploded mid-move")
+        return real_move(src, dst)
+
+    monkeypatch.setattr(extractor.shutil, "move", failing_move)
+
+    with pytest.raises(ExtractionError) as excinfo:
+        extract_archive(archive, target)
+    assert "device exploded mid-move" in str(excinfo.value)
+
+    # The first file was already published; the rest never moved
+    published = sorted(p for p in target.rglob("*") if p.is_file())
+    assert len(published) == 1
+    assert published[0].read_bytes() in (b"one", b"two", b"three")
+    # Staging is fully cleaned up even on this failure path
+    assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
+
+    # Re-running the same extraction completes and overwrites the subset
+    result = extract_archive(archive, target)
+    assert len(result) == 3
+    assert (target / "Data" / "one.txt").read_bytes() == b"one"
+    assert (target / "Data" / "two.txt").read_bytes() == b"two"
+    assert (target / "Data" / "three.txt").read_bytes() == b"three"
+    assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
