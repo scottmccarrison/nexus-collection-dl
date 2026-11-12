@@ -965,8 +965,19 @@ def test_sanitize_message_strips_nxm_uri_with_query():
     assert out == "boom [url redacted] end"
 
 
-def test_sanitize_message_keeps_bare_scheme_mentions():
+def test_sanitize_message_strips_bare_nxm_mentions():
+    # Security-driven change (supersedes the earlier "bare nxm:// kept"
+    # expectation): nxm:// URIs are stripped by scheme whether or not
+    # they carry a query, because the query is where link credentials
+    # live and no part of a raw link is worth the risk of a near-miss.
     text = "Collection nxm:// links are not supported."
+    out = handler_module.sanitize_message(text)
+    assert "nxm://" not in out
+    assert out == "Collection [url redacted] links are not supported."
+
+
+def test_sanitize_message_keeps_other_bare_scheme_mentions():
+    text = "an ftp:// mirror and a steam://game link"
     assert handler_module.sanitize_message(text) == text
 
 
@@ -1031,3 +1042,76 @@ def test_fresh_install_failure_still_removes_entry(exe, cfg_path, tmp_path):
         inst.install()
     assert not (tmp_path / "apps" / DESKTOP_ENTRY_NAME).exists()
     assert not cfg_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# D1/D3: rollback never destroys what it cannot snapshot and never strands
+# the MIME default pointing at a deleted entry
+# ---------------------------------------------------------------------------
+
+def test_install_aborts_when_existing_entry_unreadable(exe, cfg_path, tmp_path,
+                                                       monkeypatch):
+    """A pre-existing entry that cannot be read aborts the install before
+    ANY mutation: never replace what cannot be snapshotted for rollback."""
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    entry_file = apps / DESKTOP_ENTRY_NAME
+    entry_file.write_bytes(b"prior bytes on disk")
+
+    real_read_text = Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self == entry_file:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    runner = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=apps, executable=exe)
+
+    with pytest.raises(DesktopEntryError, match="could not"):
+        inst.install()
+
+    assert entry_file.read_bytes() == b"prior bytes on disk"   # untouched
+    # Nothing was changed: no default registration, no config write
+    assert not [c for c in runner.calls if c[:2] == ["xdg-mime", "default"]]
+    assert not cfg_path.exists()
+
+
+def test_failed_install_without_prior_default_keeps_registered_entry(
+    exe, cfg_path, tmp_path, monkeypatch
+):
+    """Registration succeeded but the config save failed and there was no
+    prior default: the entry must be KEPT, because the MIME default now
+    points at it and xdg-mime cannot unset a default. Deleting it would
+    strand a dangling registration with no working handler."""
+    runner = FakeRunner(query_default="")            # nothing registered before
+    cfg = HandlerConfig(cfg_path)
+
+    def fail_save(self):
+        raise HandlerError("Could not write handler config: disk on fire")
+
+    monkeypatch.setattr(HandlerConfig, "save", fail_save)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+
+    with pytest.raises(DesktopEntryError) as excinfo:
+        inst.install()
+
+    entry = tmp_path / "apps" / DESKTOP_ENTRY_NAME
+    assert entry.exists()                            # kept, not stranded
+    assert entry.read_text() == build_desktop_entry_content(exe.resolve())
+    message = str(excinfo.value)
+    assert "KEPT" in message                         # honest about the state
+    assert "disk on fire" in message                 # real failure disclosed
+    assert "handler uninstall" in message            # way out is named
+    # The default was registered as ours and never flipped elsewhere
+    assert runner.has_call("xdg-mime", "default", DESKTOP_ENTRY_NAME,
+                           NXM_MIME_TYPE)
+    assert not [c for c in runner.calls
+                if c[:2] == ["xdg-mime", "default"]
+                and c[2] != DESKTOP_ENTRY_NAME]
+    assert not cfg_path.exists()                     # config not saved

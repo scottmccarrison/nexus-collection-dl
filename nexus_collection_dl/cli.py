@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import click
 from rich.console import Console
@@ -762,24 +762,48 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
         pass  # best-effort logging: a broken log must never break nxm
 
 
+def _secret_variants(value: str) -> list[str]:
+    """Every shape one literal secret can realistically appear in.
+
+    Literal redaction is exact and case-sensitive, and free-form
+    exception text can carry a credential raw, percent-encoded (either
+    hex case), or case-varied. Keys are long opaque strings, so
+    case-folded variants cannot collide with ordinary words.
+    """
+    encoded = quote(value, safe="")
+    variants: list[str] = []
+    for form in (value, encoded):
+        for cased in (form, form.lower(), form.upper()):
+            if cased and cased not in variants:
+                variants.append(cased)
+    return variants
+
+
 def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
     """Literal secrets to redact from unexpected-exception text.
 
     The catch-all boundary prints and notifies free-form exception text,
     which could embed the resolved API key or the raw URI's key/expires
-    query values verbatim. Both join the redaction scope here; values are
-    never displayed, only used for replacement.
+    query values verbatim, in percent-encoded form, or case-varied. Each
+    secret joins the redaction scope in all of those shapes (see
+    _secret_variants). Values are never displayed, only used for
+    replacement.
     """
-    secrets: list = []
+    base: list = []
     api_key = (ctx.obj or {}).get("api_key")
     if api_key:
-        secrets.append(api_key)
+        base.append(api_key)
     try:
         query = urlsplit(uri).query
         for name in ("key", "expires"):
-            secrets.extend(v for v in parse_qs(query).get(name, []) if v)
+            base.extend(v for v in parse_qs(query).get(name, []) if v)
     except ValueError:
         pass
+    secrets: list = []
+    for value in base:
+        for variant in _secret_variants(str(value)):
+            if variant not in secrets:
+                secrets.append(variant)
     return tuple(secrets)
 
 

@@ -35,10 +35,15 @@ SUBPROCESS_TIMEOUT = 30
 
 _GAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$")
 _URL_RE = re.compile(r"https?://\S+")
-# Any-scheme URI carrying a query string: a raw nxm:// link embeds its
-# key/expires credentials there, so scheme-agnostic stripping is needed
-# wherever free-form exception text can reach the user (the http(s)
-# pattern above never matched nxm:// URIs).
+# nxm:// URIs are stripped by scheme, with or without a query: the
+# credentials normally ride in the query, but a query-less URI still
+# leaks account/mod identity and a hostile message could carry them in
+# the path or userinfo. Case-insensitive: URI schemes are.
+_NXM_URI_RE = re.compile(r"nxm://\S*", re.IGNORECASE)
+# Any-scheme URI carrying a query string: a raw link embeds its
+# credentials there, so scheme-agnostic stripping is needed wherever
+# free-form exception text can reach the user (the http(s) pattern
+# above never matched non-http schemes).
 _SCHEME_URI_QUERY_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*\?\S*")
 
 # Characters the Desktop Entry Specification reserves in Exec values.
@@ -60,12 +65,15 @@ class DesktopEntryError(HandlerError):
 def sanitize_message(text: str) -> str:
     """Strip URL-looking text so signed links never reach logs or notify.
 
-    Two patterns are removed: http(s) URLs (query or not) and any-scheme
-    URIs that carry a query string, notably raw nxm:// links whose query
-    holds the key/expires credentials. A bare scheme mention without a
-    query ("nxm:// links ...") is left intact.
+    Three patterns are removed: http(s) URLs (query or not), nxm:// URIs
+    in ANY form (with or without a query), and any other scheme's URI
+    that carries a query string. A bare non-nxm scheme mention without a
+    query ("an ftp:// mirror") is left intact; nxm:// is stripped
+    wholesale because its query is exactly where link credentials live
+    and no part of a raw link is worth showing.
     """
     out = _URL_RE.sub("[url redacted]", str(text))
+    out = _NXM_URI_RE.sub("[url redacted]", out)
     return _SCHEME_URI_QUERY_RE.sub("[url redacted]", out)
 
 
@@ -606,7 +614,8 @@ class DesktopInstaller:
         wrote_entry: bool,
         prior_content: str | None = None,
         default_at_start: str | None = None,
-    ) -> None:
+        registered: bool = False,
+    ) -> bool:
         """Undo a partial install, leaving the system as this run found it.
 
         The MIME default is restored to the value observed when THIS
@@ -616,41 +625,75 @@ class DesktopInstaller:
         existed is restored to its prior contents, so a failed re-run
         cannot destroy a working entry; only an entry this run created is
         deleted.
+
+        One exception, because xdg-mime cannot unset a default: when this
+        run registered our entry and there is no other default to restore
+        to, the entry is KEPT even though the install failed. Deleting it
+        would strand the MIME default pointing at a missing file (no
+        working handler, dangling registration). Returns True when the
+        entry was kept for this reason, so the caller can report the
+        state honestly; False otherwise.
         """
         if isinstance(default_at_start, str) and default_at_start:
             with contextlib.suppress(Exception):
                 self._runner(
                     ["xdg-mime", "default", default_at_start, NXM_MIME_TYPE]
                 )
-        if wrote_entry:
-            if prior_content is not None:
-                with contextlib.suppress(Exception):
-                    _atomic_write_text(self.entry_path, prior_content)
-            else:
-                with contextlib.suppress(OSError):
-                    self.entry_path.unlink()
+        if not wrote_entry:
+            return False
+        if prior_content is not None:
+            with contextlib.suppress(Exception):
+                _atomic_write_text(self.entry_path, prior_content)
+            return False
+        # After the restore attempt above, does the default point at our
+        # entry? Either nothing else was registered and this run made
+        # ours the default, or ours already was the default.
+        default_is_ours = registered and (
+            not default_at_start or default_at_start == DESKTOP_ENTRY_NAME
+        )
+        if default_is_ours:
+            return True
+        with contextlib.suppress(OSError):
+            self.entry_path.unlink()
+        return False
 
     def install(self) -> Path:
         """Install the desktop entry and register it as the nxm handler.
 
         Honest and rollback-safe: any registration failure removes the
-        entry file again, best-effort restores the previous default, and
-        leaves the on-disk config untouched.
+        entry file again, best-effort restores the default exactly as
+        this run found it, and leaves the on-disk config untouched. A
+        pre-existing entry that cannot be read aborts the install before
+        anything is written: never replace what cannot be snapshotted
+        for rollback. When the failure happens after registration
+        succeeded and there is no other default to restore, the entry is
+        kept instead of deleted so the MIME default never points at a
+        missing file, and the error says so.
         """
         exe = self.resolve_executable()
         # Raises before any write when the path cannot be represented.
         content = build_desktop_entry_content(exe)
         self.entry_dir.mkdir(parents=True, exist_ok=True)
 
-        current = self._query_default()
         # Capture what a re-run must not destroy: the existing entry's
-        # contents and the default as found. Rollback restores exactly
-        # these, so a failed reinstall over a working installation leaves
-        # the working entry in place and the MIME default unchanged.
+        # contents, read BEFORE anything is modified. An unreadable
+        # pre-existing entry is a hard abort: replacing a file we could
+        # not snapshot means a failed rollback could only delete it.
         prior_content: str | None = None
         if self.entry_path.exists():
-            with contextlib.suppress(OSError):
+            try:
                 prior_content = self.entry_path.read_text()
+            except (OSError, ValueError) as e:
+                detail = getattr(e, "strerror", None) or type(e).__name__
+                raise DesktopEntryError(
+                    f"The existing desktop entry {self.entry_path} could "
+                    f"not be read ({detail}). Refusing to replace an entry "
+                    "that cannot be backed up for rollback. Fix its "
+                    "permissions or remove it manually, then re-run "
+                    "'nexus-dl handler install'. Nothing was changed."
+                ) from None
+
+        current = self._query_default()
         desktop = self.config.desktop
         # Save the previous default exactly once: a reinstall while we are
         # already the default must not record ourselves as "previous".
@@ -658,6 +701,7 @@ class DesktopInstaller:
             desktop["previous_default"] = None if current == DESKTOP_ENTRY_NAME else current
 
         wrote_entry = False
+        registered = False
         try:
             _atomic_write_text(self.entry_path, content)
             wrote_entry = True
@@ -689,6 +733,7 @@ class DesktopInstaller:
                     "xdg-mime default failed"
                     + (f": {sanitize_message(detail)}" if detail else ".")
                 )
+            registered = True
             desktop.update(
                 {
                     "installed": True,
@@ -698,8 +743,23 @@ class DesktopInstaller:
                 }
             )
             self.config.save()
-        except (DesktopEntryError, HandlerError, OSError, subprocess.SubprocessError):
-            self._rollback(wrote_entry, prior_content, current)
+        except (DesktopEntryError, HandlerError, OSError, subprocess.SubprocessError) as e:
+            kept = self._rollback(wrote_entry, prior_content, current, registered)
+            if kept:
+                # Registration succeeded and no other default exists to
+                # restore: the entry was kept so the MIME default does not
+                # dangle. Report the real failure and the kept state.
+                raise DesktopEntryError(
+                    "The desktop entry was written and registered as the "
+                    "nxm:// handler, but the install did not complete: "
+                    f"{sanitize_message(str(e))}. The entry at "
+                    f"{self.entry_path} was KEPT because it is now the "
+                    "registered default and xdg-mime cannot unset one; the "
+                    "handler configuration was not saved. Fix the "
+                    "underlying problem (permissions, disk space) and "
+                    "re-run 'nexus-dl handler install' to finish, or run "
+                    "'nexus-dl handler uninstall' to remove it."
+                ) from e
             raise
         return self.entry_path
 

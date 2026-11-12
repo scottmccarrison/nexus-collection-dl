@@ -359,6 +359,7 @@ def test_duplicate_with_corrupt_archive_refuses_to_replace(svc, tmp_path, monkey
     assert not result.success
     assert "refusing to overwrite" in result.error
     assert "--output" in result.error                 # actionable guidance
+    assert f"nexus-dl import {cdir}" in result.error  # names the import recovery
     assert (cdir / "TestMod-1.0.zip").read_bytes() == b"garbage-not-a-zip"
     assert state_raw(cdir) == before                  # entry still downloaded
     assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
@@ -1477,13 +1478,15 @@ def test_zero_size_md5_mismatch_refused(svc, tmp_path, monkeypatch):
 # C3: re-click recovery for a pending entry with a retained archive
 # ---------------------------------------------------------------------------
 
-def test_pending_retained_archive_completes_extraction_zero_network(
+def test_pending_retained_archive_completes_extraction_without_redownload(
     svc, tmp_path, monkeypatch
 ):
     """A failed extraction leaves the entry pending with the verified
     archive retained; a re-click must finish the extraction from that
-    archive with zero network instead of re-downloading into the strict
-    no-clobber refusal."""
+    archive with no download traffic instead of re-downloading into the
+    strict no-clobber refusal. (fake.calls stays empty because the
+    collection has track-sync disabled; with it enabled the post-save
+    tracked-mod sync may make API calls, but never a file download.)"""
     zip_bytes = make_zip()
     cdir = make_collection(tmp_path, mods=[pending_entry()])
     (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)   # retained archive
@@ -1531,6 +1534,7 @@ def test_pending_retained_corrupt_archive_refused_with_guidance(
     assert not result.success
     assert "refusing to overwrite" in result.error
     assert "Remove the file" in result.error
+    assert f"nexus-dl import {cdir}" in result.error  # import recovery named
     assert (cdir / "TestMod-1.0.zip").read_bytes() == b"garbage-not-a-zip"
     assert state_raw(cdir) == before                    # still pending
     assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
@@ -1563,3 +1567,152 @@ def test_pending_retained_archive_extraction_failure_stays_pending(
     assert fake.calls == []                             # still zero network
     assert state_raw(cdir) == before
     assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+
+
+# ---------------------------------------------------------------------------
+# D4: recovery-path polish: offline integrity preflight, failure branches
+# ---------------------------------------------------------------------------
+
+def test_recovery_verifies_retained_archive_against_cached_md5(
+    svc, tmp_path, monkeypatch
+):
+    """When the cached manifest knows a well-formed hash for this
+    identity, the retained archive must match it before the no-download
+    recovery runs (the state stores no expected byte size, so the hash
+    is the offline integrity datum)."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    _state_with_manifest_md5(cdir, hashlib.md5(zip_bytes).hexdigest())
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    session = patch_downloader(monkeypatch, zip_bytes)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "extracted_from_archive"
+    assert fake.calls == [] and session.calls == []
+    assert (cdir / "Data" / "test.txt").exists()
+
+
+def test_recovery_rejects_retained_archive_failing_cached_md5(
+    svc, tmp_path, monkeypatch
+):
+    """A retained archive whose bytes contradict the cached manifest hash
+    is not trusted: nothing is extracted from it. The fresh download then
+    fails verification itself (served bytes match neither the hash nor
+    the size), so the retained file and the state stay untouched."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    other_md5 = hashlib.md5(b"something else entirely").hexdigest()
+    _state_with_manifest_md5(cdir, other_md5)
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "MD5 mismatch" in result.error
+    assert not (cdir / "Data" / "test.txt").exists()   # never extracted
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+    assert state_raw(cdir) == before                   # still pending
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+
+
+def test_recovery_hash_mismatch_verified_download_still_refused(
+    svc, tmp_path, monkeypatch
+):
+    """Even when the fresh download fully verifies against the cached
+    hash and size, the untrusted retained archive is never replaced: the
+    strict no-clobber publish refuses with import guidance."""
+    retained = make_zip()
+    replacement = b"something else entirely"
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(retained)
+    _state_with_manifest_md5(cdir, hashlib.md5(replacement).hexdigest())
+    meta = files_meta(retained)
+    meta[0]["size_in_bytes"] = len(replacement)        # matches the payload
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    patch_downloader(monkeypatch, replacement)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert f"nexus-dl import {cdir}" in result.error
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == retained
+    assert state_raw(cdir) == before
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+
+
+def test_recovery_save_failure_reports_and_keeps_everything(
+    svc, tmp_path, monkeypatch
+):
+    """Recovery failure branch: extraction succeeded but the completion
+    could not be persisted. Never claim completion; extracted files and
+    the archive stay, on-disk state stays pending."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
+
+    def fail_save(self):
+        raise StateError("disk on fire")
+
+    monkeypatch.setattr(CollectionState, "save", fail_save)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be saved" in result.error
+    assert "disk on fire" in result.error
+    assert f"nexus-dl import {cdir}" in result.error
+    assert fake.calls == []                            # no download traffic
+    assert (cdir / "Data" / "test.txt").exists()       # honest about extraction
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes   # archive kept
+    assert state_raw(cdir) == before                   # on-disk still pending
+
+
+def test_recovery_warnings_are_truthful_on_success(svc, tmp_path, monkeypatch):
+    """Recovery warning branches: tracked-sync and load-order failures
+    after the persisted completion are truthful warnings on a successful
+    result, never crashes."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    def track_boom(self, state):
+        raise RuntimeError("track exploded")
+
+    def lo_boom(self, target, state):
+        raise RuntimeError("loot exploded")
+
+    monkeypatch.setattr(
+        service_module.ModManagerService, "_maybe_sync_tracked", track_boom
+    )
+    monkeypatch.setattr(
+        service_module.ModManagerService, "_regen_load_order_from_state", lo_boom
+    )
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "extracted_from_archive"
+    assert len(result.warnings) == 2
+    assert any("Tracked-mod sync failed" in w for w in result.warnings)
+    assert any("Load order regeneration failed" in w for w in result.warnings)
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"

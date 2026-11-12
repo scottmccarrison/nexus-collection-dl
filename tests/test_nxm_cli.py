@@ -117,6 +117,10 @@ def cli_env(monkeypatch, tmp_path):
     # Pin the state dir too: nxm runs append their status log there, and
     # tests must never write into the host's ~/.local/state.
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    # Pin the data dir as well: the desktop entry lives under
+    # ~/.local/share/applications, and a handler installed on the host
+    # must never leak into CLI test assertions (or be modified by them).
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     # Key resolution must be test-controlled: a NEXUS_API_KEY exported on
     # the host (e.g. from .bashrc) must never leak into CLI tests.
     monkeypatch.delenv("NEXUS_API_KEY", raising=False)
@@ -948,3 +952,62 @@ def test_nxm_extracted_from_archive_prints_and_notifies(cli_env):
     content = nxm_log_file(cli_env).read_text()
     assert " success " in content
     assert "status=extracted_from_archive" in content   # same log shape
+
+
+# ---------------------------------------------------------------------------
+# D2: boundary redaction covers encoded/case-varied secrets and query-less
+# nxm:// URIs
+# ---------------------------------------------------------------------------
+
+def test_nxm_boundary_redacts_encoded_and_case_variants(cli_env):
+    """Literal redaction is exact and case-sensitive, so the boundary
+    scope carries every realistic shape of each secret: raw,
+    percent-encoded (upper and lower hex), and case-folded. Obviously
+    fake fixtures; the assertions are on their ABSENCE."""
+    from urllib.parse import quote
+
+    link_key = "FakeLinkKey-abc123/xyz+789"
+    api_key_value = "FakeApiKeyValue-XYZ789"
+    encoded_key = quote(link_key, safe="")     # FakeLinkKey-abc123%2Fxyz%2B789
+    hostile = f"nxm://{GAME}/mods/1/files/2?key={encoded_key}&expires=1893456000"
+    FakeService.error = RuntimeError(
+        f"boom raw={link_key} enc={encoded_key} "
+        f"enclower={encoded_key.lower()} encupper={encoded_key.upper()} "
+        f"apiupper={api_key_value.upper()} apilower={api_key_value.lower()}"
+    )
+    result = CliRunner().invoke(
+        cli_module.main, ["--api-key", api_key_value, "nxm", hostile]
+    )
+    assert result.exit_code == 1
+    fragments = (
+        link_key, encoded_key, encoded_key.lower(), encoded_key.upper(),
+        api_key_value, api_key_value.upper(), api_key_value.lower(),
+        "nxm://", "key=",
+    )
+    for fragment in fragments:
+        assert fragment not in result.output
+    assert "[redacted]" in result.output
+    summary, body = cli_env["notifications"][0]
+    for fragment in fragments:
+        assert fragment not in body
+    content = nxm_log_file(cli_env).read_text()
+    for fragment in fragments:
+        assert fragment not in content
+    assert "reason=error" in content
+
+
+def test_nxm_boundary_strips_queryless_nxm_uri(cli_env):
+    """An nxm:// URI without any query still leaks identity and is
+    stripped by scheme at the boundary (terminal, notification, log)."""
+    FakeService.error = RuntimeError(
+        f"unexpected failure while handling nxm://{GAME}/mods/1/files/2 today"
+    )
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2"])
+    assert result.exit_code == 1
+    assert "nxm://" not in result.output
+    assert GAME not in result.output
+    assert "[url redacted]" in result.output
+    summary, body = cli_env["notifications"][0]
+    assert "nxm://" not in body and GAME not in body
+    content = nxm_log_file(cli_env).read_text()
+    assert "nxm://" not in content and GAME not in content

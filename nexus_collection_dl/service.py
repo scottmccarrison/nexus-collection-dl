@@ -1887,21 +1887,37 @@ class ModManagerService:
                 and not no_extract
             ):
                 archive = target / existing.filename
-                if archive.is_file() and (
-                    archive.suffix.lower() not in _MAGIC_VERIFIED_SUFFIXES
-                    or sniff_archive_magic(archive) is not None
+                # Offline integrity preflight on top of the magic check.
+                # The state stores no expected byte size, so the cached
+                # manifest's identity-scoped hash is the only expected-
+                # content datum available without network (the same
+                # verification 'import' uses): when a well-formed hash is
+                # known, the retained bytes must match it, otherwise the
+                # archive is not trusted for extraction.
+                by_identity_md5, _ = _expected_md5_maps(state.manifest_data)
+                expected_md5 = by_identity_md5.get((info.mod_id, info.file_id))
+                if (
+                    archive.is_file()
+                    and (
+                        archive.suffix.lower() not in _MAGIC_VERIFIED_SUFFIXES
+                        or sniff_archive_magic(archive) is not None
+                    )
+                    and (expected_md5 is None or _file_md5(archive) == expected_md5)
                 ):
-                    # Failed-extraction recovery with zero network: a
-                    # pending entry whose verified archive was retained on
-                    # disk finishes its extraction from that archive
+                    # Failed-extraction recovery with no download traffic:
+                    # a pending entry whose verified archive was retained
+                    # on disk finishes its extraction from that archive
                     # instead of re-downloading into the strict no-clobber
                     # refusal (the refusal would be guaranteed, because the
                     # retained archive still occupies the destination).
                     # This restores the recovery path a failed extraction
                     # promises: "import or a re-click can finish the job".
-                    # The archive is kept, not deleted: this run did not
-                    # download it, and keeping it means a later re-click
-                    # dedupes to already_downloaded with zero network.
+                    # No file download happens; when track-sync is enabled
+                    # the post-save tracked-mod sync below may still make
+                    # API calls. The archive is kept, not deleted: this run
+                    # did not download it, and keeping it means a later
+                    # re-click dedupes to already_downloaded with zero
+                    # network.
                     progress(
                         "extract", 0.5,
                         f"Extracting retained archive {archive.name}...",
@@ -1969,9 +1985,11 @@ class ModManagerService:
                         extracted=True,
                         warnings=warnings,
                     )
-                # Retained archive failed the sanity checks: fall through
-                # to the download path, where the strict no-clobber
-                # publish refuses to replace it with actionable guidance.
+                # Retained archive failed the sanity checks (missing
+                # content, bad magic, or a known-hash mismatch): fall
+                # through to the download path, where the strict
+                # no-clobber publish refuses to replace it with
+                # actionable guidance.
 
             progress("init", 0.05, "Validating API key...")
             account_error = self._nxm_account_error(info, collection_dir=target)
@@ -2022,6 +2040,12 @@ class ModManagerService:
                     collection_dir=target,
                     filename=filename,
                 )
+            # When this file's own artifact still occupies the destination
+            # it failed the sanity checks above (corrupt, unreadable, or a
+            # dangling link): the strict no-clobber publish is guaranteed
+            # to refuse the fresh download, so the refusal below is
+            # extended with the recovery steps for exactly that situation.
+            corrupt_owned_dest = dest_existed and owned_by_this
 
             try:
                 size_bytes = _metadata_size_bytes(selected)
@@ -2103,8 +2127,18 @@ class ModManagerService:
             except DownloadError as e:
                 # State is untouched and any previous files are intact:
                 # a failed download never claims completion.
+                message = str(e)
+                if corrupt_owned_dest and "refusing to overwrite" in message:
+                    message += (
+                        " The existing file is this collection's own "
+                        "archive for this download, and it failed the "
+                        "sanity checks (corrupt or unreadable). Remove it "
+                        "and click the download link again, or download "
+                        "the file in your browser and run 'nexus-dl "
+                        f"import {target}'."
+                    )
                 return self._nxm_failure(
-                    info, str(e), collection_dir=target,
+                    info, message, collection_dir=target,
                     mod_name=mod_name, filename=filename,
                 )
 
