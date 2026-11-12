@@ -66,11 +66,17 @@ def _secret_pattern(secret: str, require_encoded: bool = False) -> "re.Pattern[s
     at one or more character positions: this redacts encoded runs of
     even very short secrets without ever matching their bare literal
     spelling in ordinary prose.
+
+    Scope note: a twice-percent-encoded reflection (e.g. '%2541' for
+    'A') is out of scope. Query values are decoded exactly once, so an
+    encoding of an encoding cannot occur in a real credential value.
     """
     char_alts: list[tuple[str, list[str]]] = []
     for ch in secret:
         encodings: list[str] = []
-        for form in {ch, ch.lower(), ch.upper()}:
+        # sorted() keeps the compiled pattern text deterministic across
+        # hash seeds (set iteration order is randomized).
+        for form in sorted({ch, ch.lower(), ch.upper()}):
             encoded = "".join(f"%{byte:02x}" for byte in form.encode("utf-8"))
             if encoded not in encodings:
                 encodings.append(encoded)
@@ -123,6 +129,12 @@ def redact_encoded_secret_forms(text: str, secrets: Iterable[Any]) -> str:
     length-independent companion to redact_literal_values for callers
     that must not mangle ordinary prose with short secrets (an encoded
     run like '%6b%39' cannot be ordinary prose).
+
+    Cost note: the encoded-required union expands one alternative per
+    character position, so the compiled pattern grows quadratically
+    with the secret length. Only short secrets are safe to pass; the
+    sole caller (the typed-branch boundary in cli) bounds them below
+    its short-secret floor.
     """
     out = str(text)
     for secret in secrets:

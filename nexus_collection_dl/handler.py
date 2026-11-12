@@ -618,7 +618,7 @@ class DesktopInstaller:
         default_at_start: str | None = None,
         registered: bool = False,
         registration_uncertain: bool = False,
-    ) -> bool:
+    ) -> str:
         """Undo a partial install, leaving the system as this run found it.
 
         The MIME default is restored to the value observed when THIS
@@ -636,8 +636,13 @@ class DesktopInstaller:
         attempt when possible; when the query is unavailable, a
         successful registration (or an indeterminate one, e.g. a timeout
         that may have applied) wins over the missing answer and the
-        entry is kept. Returns True when the entry was kept for this
-        reason, so the caller can report the state honestly.
+        entry is kept. Returns a keep-reason string ("" when the entry
+        was not kept) so the caller can report the state honestly:
+        "query-confirmed" when a live query showed the effective default
+        points at this run's entry, "registered" when this run's
+        registration succeeded but could not be re-queried, and
+        "indeterminate" when only a timed-out registration with no query
+        answer keeps the entry.
         """
         if isinstance(default_at_start, str) and default_at_start:
             try:
@@ -647,11 +652,11 @@ class DesktopInstaller:
             except Exception:
                 pass  # best-effort; the query below decides what is safe
         if not wrote_entry:
-            return False
+            return ""
         if prior_content is not None:
             with contextlib.suppress(Exception):
                 _atomic_write_text(self.entry_path, prior_content)
-            return False
+            return ""
         # Decide from the best evidence available whether the effective
         # default points at our entry: a live query first, inference from
         # this run's outcome when the query cannot run.
@@ -667,21 +672,20 @@ class DesktopInstaller:
         except Exception:
             query_ran = False
         if query_ran and effective is not None:
-            points_at_ours = effective == DESKTOP_ENTRY_NAME
+            if effective == DESKTOP_ENTRY_NAME:
+                return "query-confirmed"
         elif registered:
             # A confirmed registration outranks an unavailable or empty
             # query answer: fail safe and keep the entry.
-            points_at_ours = True
-        else:
+            return "registered"
+        elif registration_uncertain and not query_ran:
             # Only an indeterminate registration (timeout) with no query
             # available keeps the entry; otherwise this run never became
             # the default and deleting is safe.
-            points_at_ours = registration_uncertain and not query_ran
-        if points_at_ours:
-            return True
+            return "indeterminate"
         with contextlib.suppress(OSError):
             self.entry_path.unlink()
-        return False
+        return ""
 
     def install(self) -> Path:
         """Install the desktop entry and register it as the nxm handler.
@@ -791,28 +795,47 @@ class DesktopInstaller:
             )
             self.config.save()
         except (DesktopEntryError, HandlerError, OSError, subprocess.SubprocessError) as e:
-            kept = self._rollback(
+            keep_reason = self._rollback(
                 wrote_entry, prior_content, current,
                 registered, registration_uncertain,
             )
             base = sanitize_message(str(e)).strip()
             if base and not base.endswith("."):
                 base += "."
-            if kept:
-                # The effective default points at the entry this run
-                # wrote (or, after a timeout, could not be confirmed to
-                # point elsewhere), so the entry was kept. State exactly
-                # which situation applies and what uninstall will and
-                # will not clear.
-                if registered:
+            if keep_reason:
+                # The entry was kept because the effective default
+                # points at it, or could not be confirmed to point
+                # elsewhere. State exactly which situation applies and
+                # what uninstall will and will not clear. Only the
+                # indeterminate note mentions a timeout or an
+                # unconfirmed outcome; a live query confirmation
+                # outranks whatever the registration attempt did.
+                if keep_reason == "query-confirmed":
                     registration_note = (
                         "the effective nxm:// default points at it"
                     )
-                else:
+                    strand_note = (
+                        "deleting the entry would strand the "
+                        "registration with no handler to run"
+                    )
+                elif keep_reason == "registered":
+                    registration_note = (
+                        "this run registered it as the nxm:// default"
+                    )
+                    strand_note = (
+                        "deleting the entry would strand the "
+                        "registration with no handler to run"
+                    )
+                else:  # "indeterminate"
                     registration_note = (
                         "the registration attempt timed out, so whether "
-                        "the default points at it could not be confirmed "
-                        "either way"
+                        "the default points at it could not be "
+                        "confirmed either way"
+                    )
+                    strand_note = (
+                        "deleting the entry while the default may point "
+                        "at it would strand the registration with no "
+                        "handler to run"
                     )
                 prior = desktop.get("previous_default")
                 if isinstance(prior, str) and prior:
@@ -833,9 +856,7 @@ class DesktopInstaller:
                 raise DesktopEntryError(
                     f"The install did not complete: {base} The desktop "
                     f"entry at {self.entry_path} was KEPT: "
-                    f"{registration_note}, and deleting the entry while "
-                    "the default may point at it would strand the "
-                    "registration with no handler to run (xdg-mime "
+                    f"{registration_note}, and {strand_note} (xdg-mime "
                     "cannot unset a default). The handler configuration "
                     "was not saved. Fix the underlying problem "
                     "(permissions, disk space) and re-run 'nexus-dl "
@@ -843,11 +864,33 @@ class DesktopInstaller:
                     f"run 'nexus-dl handler uninstall': {uninstall_note}"
                 ) from e
             if wrote_entry:
+                if prior_content is not None:
+                    entry_note = (
+                        "the desktop entry was restored to its prior "
+                        "contents (best effort)"
+                    )
+                elif self.entry_path.exists():
+                    # The rollback's unlink is best effort; report the
+                    # file's real state instead of assuming removal.
+                    entry_note = (
+                        "the desktop entry could not be removed and "
+                        f"still exists at {self.entry_path}"
+                    )
+                else:
+                    entry_note = "the desktop entry was removed"
+                if isinstance(current, str) and current:
+                    default_note = (
+                        "the MIME default was restored toward the "
+                        "value found at the start of this run"
+                    )
+                else:
+                    default_note = (
+                        "no MIME default was found at the start of "
+                        "this run, so none was restored"
+                    )
                 outcome = (
-                    " The partial install was rolled back: the desktop "
-                    "entry was removed or restored to its prior contents, "
-                    "and the MIME default was restored toward the value "
-                    "found at the start of this run. Retry 'nexus-dl "
+                    f" The partial install was rolled back: "
+                    f"{entry_note}, and {default_note}. Retry 'nexus-dl "
                     "handler install' once the problem is fixed."
                 )
             else:

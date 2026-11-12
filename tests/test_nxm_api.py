@@ -629,6 +629,24 @@ def test_redact_literal_values_multibyte_full_encoded_sequence():
     assert "enc=" in out and "upper=" in out and "raw=" in out
 
 
+def test_split_multibyte_encoding_is_not_redacted():
+    """A multi-byte character whose percent-encoded BYTES are separated
+    by other text (%c3 x %a9) is not a reflection of the character and
+    must not be redacted by either redaction mode: per-byte matching is
+    exactly the bug the full-sequence fix removed."""
+    from nexus_collection_dl.api import (
+        redact_encoded_secret_forms,
+        redact_literal_values,
+    )
+
+    secret = "Cl\u00e9-FakeKey"                  # obviously fake fixture
+    split = "reflected Cl%c3 x %a9-FakeKey here"
+    out = redact_literal_values(split, (secret,))
+    assert out == split                       # nothing matched, nothing redacted
+    out = redact_encoded_secret_forms(split, (secret,))
+    assert out == split
+
+
 def test_redact_encoded_secret_forms_leaves_bare_prose():
     """require_encoded mode: encoded runs of even a very short secret are
     redacted, while its bare literal spelling in prose is untouched."""

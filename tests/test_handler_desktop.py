@@ -1275,3 +1275,52 @@ def test_timeout_keep_message_is_internally_consistent(exe, cfg_path, tmp_path):
     assert "inert reference" in msg           # honest uninstall outcome
     assert "handler uninstall" in msg
     assert not cfg_path.exists()              # config never saved
+
+
+def test_nontimeout_keep_message_matches_confirmed_outcome(exe, cfg_path, tmp_path):
+    """Non-timeout failure with the default confirmed ours by live query.
+
+    Deterministic keep path where the old two-way note was wrong:
+    re-run while nexus-dl is already the default but the entry file is
+    missing, then the registration call fails outright (non-timeout).
+    The rollback's live query confirms the default points at this run's
+    entry, so the message must claim neither a timeout nor an
+    unconfirmed registration outcome."""
+
+    class ConfirmedQueryRunner:
+        def __init__(self):
+            self.calls = []
+            self.default_sets = 0
+
+        def __call__(self, argv):
+            self.calls.append(list(argv))
+            if argv[:3] == ["xdg-mime", "query", "default"]:
+                return SimpleNamespace(returncode=0, stdout=DESKTOP_ENTRY_NAME,
+                                       stderr="")
+            if argv[:2] == ["xdg-mime", "default"]:
+                self.default_sets += 1
+                if self.default_sets == 1:
+                    # The install's own registration fails outright
+                    return SimpleNamespace(returncode=1, stdout="",
+                                           stderr="simulated failure")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner = ConfirmedQueryRunner()
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+
+    with pytest.raises(DesktopEntryError) as excinfo:
+        inst.install()
+
+    entry = tmp_path / "apps" / DESKTOP_ENTRY_NAME
+    assert entry.exists()                        # kept: default confirmed ours
+    msg = str(excinfo.value)
+    assert "KEPT" in msg
+    assert "the effective nxm:// default points at it" in msg   # confirmed
+    assert "timed out" not in msg                # no timeout happened
+    assert "could not be confirmed" not in msg   # the query confirmed it
+    assert "may point" not in msg                # no hedge after a confirmation
+    assert "was rolled back" not in msg
+    assert not cfg_path.exists()                 # config never saved
