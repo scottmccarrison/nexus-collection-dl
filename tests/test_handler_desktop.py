@@ -26,8 +26,10 @@ from nexus_collection_dl.handler import (
     add_mapping,
     applications_dir,
     build_desktop_entry_content,
+    capability_warnings,
     config_dir,
     escape_exec_argument,
+    notifications_enabled_in_desktop,
     notify,
     remove_mapping,
     resolve_collection_dir,
@@ -1324,3 +1326,177 @@ def test_nontimeout_keep_message_matches_confirmed_outcome(exe, cfg_path, tmp_pa
     assert "may point" not in msg                # no hedge after a confirmation
     assert "was rolled back" not in msg
     assert not cfg_path.exists()                 # config never saved
+
+
+# ---------------------------------------------------------------------------
+# Batch E: install-time capability probe (warnings, never refusals)
+# ---------------------------------------------------------------------------
+
+def _probe_tools(monkeypatch, *names):
+    """Make shutil.which find exactly `names` and nothing else.
+
+    Guarantees no host tool discovery leaks into probe tests."""
+    found = {name: f"/usr/bin/{name}" for name in names}
+    monkeypatch.setattr(handler_module.shutil, "which",
+                        lambda name: found.get(name))
+
+
+class ProbeRunner:
+    """Capability-probe stand-in: canned answers per program, records calls.
+
+    argv lists only, like every house runner; never a shell string."""
+
+    def __init__(self, gsettings="true", gsettings_rc=0, xdgmime_rc=0):
+        self.calls = []
+        self.gsettings = gsettings
+        self.gsettings_rc = gsettings_rc
+        self.xdgmime_rc = xdgmime_rc
+
+    def __call__(self, argv):
+        assert isinstance(argv, (list, tuple)), f"non-argv: {argv!r}"
+        assert all(isinstance(a, str) for a in argv)
+        self.calls.append(list(argv))
+        prog = argv[0]
+        if prog == "gsettings":
+            return SimpleNamespace(returncode=self.gsettings_rc,
+                                   stdout=self.gsettings, stderr="")
+        if prog == "xdg-mime":
+            return SimpleNamespace(returncode=self.xdgmime_rc,
+                                   stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+CINNAMON = {"XDG_CURRENT_DESKTOP": "X-Cinnamon"}
+GNOME = {"XDG_CURRENT_DESKTOP": "GNOME"}
+KDE = {"XDG_CURRENT_DESKTOP": "KDE"}
+
+
+def test_capability_warnings_healthy_system_is_silent(monkeypatch):
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    for env in (CINNAMON, GNOME, KDE):
+        runner = ProbeRunner(gsettings="true")
+        assert capability_warnings(runner=runner, environ=env) == []
+
+
+def test_capability_warnings_missing_xdg_mime(monkeypatch):
+    """Missing xdg-mime warns with the honest failure mode: install
+    stops with an error rather than half-installing."""
+    _probe_tools(monkeypatch, "notify-send", "gsettings")
+    out = capability_warnings(runner=ProbeRunner(), environ=KDE)
+    assert len(out) == 1
+    assert "xdg-mime" in out[0]
+    assert "xdg-utils" in out[0]
+    assert "will stop with an error" in out[0]
+    assert "register the desktop entry" in out[0]   # manual fallback named
+
+
+def test_capability_warnings_xdg_mime_broken(monkeypatch):
+    """Present-but-unresponsive xdg-mime is its own honest warning."""
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    out = capability_warnings(runner=ProbeRunner(xdgmime_rc=1), environ=KDE)
+    assert len(out) == 1
+    assert "did not answer a test query" in out[0]
+    # A probe that raises is the same finding, never a crash
+    def broken(argv):
+        raise OSError("simulated")
+    out = capability_warnings(runner=broken, environ=KDE)
+    assert len(out) == 1
+    assert "did not answer a test query" in out[0]
+
+
+def test_capability_warnings_missing_notify_send(monkeypatch):
+    _probe_tools(monkeypatch, "xdg-mime", "gsettings")
+    out = capability_warnings(runner=ProbeRunner(), environ=KDE)
+    assert len(out) == 1
+    assert "notify-send" in out[0]
+    assert "silently" in out[0]                    # degraded but usable
+    assert "nxm.log" in out[0]                     # log fallback named
+
+
+def test_capability_warnings_cinnamon_notifications_disabled(monkeypatch):
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    runner = ProbeRunner(gsettings="false")
+    out = capability_warnings(runner=runner, environ=CINNAMON)
+    assert len(out) == 1
+    assert ("org.cinnamon.desktop.notifications display-notifications"
+            in out[0])                             # exact key named
+    assert ("gsettings set org.cinnamon.desktop.notifications"
+            " display-notifications true" in out[0])   # exact fix command
+    assert ["gsettings", "get", "org.cinnamon.desktop.notifications",
+            "display-notifications"] in runner.calls
+
+
+def test_capability_warnings_gnome_notifications_disabled(monkeypatch):
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    runner = ProbeRunner(gsettings="false")
+    out = capability_warnings(runner=runner, environ=GNOME)
+    assert len(out) == 1
+    assert "org.gnome.desktop.notifications show-banners" in out[0]
+    assert ("gsettings set org.gnome.desktop.notifications show-banners true"
+            in out[0])
+    assert ["gsettings", "get", "org.gnome.desktop.notifications",
+            "show-banners"] in runner.calls
+
+
+def test_capability_warnings_unknown_desktop_settings_silent(monkeypatch):
+    """KDE/CachyOS and any unknown desktop: never gated, never warned.
+    The gsettings switch is not even queried when the desktop has no
+    known notification setting."""
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    runner = ProbeRunner(gsettings="false")        # would warn if consulted
+    assert capability_warnings(runner=runner, environ=KDE) == []
+    assert not any(c[0] == "gsettings" for c in runner.calls)
+    assert capability_warnings(runner=runner, environ={}) == []
+    assert capability_warnings(runner=runner,
+                               environ={"XDG_CURRENT_DESKTOP": "i3"}) == []
+
+
+def test_capability_warnings_unreadable_settings_silent(monkeypatch):
+    """Unreadable or missing switch = say nothing: unknown is not a finding."""
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    # gsettings exits non-zero: schema absent / dconf unreadable
+    assert capability_warnings(
+        runner=ProbeRunner(gsettings_rc=1), environ=CINNAMON) == []
+    # gsettings missing entirely
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send")
+    assert capability_warnings(runner=ProbeRunner(), environ=CINNAMON) == []
+    # gsettings explodes: never a crash, never a warning
+    def broken_gsettings(argv):
+        if argv[0] == "gsettings":
+            raise OSError("simulated")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    _probe_tools(monkeypatch, "xdg-mime", "notify-send", "gsettings")
+    assert capability_warnings(runner=broken_gsettings,
+                               environ=CINNAMON) == []
+    # unreadable value text is not a boolean: silence
+    assert capability_warnings(
+        runner=ProbeRunner(gsettings="garbage"), environ=CINNAMON) == []
+
+
+def test_capability_warnings_stack_independently(monkeypatch):
+    """All three findings at once: one warning each, no refusals (the
+    return type is a list of strings; install code decides what to do,
+    and it only prints)."""
+    _probe_tools(monkeypatch)                      # nothing found at all
+    out = capability_warnings(runner=ProbeRunner(gsettings="false"),
+                              environ=CINNAMON)
+    joined = "\n".join(out)
+    assert len(out) == 2                           # xdg-mime + notify-send
+    assert "xdg-mime" in joined and "notify-send" in joined
+    assert all(isinstance(w, str) and w for w in out)
+
+
+def test_notifications_enabled_tri_state(monkeypatch):
+    _probe_tools(monkeypatch, "gsettings")
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings="true"), environ=CINNAMON) is True
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings="false"), environ=GNOME) is False
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(), environ=KDE) is None
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings_rc=1), environ=GNOME) is None
+    # Colon-separated and prefixed desktop names resolve too
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings="true"),
+        environ={"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}) is True

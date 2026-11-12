@@ -112,6 +112,10 @@ def cli_env(monkeypatch, tmp_path):
     # tests override this to exercise the warning paths.
     monkeypatch.setattr(cli_module, "notification_daemon_available",
                         lambda: True)
+    # Deterministic capability probe for the same reason: the real one
+    # inspects host tools (shutil.which) and may run gsettings. Tests
+    # override this to exercise warning display.
+    monkeypatch.setattr(cli_module, "capability_warnings", lambda: [])
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     # Pin the state dir too: nxm runs append their status log there, and
@@ -836,6 +840,28 @@ def test_handler_install_warns_without_notification_daemon(cli_env, monkeypatch)
     assert "NXM handler installed" in result.output
     assert "no notification daemon" in result.output
     assert "nxm.log" in result.output                  # log fallback shown
+
+
+def test_handler_install_prints_capability_warnings(cli_env, monkeypatch):
+    """Capability findings print as warnings and never refuse: install
+    still succeeds on a degraded system."""
+    monkeypatch.setattr(cli_module, "DesktopInstaller", FakeInstaller)
+    monkeypatch.setattr(cli_module, "capability_warnings", lambda: [
+        "notify-send was not found: clicks will complete silently.",
+        "notifications are disabled in this desktop's settings: "
+        "org.cinnamon.desktop.notifications display-notifications is false. "
+        "Enable it with 'gsettings set org.cinnamon.desktop.notifications "
+        "display-notifications true'.",
+    ])
+    result = invoke(["handler", "install"])
+    assert result.exit_code == 0, result.output
+    assert "NXM handler installed" in result.output    # install still succeeds
+    assert result.output.count("Warning:") == 2
+    assert "notify-send was not found" in result.output
+    assert ("org.cinnamon.desktop.notifications display-notifications"
+            in result.output)                          # exact key shown
+    assert ("gsettings set org.cinnamon.desktop.notifications"
+            " display-notifications true" in result.output)  # fix command shown
 
 
 def test_handler_install_silent_when_probe_unavailable(cli_env, monkeypatch):

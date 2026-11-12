@@ -23,7 +23,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .state import STATE_FILENAME, CollectionState, StateError
 
@@ -538,6 +538,143 @@ def notification_daemon_available(runner: Callable | None = None) -> bool | None
             runner=runner,
         )
     return None
+
+
+# Notification-display switches for the desktops where a silently-false
+# one is known, with the exact fix command. XDG_CURRENT_DESKTOP picks
+# WHICH switch to read; desktop identity never gates install (KDE,
+# tiling, and unknown desktops run fine and simply get no settings
+# warning), and the warning names the switch and the fix instead of
+# hiding the setting.
+_NOTIFICATION_SETTINGS: dict[str, tuple[str, str, str]] = {
+    "cinnamon": (
+        "org.cinnamon.desktop.notifications",
+        "display-notifications",
+        "gsettings set org.cinnamon.desktop.notifications"
+        " display-notifications true",
+    ),
+    "gnome": (
+        "org.gnome.desktop.notifications",
+        "show-banners",
+        "gsettings set org.gnome.desktop.notifications show-banners true",
+    ),
+}
+
+
+def _desktop_notification_setting(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str, str, str] | None:
+    """This desktop's notification-display switch, or None if unknown.
+
+    Substring match because XDG_CURRENT_DESKTOP can hold a colon
+    separated list ("ubuntu:GNOME") or a prefixed name ("X-Cinnamon").
+    """
+    env = os.environ if environ is None else environ
+    desktop = (env.get("XDG_CURRENT_DESKTOP") or "").lower()
+    if "cinnamon" in desktop:
+        return _NOTIFICATION_SETTINGS["cinnamon"]
+    if "gnome" in desktop:
+        return _NOTIFICATION_SETTINGS["gnome"]
+    return None
+
+
+def notifications_enabled_in_desktop(
+    runner: Callable | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool | None:
+    """Best-effort: does this desktop actually display notifications?
+
+    Reads the desktop's own gsettings switch where one is known
+    (Cinnamon's ``display-notifications``, GNOME's ``show-banners``).
+    Returns False when the switch reads false, True when it reads true,
+    and None when the desktop is unknown, gsettings is missing, or the
+    value cannot be read: callers must answer None with silence, never
+    a warning and never a refusal. Never raises.
+    """
+    spec = _desktop_notification_setting(environ)
+    if spec is None or shutil.which("gsettings") is None:
+        return None
+    schema, key, _fix = spec
+    try:
+        proc = (runner or _notify_runner)(["gsettings", "get", schema, key])
+    except Exception:
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None  # schema absent or dconf unreadable: say nothing
+    out = (getattr(proc, "stdout", "") or "").strip().lower()
+    if out in ("true", "false"):
+        return out == "true"
+    return None
+
+
+def capability_warnings(
+    runner: Callable | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Capability probe for 'nexus-dl handler install': warnings only.
+
+    Probes what the click-through flow actually needs: xdg-mime (to
+    register the default handler), notify-send (to report click
+    outcomes), and the desktop's notification-display switch where one
+    is known. Every finding is a warning, never a refusal: a degraded
+    handler is still usable, desktop identity is never a gate, and an
+    unknown or unreadable setting is not a finding. Subprocess probes
+    are argv lists bounded by NOTIFY_TIMEOUT and never raise; missing
+    probe tooling is never a warning either.
+    """
+    run = runner or _notify_runner
+    warnings: list[str] = []
+
+    # (a) xdg-mime: presence plus one harmless read-only query. Install
+    # itself stops with an error when this fails, so the warning says
+    # exactly that instead of promising a degraded install.
+    if shutil.which("xdg-mime") is None:
+        warnings.append(
+            "xdg-mime was not found: 'nexus-dl handler install' cannot "
+            "register nexus-dl as the default nxm:// handler and will "
+            "stop with an error. Install xdg-utils (or your "
+            "distribution's equivalent), or register the desktop entry "
+            "with your desktop environment manually."
+        )
+    else:
+        try:
+            proc = run(["xdg-mime", "query", "default", "text/plain"])
+            functional = getattr(proc, "returncode", 1) == 0
+        except Exception:
+            functional = False
+        if not functional:
+            warnings.append(
+                "xdg-mime is present but did not answer a test query: "
+                "default-handler registration will likely fail and "
+                "'nexus-dl handler install' will stop with an error. "
+                "Check your xdg-utils installation, or register the "
+                "desktop entry with your desktop environment manually."
+            )
+
+    # (b) notify-send: the only click-feedback channel besides the log.
+    if shutil.which("notify-send") is None:
+        warnings.append(
+            "notify-send was not found: nxm:// clicks will still "
+            "download and extract, but they will complete silently with "
+            "no desktop notification. Install libnotify (or your "
+            "distribution's equivalent), or check "
+            f"{nxm_log_path()} after clicking; it records every run."
+        )
+
+    # (c) the desktop's own notification-display switch, only where one
+    # is known and readable.
+    spec = _desktop_notification_setting(environ)
+    if spec is not None and notifications_enabled_in_desktop(
+        runner=run, environ=environ
+    ) is False:
+        schema, key, fix = spec
+        warnings.append(
+            f"notifications are disabled in this desktop's settings: "
+            f"{schema} {key} is false, so nxm:// clicks will complete "
+            "silently even though everything else works. Enable it "
+            f"with '{fix}', or in your desktop's notification settings."
+        )
+    return warnings
 
 
 class DesktopInstaller:

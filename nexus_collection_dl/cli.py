@@ -24,6 +24,7 @@ from .handler import (
     NxmRoutingError,
     add_mapping,
     append_nxm_log,
+    capability_warnings,
     notification_daemon_available,
     notify as handler_notify,
     nxm_log_path,
@@ -1222,6 +1223,13 @@ def handler_install() -> None:
     idempotent: the entry is always rewritten, so stale entries from
     older versions are replaced.
     """
+    # Capability probe (warnings only, never a refusal): the click flow
+    # needs xdg-mime to register, notify-send to report outcomes, and a
+    # desktop that actually displays notifications. Findings print
+    # before install so a degraded system sees them even when install
+    # then stops with an error. Desktop identity is never a gate.
+    for warning in capability_warnings():
+        console.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
     try:
         entry = DesktopInstaller().install()
     except (HandlerError, OSError) as e:
