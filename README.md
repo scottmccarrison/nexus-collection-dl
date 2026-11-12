@@ -188,7 +188,7 @@ If the tool can't auto-select a file (no main file category), it lists all avail
 
 ### nxm:// link handler
 
-Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button (and accept the browser's first-run "Launch application" confirmation for nxm:// links), your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. The click runs headless (no terminal window); the outcome arrives as a desktop notification, and every run appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` as the diagnostic fallback. When the download finishes, the process exits.
+Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button (and accept the browser's first-run "Launch application" confirmation for nxm:// links), your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. The click runs headless (no terminal window); the outcome arrives as a desktop notification, and every run appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` (or `$XDG_STATE_HOME/nexus-dl/nxm.log` if `XDG_STATE_HOME` is set) as the diagnostic fallback. When the download finishes, the process exits.
 
 One catch: a browser-launched process sees your desktop session's environment, not your shell's, so a `NEXUS_API_KEY` exported in `.bashrc` never reaches it. Store the key once instead. The prompt is hidden: the key is never echoed, never lands in shell history, and never appears in the process list:
 
@@ -269,7 +269,7 @@ The click-through flow was live-tested end to end on one machine: Linux Mint (Ci
 
 | Desktop | Status | Notes |
 |---|---|---|
-| Cinnamon (Linux Mint) | Tested live | With Firefox. Mint ships with Settings > Notifications > "Display notifications" off; the install probe warns when it finds the switch off (see [Notifications](#notifications)). |
+| Cinnamon (Linux Mint) | Tested live | With Firefox. On the machine tested, Settings > Notifications > "Display notifications" was already off, so check it first if a click seems to do nothing (see [Notifications](#notifications)); the install probe warns when it finds the switch off. |
 | GNOME | Expected to work, untested | Standard xdg-mime/desktop-entry handling. Its `show-banners` switch must be on for click notifications; the install probe warns when it finds it off. |
 | MATE, XFCE, Budgie | Expected to work, untested | GIO-family desktops; standard xdg-mime/desktop-entry handling. No notification switch to probe. |
 | KDE Plasma (including CachyOS) | Expected to work, untested | KIO-based rather than GIO, but scheme handlers register through the same xdg-mime/desktop-entry mechanisms and notify-send works. No notification switch to probe. |
@@ -280,7 +280,7 @@ The click-through flow was live-tested end to end on one machine: Linux Mint (Ci
 
 The desktop notification is the normal confirmation for a click: successes and failures both report one, and every run also appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` whatever the desktop does. Two things silently take the notification away while the download still works:
 
-- **The desktop's notification switch is off.** Linux Mint/Cinnamon ships with Settings > Notifications > "Display notifications" off, so a fresh Mint install shows nothing after a click even though the download worked. This was a real support trap; GNOME hides the same switch behind "Show banners". `nexus-dl handler install` probes the switch where it is known and warns when it finds it off. Fixes:
+- **The desktop's notification switch is off.** On the Linux Mint (Cinnamon) machine this was tested on, Settings > Notifications > "Display notifications" was already off, so a click showed nothing even though the download worked. Check it first when a click seems to do nothing; this was a real support trap. GNOME hides the same switch behind "Show banners". `nexus-dl handler install` probes the switch where it is known and warns when it finds it off. Fixes:
   - Cinnamon: `gsettings set org.cinnamon.desktop.notifications display-notifications true`
   - GNOME: `gsettings set org.gnome.desktop.notifications show-banners true`
 - **No notification tooling.** nexus-dl asks for notifications through `notify-send` (package `libnotify`), and tiling setups need a notification daemon (`dunst`, `mako`, ...). Without them clicks complete silently; the install probe warns about both.

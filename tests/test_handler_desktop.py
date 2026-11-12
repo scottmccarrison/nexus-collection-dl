@@ -1474,9 +1474,11 @@ def test_capability_warnings_unreadable_settings_silent(monkeypatch):
 
 
 def test_capability_warnings_stack_independently(monkeypatch):
-    """All three findings at once: one warning each, no refusals (the
-    return type is a list of strings; install code decides what to do,
-    and it only prints)."""
+    """Findings stack: with no tools found at all, the xdg-mime and
+    notify-send warnings both appear. The switch warning is unreachable
+    here (gsettings is absent too), so this is two warnings, not three.
+    No refusals either way: the return type is a list of strings and
+    install code only prints them."""
     _probe_tools(monkeypatch)                      # nothing found at all
     out = capability_warnings(runner=ProbeRunner(gsettings="false"),
                               environ=CINNAMON)
@@ -1484,6 +1486,22 @@ def test_capability_warnings_stack_independently(monkeypatch):
     assert len(out) == 2                           # xdg-mime + notify-send
     assert "xdg-mime" in joined and "notify-send" in joined
     assert all(isinstance(w, str) and w for w in out)
+
+
+def test_capability_warnings_survive_unresolvable_log_path(monkeypatch):
+    """nxm_log_path() can raise (Path.home() with no resolvable HOME);
+    the notify-send warning must fall back to a plain string, never
+    abort the install it is describing."""
+    _probe_tools(monkeypatch, "xdg-mime", "gsettings")
+
+    def exploding_home():
+        raise RuntimeError("could not determine home directory")
+
+    monkeypatch.setattr(handler_module, "nxm_log_path", exploding_home)
+    out = capability_warnings(runner=ProbeRunner(), environ=KDE)
+    assert len(out) == 1
+    assert "notify-send" in out[0]
+    assert "the nexus-dl state directory" in out[0]   # fallback wording
 
 
 def test_notifications_enabled_tri_state(monkeypatch):
@@ -1496,7 +1514,15 @@ def test_notifications_enabled_tri_state(monkeypatch):
         runner=ProbeRunner(), environ=KDE) is None
     assert notifications_enabled_in_desktop(
         runner=ProbeRunner(gsettings_rc=1), environ=GNOME) is None
+    # Garbage value text is not a boolean: None, never a guess
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings="garbage"), environ=CINNAMON) is None
+    # gsettings missing entirely: None even when the switch reads false
+    _probe_tools(monkeypatch)
+    assert notifications_enabled_in_desktop(
+        runner=ProbeRunner(gsettings="false"), environ=CINNAMON) is None
     # Colon-separated and prefixed desktop names resolve too
+    _probe_tools(monkeypatch, "gsettings")
     assert notifications_enabled_in_desktop(
         runner=ProbeRunner(gsettings="true"),
         environ={"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}) is True

@@ -653,12 +653,18 @@ def capability_warnings(
 
     # (b) notify-send: the only click-feedback channel besides the log.
     if shutil.which("notify-send") is None:
+        # Path.home() can raise (unresolvable HOME): this warning must
+        # never abort the install it is describing.
+        try:
+            log_where = str(nxm_log_path())
+        except Exception:
+            log_where = "the nexus-dl state directory"
         warnings.append(
             "notify-send was not found: nxm:// clicks will still "
             "download and extract, but they will complete silently with "
             "no desktop notification. Install libnotify (or your "
             "distribution's equivalent), or check "
-            f"{nxm_log_path()} after clicking; it records every run."
+            f"{log_where} after clicking; it records every run."
         )
 
     # (c) the desktop's own notification-display switch, only where one
