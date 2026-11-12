@@ -758,3 +758,57 @@ def test_nxm_log_failure_never_fails_the_command(cli_env, monkeypatch):
     result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2", "--no-notify"])
     assert result.exit_code == 0, result.output
     assert "already downloaded" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Outer boundary: construction-time and unexpected failures still log one
+# redacted line and notify before exiting non-zero
+# ---------------------------------------------------------------------------
+
+def test_nxm_service_construction_failure_logs_and_notifies(cli_env, monkeypatch):
+    """Service construction is deferred into the nxm command's guarded
+    flow: even a constructor failure leaves a status-log line and a
+    notification instead of an invisible traceback."""
+    class BrokenService:
+        def __init__(self, api_key=None, force_free=False):
+            raise NexusAPIError(
+                "No API key provided. Set NEXUS_API_KEY environment "
+                "variable or pass --api-key flag."
+            )
+
+    monkeypatch.setattr(cli_module, "ModManagerService", BrokenService)
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2"])  # notify default on
+    assert result.exit_code == 1
+    assert "No API key" in result.output
+    assert "Traceback" not in result.output
+    log_file = nxm_log_file(cli_env)
+    assert log_file.exists()
+    content = log_file.read_text()
+    assert len(content.splitlines()) == 1          # exactly one line
+    assert " error " in content
+    assert "reason=api" in content                 # static reason code only
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert "No API key" in body
+
+
+def test_nxm_unexpected_failure_logs_generic_reason_redacted(cli_env):
+    """Any exception outside the known domain types still exits non-zero
+    with one redacted log line and a sanitized notification."""
+    FakeService.error = RuntimeError(
+        "unexpected boom at https://cdn.example/f?key=SECRETVALUE9"
+    )
+    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2"])
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "SECRETVALUE9" not in result.output
+    assert "cdn.example" not in result.output
+    assert "[url redacted]" in result.output
+    content = nxm_log_file(cli_env).read_text()
+    assert len(content.splitlines()) == 1
+    assert " error " in content
+    assert "reason=error" in content
+    assert "SECRETVALUE9" not in content
+    summary, body = cli_env["notifications"][0]
+    assert summary == "nexus-dl: download failed"
+    assert "SECRETVALUE9" not in body

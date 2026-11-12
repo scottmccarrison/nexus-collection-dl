@@ -757,3 +757,52 @@ def test_append_nxm_log_best_effort_on_os_failure(tmp_path, monkeypatch):
     blocker.write_text("not a directory")
     monkeypatch.setenv("XDG_STATE_HOME", str(blocker))
     assert handler_module.append_nxm_log("success", "mod=1 file=2") is False
+
+
+# ---------------------------------------------------------------------------
+# Empty game_domain states fail closed: never a wildcard for any game
+# ---------------------------------------------------------------------------
+
+def make_empty_domain_collection(tmp_path, name="empty"):
+    """A collection dir whose state carries no game domain."""
+    cdir = tmp_path / name
+    cdir.mkdir()
+    state = CollectionState(cdir)
+    state.collection_name = "No Domain"
+    state.save()                     # game_domain stays ""
+    return cdir
+
+
+def test_add_mapping_rejects_empty_game_domain(tmp_path, cfg_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_path.parent))
+    cdir = make_empty_domain_collection(tmp_path)
+    with pytest.raises(HandlerError) as excinfo:
+        add_mapping(GAME, cdir)
+    assert "no game domain" in str(excinfo.value)
+    assert "nexus-dl sync" in str(excinfo.value)   # actionable
+    assert not cfg_path.exists()                   # failure writes nothing
+
+
+def test_resolve_explicit_dir_rejects_empty_game_domain(tmp_path, monkeypatch, cfg_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_path.parent))
+    cdir = make_empty_domain_collection(tmp_path)
+    with pytest.raises(NxmRoutingError) as excinfo:
+        resolve_collection_dir(GAME, cdir)
+    assert "no game domain" in str(excinfo.value)
+    assert "nexus-dl sync" in str(excinfo.value)
+
+
+def test_resolve_mapped_empty_game_domain_rejected(tmp_path, monkeypatch, cfg_path):
+    """A mapped collection whose state later loses its domain must not
+    silently accept links for any game."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg_path.parent))
+    cdir = make_collection(tmp_path)
+    add_mapping(GAME, cdir)
+    state = CollectionState(cdir)
+    state.load()
+    state.game_domain = ""
+    state.save()
+    with pytest.raises(NxmRoutingError) as excinfo:
+        resolve_collection_dir(GAME)
+    assert "no game domain" in str(excinfo.value)
+    assert str(cdir) in str(excinfo.value)         # says which dir to fix

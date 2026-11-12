@@ -9,14 +9,18 @@ collisions refused, --output standalone drops without state, credential
 redaction in results and state files, and lock contention.
 """
 
+import hashlib
 import io
+import json
 import time
 import zipfile
 from pathlib import Path
 
 import pytest
+import requests
 
 from nexus_collection_dl import service as service_module
+from nexus_collection_dl.api import NexusAPI, NexusAPIError
 from nexus_collection_dl.downloader import Downloader
 from nexus_collection_dl.handler import NxmRoutingError, add_mapping
 from nexus_collection_dl.nxm import NxmCollectionLinkError
@@ -331,7 +335,15 @@ def test_proven_duplicate_is_noop_without_network(svc, tmp_path):
     assert fake.calls == []                   # zero network for proven dupes
 
 
-def test_duplicate_with_corrupt_archive_redownloads(svc, tmp_path, monkeypatch):
+def test_duplicate_with_corrupt_archive_refuses_to_replace(svc, tmp_path, monkeypatch):
+    """A corrupt state-owned archive is never replaced by the nxm flow.
+
+    Publication is no-clobber even for this file's own tracked archive:
+    the publish fails with actionable guidance, the on-disk file and the
+    state stay untouched, and no temp download is left behind. The user
+    removes the corrupt file (or uses --output) and re-clicks; the
+    artifact-gone path then re-downloads cleanly.
+    """
     zip_bytes = make_zip()
     entry = pending_entry()
     entry["download_status"] = "downloaded"
@@ -340,12 +352,17 @@ def test_duplicate_with_corrupt_archive_redownloads(svc, tmp_path, monkeypatch):
     fake = FakeNexusAPI(files=files_meta(zip_bytes))
     svc._api = fake
     patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
 
     result = svc.add_nxm(uri(), mods_dir=cdir)
 
-    assert result.success, result.error
-    assert result.status == "downloaded"      # state flag was not trusted
-    assert "get_download_url" in fake.calls
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert "--output" in result.error                 # actionable guidance
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == b"garbage-not-a-zip"
+    assert state_raw(cdir) == before                  # entry still downloaded
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+    assert KEY not in result.error and str(FUTURE) not in result.error
 
 
 def test_artifact_gone_triggers_retry(svc, tmp_path, monkeypatch):
@@ -1025,3 +1042,266 @@ def test_nonjson_api_response_at_service_boundary(svc, tmp_path):
     msg = str(excinfo.value)
     assert "non-JSON" in msg
     assert "<html>" not in msg
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review hardening: bounded translated transport errors,
+# publish-time no-clobber, verify-or-refuse, empty-domain fail-closed
+# ---------------------------------------------------------------------------
+
+def _json_response(payload, status=200):
+    """Real requests.Response carrying JSON, for fake transport sessions."""
+    r = requests.Response()
+    r.status_code = status
+    r.url = "https://api.nexusmods.com/v1/x"
+    r.reason = "Status"
+    r.headers = {}
+    r._content = json.dumps(payload).encode()
+    return r
+
+
+def test_api_timeout_fails_bounded_state_untouched_lock_released(svc, tmp_path):
+    """A stalling API endpoint fails within the request timeout instead
+    of hanging forever under the collection lock; the raw requests
+    exception text (which embeds the URL and query) never surfaces."""
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+
+    class TimeoutSession:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            # Every request in the nxm flow must carry an explicit timeout
+            assert kwargs.get("timeout") is not None
+            raise requests.Timeout(
+                f"Read timed out. (url={url}?key={KEY}&expires={FUTURE})"
+            )
+
+    real = NexusAPI(api_key="test-key")
+    real.session = TimeoutSession()
+    real._min_request_interval = 0
+    svc._api = real
+    before = state_raw(cdir)
+
+    with pytest.raises(NexusAPIError) as excinfo:
+        svc.add_nxm(uri(), mods_dir=cdir)
+
+    msg = str(excinfo.value)
+    assert "timed out" in msg
+    assert KEY not in msg and str(FUTURE) not in msg
+    assert "key=" not in msg and "http" not in msg.lower()
+    assert state_raw(cdir) == before                  # state untouched
+    with CollectionLock(cdir):                        # lock was released
+        pass
+
+
+def test_metadata_connection_error_translated_and_redacted(svc, tmp_path):
+    """Transport failures after account validation (get_mod_files) are
+    translated into the domain error the CLI handlers understand."""
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+
+    class FlakySession:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            assert kwargs.get("timeout") is not None
+            if "validate" in url:
+                return _json_response({"user_id": USER_ID, "is_premium": False})
+            raise requests.ConnectionError(
+                "HTTPSConnectionPool(host='api.nexusmods.com', port=443): "
+                f"Max retries exceeded with url: {url}?key={KEY}"
+            )
+
+    real = NexusAPI(api_key="test-key")
+    real.session = FlakySession()
+    real._min_request_interval = 0
+    svc._api = real
+    before = state_raw(cdir)
+
+    with pytest.raises(NexusAPIError) as excinfo:
+        svc.add_nxm(uri(), mods_dir=cdir)
+
+    msg = str(excinfo.value)
+    assert "connection" in msg.lower()
+    assert "https://" not in msg and "api.nexusmods.com" not in msg
+    assert KEY not in msg and "key=" not in msg
+    assert state_raw(cdir) == before
+    with CollectionLock(cdir):
+        pass
+
+
+def test_destination_created_mid_download_is_never_overwritten(
+    svc, tmp_path, monkeypatch
+):
+    """Collection-flow TOCTOU: an external writer creates the destination
+    after the precheck; the publish refuses, preserves the external file,
+    and cleans up the temp download."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+
+    class RacingSession(FakeCdnSession):
+        def get(self, url, **kwargs):
+            # External writer creates the destination mid-download
+            (cdir / "TestMod-1.0.zip").write_bytes(b"external-sentinel")
+            return super().get(url, **kwargs)
+
+    session = RacingSession(zip_bytes)
+
+    class PatchedDownloader(Downloader):
+        def __init__(self, api):
+            super().__init__(api)
+            self.session = session
+
+    monkeypatch.setattr(service_module, "Downloader", PatchedDownloader)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert "--output" in result.error
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == b"external-sentinel"
+    assert not [p for p in cdir.iterdir() if p.name.startswith(".nexus-download-")]
+    assert state_raw(cdir) == before                  # entry still pending
+    assert KEY not in result.error and str(FUTURE) not in result.error
+
+
+def test_zero_size_without_md5_refused_without_writes(svc, tmp_path, monkeypatch):
+    """No positive byte size and no cached checksum means nothing could
+    be verified: refuse before any download and write nothing."""
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    meta = files_meta(make_zip())
+    meta[0]["size_in_bytes"] = 0
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    patch_downloader(monkeypatch, make_zip())
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be verified" in result.error
+    assert "nothing was written" in result.error
+    assert "get_download_url" not in fake.calls
+    assert state_raw(cdir) == before
+    assert not (cdir / "TestMod-1.0.zip").exists()
+
+
+def test_missing_size_without_md5_refused_without_writes(svc, tmp_path, monkeypatch):
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    meta = files_meta(make_zip())
+    meta[0]["size_in_bytes"] = None
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    patch_downloader(monkeypatch, make_zip())
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "could not be verified" in result.error
+    assert "get_download_url" not in fake.calls
+
+
+def test_zero_size_with_cached_manifest_md5_proceeds(svc, tmp_path, monkeypatch):
+    """MD5-only verification is sufficient: the cached manifest checksum
+    lets the download proceed (and be verified) with no byte size."""
+    zip_bytes = make_zip()
+    md5 = hashlib.md5(zip_bytes).hexdigest()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = {
+        "mod_rules": [{
+            "source": {
+                "modId": MOD_ID,
+                "fileID": FILE_ID,
+                "fileMD5": md5,
+                "logicalFileName": "TestMod-1.0.zip",
+            },
+        }]
+    }
+    state.save()
+    meta = files_meta(zip_bytes)
+    meta[0]["size_in_bytes"] = 0
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success, result.error
+    assert result.status == "downloaded"
+    state = CollectionState(cdir)
+    state.load()
+    assert state.mods[FILE_ID].download_status == "downloaded"
+
+
+def test_output_zero_size_refused_without_writes(svc, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    meta = files_meta(make_zip())
+    meta[0]["size_in_bytes"] = None
+    fake = FakeNexusAPI(files=meta)
+    svc._api = fake
+
+    result = svc.add_nxm(uri(), output_dir=out)
+
+    assert not result.success
+    assert "could not be verified" in result.error
+    assert "get_download_url" not in fake.calls
+    assert list(out.iterdir()) == []
+
+
+def _make_empty_domain_state(cdir: Path) -> Path:
+    """A collection dir whose state carries no game domain."""
+    cdir.mkdir(parents=True, exist_ok=True)
+    state = CollectionState(cdir)
+    state.collection_name = "No Domain"
+    state.save()                      # game_domain stays ""
+    return cdir
+
+
+def test_empty_domain_state_refused_via_mods_dir(svc, tmp_path):
+    cdir = _make_empty_domain_state(tmp_path / "col")
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    svc._api = fake
+
+    with pytest.raises(NxmRoutingError, match="no game domain"):
+        svc.add_nxm(uri(), mods_dir=cdir)
+    assert fake.calls == []           # refused before any network
+
+
+def test_empty_domain_state_refused_via_mapping(svc, tmp_path, xdg_config):
+    cdir = make_collection(tmp_path)
+    add_mapping(GAME, cdir)
+    # The mapped collection's state loses its domain afterwards
+    state = CollectionState(cdir)
+    state.load()
+    state.game_domain = ""
+    state.save()
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    svc._api = fake
+
+    with pytest.raises(NxmRoutingError, match="no game domain"):
+        svc.add_nxm(uri())
+    assert fake.calls == []
+
+
+def test_service_side_empty_domain_check_fails_closed(svc, tmp_path, monkeypatch):
+    """Defense in depth: even with routing bypassed, add_nxm refuses a
+    no-domain state under the lock, with zero network."""
+    cdir = _make_empty_domain_state(tmp_path / "col")
+    monkeypatch.setattr(
+        service_module, "resolve_collection_dir",
+        lambda game, explicit=None: cdir,
+    )
+    fake = FakeNexusAPI(files=files_meta(make_zip()))
+    svc._api = fake
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert not result.success
+    assert "no game domain" in result.error
+    assert "nexus-dl sync" in result.error
+    assert fake.calls == []

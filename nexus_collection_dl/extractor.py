@@ -2,6 +2,7 @@
 
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -100,7 +101,15 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
     Extract an archive to the target directory, preserving internal structure.
 
     Uses a staging directory to avoid conflicts when the archive contains
-    a top-level folder matching the archive filename.
+    a top-level folder matching the archive filename. The staging
+    directory is private to this call: a unique hidden mkdtemp directory
+    (mode 0700) inside target_dir, never a shared predictable name, so
+    concurrent extractions of same-named archives cannot delete or mix
+    each other's staged content. Staging on the destination filesystem
+    keeps the final move a same-device rename, and the dot prefix keeps
+    staged content invisible to the import and deploy scanners until it
+    is published under its final names. Staging is removed on success
+    and on every failure path.
 
     IMPORTANT: Structure is preserved (not flattened) because BG3 mods often
     have internal folders like ModName/Data/Public/... that must be kept intact
@@ -114,13 +123,15 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
 
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Use a clean temp path to avoid special character issues with system tools
-    staging_dir = Path("/tmp") / f"nexus_extract_{archive_path.stem[:20]}"
-
+    staging_dir: Path | None = None
     try:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
-        staging_dir.mkdir(parents=True)
+        # Unique per call and created 0700: mkdtemp never collides with a
+        # concurrent extraction, and system tools (7z/unar) receive the
+        # path through argv lists, so special characters in the target
+        # directory's path are safe.
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=".nexus-extract-", dir=target_dir)
+        )
 
         if archive_type == "zip":
             extracted = _extract_zip(archive_path, staging_dir)
@@ -138,7 +149,7 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
     except Exception as e:
         raise ExtractionError(f"Failed to extract {archive_path}: {e}")
     finally:
-        if staging_dir.exists():
+        if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
@@ -179,7 +190,8 @@ def _extract_7z_system(archive_path: Path, target_dir: Path) -> list[Path]:
             "Install p7zip-full (apt install p7zip-full / dnf install p7zip-plugins)."
         )
 
-    # Use -o with the target_dir path directly (already a clean /tmp path)
+    # Use -o with the staging path directly; argv passing keeps any
+    # characters in the path safe.
     result = subprocess.run(
         [sz_bin, "x", str(archive_path), f"-o{target_dir}", "-y"],
         capture_output=True,

@@ -21,9 +21,14 @@ _URL_RE = re.compile(r"https?://\S+")
 # (connect, read) seconds for the signed download-link request. It runs
 # inside the serialized HTTP-logging context, so an unbounded hang would
 # also stall every other thread's signed request; the timeout keeps that
-# lock hold bounded. Other API endpoints keep their pre-existing
-# (untimed) behavior for now.
+# lock hold bounded.
 SIGNED_REQUEST_TIMEOUT = (15, 60)
+
+# (connect, read) seconds for every other API request. The nxm flow calls
+# these while holding the per-collection lock, so an unbounded hang would
+# stall every other operation on that collection forever; no request may
+# wait unboundedly.
+API_REQUEST_TIMEOUT = (15, 60)
 
 
 def redact_url(url: str) -> str:
@@ -135,6 +140,20 @@ class NexusRateLimited(NexusAPIError):
         super().__init__(f"Rate limited. Retry after {retry_after} seconds.")
 
 
+def _transport_error_text(exc: requests.RequestException) -> str:
+    """Categorical, credential-safe text for a transport failure.
+
+    requests exceptions embed the request URL (with any signed query) in
+    their text, so only the failure category is ever reported; the raw
+    exception text is never included.
+    """
+    if isinstance(exc, requests.Timeout):
+        return "The Nexus API request timed out."
+    if isinstance(exc, requests.ConnectionError):
+        return "Could not connect to the Nexus API (connection error)."
+    return f"The Nexus API request failed ({type(exc).__name__})."
+
+
 class NexusAPI:
     """Client for Nexus Mods API (GraphQL + REST)."""
 
@@ -161,6 +180,31 @@ class NexusAPI:
         if elapsed < self._min_request_interval:
             time.sleep(self._min_request_interval - elapsed)
         self._last_request_time = time.time()
+
+    def _request(
+        self, method: str, url: str, *, secrets: tuple = (), **kwargs: Any
+    ) -> requests.Response:
+        """One rate-limited, time-bounded HTTP request.
+
+        Every request carries an explicit (connect, read) timeout unless
+        the caller pins its own, so no call can wait unboundedly (the nxm
+        flow holds the per-collection lock across these requests).
+        Transport failures are translated into NexusAPIError with
+        categorical text only: raw requests exception text embeds the
+        request URL (and any signed query values), so it never surfaces.
+        Known secret values are redacted from the message as a second
+        layer.
+        """
+        self._rate_limit_wait()
+        kwargs.setdefault("timeout", API_REQUEST_TIMEOUT)
+        try:
+            return getattr(self.session, method)(url, **kwargs)
+        except requests.RequestException as e:
+            raise NexusAPIError(
+                redact_literal_values(
+                    _transport_error_text(e), secrets + (self.api_key,)
+                )
+            ) from None
 
     def _handle_response(
         self, response: requests.Response, secrets: tuple = ()
@@ -265,8 +309,8 @@ class NexusAPI:
 
     def graphql_query(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
         """Execute a GraphQL query."""
-        self._rate_limit_wait()
-        response = self.session.post(
+        response = self._request(
+            "post",
             GRAPHQL_URL,
             json={"query": query, "variables": variables or {}},
         )
@@ -437,7 +481,6 @@ class NexusAPI:
                 "download_link requires the key/expires credential pair "
                 "together (or neither)."
             )
-        self._rate_limit_wait()
         url = (
             f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}"
             f"/files/{file_id}/download_link.json"
@@ -457,11 +500,13 @@ class NexusAPI:
             # safe failure instead (requests strips nothing custom). The
             # bounded timeout keeps the serialized HTTP-logging lock hold
             # bounded even if the endpoint stalls.
-            response = self.session.get(
+            response = self._request(
+                "get",
                 url,
                 params=params,
                 allow_redirects=False,
                 timeout=SIGNED_REQUEST_TIMEOUT,
+                secrets=secrets,
             )
 
         try:
@@ -488,43 +533,41 @@ class NexusAPI:
 
     def get_mod_files(self, game_domain: str, mod_id: int) -> list[dict[str, Any]]:
         """List all files for a mod."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}/files.json"
-        response = self.session.get(url)
+        response = self._request("get", url)
         data = self._handle_response(response)
         return data.get("files", [])
 
     def get_mod_info(self, game_domain: str, mod_id: int) -> dict[str, Any]:
         """Get mod metadata from REST API."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/games/{game_domain}/mods/{mod_id}.json"
-        response = self.session.get(url)
+        response = self._request("get", url)
         return self._handle_response(response)
 
     def validate_key(self) -> dict[str, Any]:
         """Validate API key and return user info."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/users/validate.json"
-        response = self.session.get(url)
+        response = self._request("get", url)
         return self._handle_response(response)
 
     def get_tracked_mods(self) -> list[dict[str, Any]]:
         """Get all mods tracked by the current user."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/user/tracked_mods.json"
-        response = self.session.get(url)
+        response = self._request("get", url)
         return self._handle_response(response)
 
     def track_mod(self, game_domain: str, mod_id: int) -> None:
         """Add a mod to the user's tracked list."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/user/tracked_mods.json"
-        response = self.session.post(url, data={"domain_name": game_domain, "mod_id": mod_id})
+        response = self._request(
+            "post", url, data={"domain_name": game_domain, "mod_id": mod_id}
+        )
         self._handle_response(response)
 
     def untrack_mod(self, game_domain: str, mod_id: int) -> None:
         """Remove a mod from the user's tracked list."""
-        self._rate_limit_wait()
         url = f"{REST_BASE_URL}/user/tracked_mods.json"
-        response = self.session.delete(url, data={"domain_name": game_domain, "mod_id": mod_id})
+        response = self._request(
+            "delete", url, data={"domain_name": game_domain, "mod_id": mod_id}
+        )
         self._handle_response(response)

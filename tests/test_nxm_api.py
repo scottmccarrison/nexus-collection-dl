@@ -453,3 +453,109 @@ def test_suppress_contexts_serialize_across_threads_without_debug_leaks():
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review hardening: every request is time-bounded and transport
+# failures are translated into redacted domain errors
+# ---------------------------------------------------------------------------
+
+from nexus_collection_dl.api import API_REQUEST_TIMEOUT  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectTimeout(
+            f"HTTPSConnectionPool(host='api.nexusmods.com', port=443): "
+            f"Read timed out. (connect timeout=15) {signed_url_with_query()}"
+        ),
+        requests.ConnectionError(
+            "HTTPSConnectionPool(host='api.nexusmods.com', port=443): "
+            f"Max retries exceeded with url: {signed_url_with_query()}"
+        ),
+        requests.RequestException(
+            f"unknown transport failure at {signed_url_with_query()}"
+        ),
+    ],
+    ids=["timeout", "connection", "generic"],
+)
+def test_transport_errors_become_redacted_domain_errors(api, exc):
+    class BoomSession(FakeSession):
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            raise exc
+
+    api.session = BoomSession()
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.validate_key()
+    msg = str(excinfo.value)
+    assert "https://" not in msg                  # no scheme/host/path
+    assert "api.nexusmods.com" not in msg
+    assert "key=" not in msg and KEY not in msg   # no query values
+    assert len(api.session.calls) == 1            # bounded: no retry loop
+
+
+def test_signed_request_transport_error_redacts_credentials(api):
+    class BoomSession(FakeSession):
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            raise requests.ConnectionError(
+                f"pool died carrying key={KEY}&expires={EXPIRES} "
+                f"apikey={API_KEY_SECRET}"
+            )
+
+    api.session = BoomSession()
+    with pytest.raises(NexusAPIError) as excinfo:
+        api.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
+    msg = str(excinfo.value)
+    assert "connection" in msg.lower()
+    assert KEY not in msg and str(EXPIRES) not in msg
+    assert "key=" not in msg and "https://" not in msg
+
+
+def test_metadata_requests_carry_bounded_timeouts(api):
+    api.session = FakeSession([
+        make_response(200, {"user_id": 7}),
+        make_response(200, {"files": []}),
+        make_response(200, {"name": "x"}),
+    ])
+    api.validate_key()
+    api.get_mod_files(GAME, 123)
+    api.get_mod_info(GAME, 123)
+    assert len(api.session.calls) == 3
+    for _url, kwargs in api.session.calls:
+        assert kwargs["timeout"] == API_REQUEST_TIMEOUT
+
+
+def test_tracked_mod_requests_carry_bounded_timeouts(api):
+    api.session = FakeSession([
+        make_response(200, []),
+        make_response(200, {}),
+        make_response(200, {}),
+    ])
+    api.get_tracked_mods()
+    api.track_mod(GAME, 123)
+    api.untrack_mod(GAME, 123)
+    assert len(api.session.calls) == 3
+    for _url, kwargs in api.session.calls:
+        assert kwargs["timeout"] == API_REQUEST_TIMEOUT
+
+
+def test_graphql_request_carries_bounded_timeout(api):
+    class GraphqlSession(FakeSession):
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return make_response(200, {"data": {}})
+
+    api.session = GraphqlSession()
+    api.graphql_query("{ x }")
+    _url, kwargs = api.session.calls[0]
+    assert kwargs["timeout"] == API_REQUEST_TIMEOUT
+
+
+def test_signed_request_keeps_its_own_timeout(api):
+    api.session = FakeSession([make_response(200, [{"URI": "https://cdn/x"}])])
+    api.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
+    _url, kwargs = api.session.calls[0]
+    assert kwargs["timeout"] == SIGNED_REQUEST_TIMEOUT

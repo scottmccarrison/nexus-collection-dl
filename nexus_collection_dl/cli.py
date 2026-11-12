@@ -101,7 +101,18 @@ def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check:
     ctx.obj["api_key"] = resolved_key
     ctx.obj["api_key_source"] = key_source
     ctx.obj["force_free"] = free
-    ctx.obj["service"] = ModManagerService(resolved_key, force_free=free)
+    if ctx.invoked_subcommand == "nxm":
+        # Deferred construction: the nxm command builds the service inside
+        # its own guarded flow, so a construction-time failure also writes
+        # the redacted nxm status-log line and desktop notification
+        # instead of escaping this callback as a raw traceback with no
+        # visible outcome. Every other command keeps the eager behavior.
+        ctx.obj["service"] = None
+        ctx.obj["service_factory"] = lambda: ModManagerService(
+            resolved_key, force_free=free
+        )
+    else:
+        ctx.obj["service"] = ModManagerService(resolved_key, force_free=free)
 
     if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
@@ -792,7 +803,6 @@ def nxm(
         _log_nxm("error", "reason=usage")
         sys.exit(1)
 
-    svc = ctx.obj["service"]
     # Desktop-launched invocations have no terminal: notify by default so
     # the outcome is visible. Terminal runs print to stdout instead.
     want_notify = notify if notify is not None else (not sys.stdout.isatty())
@@ -806,6 +816,11 @@ def nxm(
         sys.exit(1)
 
     try:
+        # The group callback defers service construction for this command
+        # so a construction failure lands in the guarded handlers below.
+        svc = ctx.obj["service"]
+        if svc is None:
+            svc = ctx.obj["service_factory"]()
         result = svc.add_nxm(
             uri,
             mods_dir=mods_dir,
@@ -830,6 +845,15 @@ def nxm(
     except (NexusAPIError, DownloadError, StateError) as e:
         _log_nxm("error", f"reason={_nxm_reason(e)}")
         fail(str(e))
+    except Exception as e:
+        # Outer boundary: any failure not matched above (including the
+        # deferred service construction) still leaves one redacted status
+        # line and the notification instead of an invisible traceback.
+        # The log carries a static reason code only; the printed text is
+        # URL-stripped in case an unexpected exception embeds one.
+        _log_nxm("error", "reason=error")
+        detail = sanitize_message(str(e)).strip()
+        fail(detail or f"Unexpected failure ({type(e).__name__}).")
 
     if not result.success:
         reason = "re_click_required" if result.re_click_required else "rejected"

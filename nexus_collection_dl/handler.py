@@ -218,7 +218,10 @@ def add_mapping(game_domain: str, collection_dir: Path | str) -> HandlerConfig:
 
     Validates before writing anything: the game domain must be well
     formed, the directory must exist and hold a synced collection state,
-    and the collection's own game domain must match the mapping key.
+    and the collection's own game domain must be present and match the
+    mapping key. A state with no game domain is rejected instead of
+    treated as a wildcard: it could never be checked against a link's
+    game, so routing cross-game downloads into it must be impossible.
     """
     game = str(game_domain).strip().lower()
     if not _GAME_RE.match(game):
@@ -237,7 +240,12 @@ def add_mapping(game_domain: str, collection_dir: Path | str) -> HandlerConfig:
             "Run 'nexus-dl sync' there first."
         )
     state = _load_collection_state(directory)
-    if state.game_domain and state.game_domain.lower() != game:
+    if not state.game_domain:
+        raise HandlerError(
+            f"The collection state in {directory} has no game domain; run "
+            "'nexus-dl sync' to create it properly."
+        )
+    if state.game_domain.lower() != game:
         raise HandlerError(
             f"{directory} holds a '{state.game_domain}' collection and cannot "
             f"be mapped to '{game}'."
@@ -273,7 +281,9 @@ def resolve_collection_dir(
     explicit --mods-dir must be an existing directory holding a synced
     collection whose game matches the link. Without one, mapped
     candidates are filtered to real, game-matching collections; zero or
-    multiple candidates are actionable failures instead of guesses.
+    multiple candidates are actionable failures instead of guesses. A
+    state with no game domain fails closed on both paths: it is never a
+    wildcard that accepts links for any game.
     """
     game = str(game_domain).strip().lower()
 
@@ -288,7 +298,12 @@ def resolve_collection_dir(
                 "'nexus-dl sync'."
             )
         state = _load_collection_state(directory)
-        if state.game_domain and state.game_domain.lower() != game:
+        if not state.game_domain:
+            raise NxmRoutingError(
+                f"The collection state in {directory} has no game domain; "
+                "run 'nexus-dl sync' there to create it properly."
+            )
+        if state.game_domain.lower() != game:
             raise NxmRoutingError(
                 f"{directory} holds a '{state.game_domain}' collection, but "
                 f"the link is for '{game}'."
@@ -305,7 +320,12 @@ def resolve_collection_dir(
             state = _load_collection_state(directory)
         except HandlerError:
             continue
-        if state.game_domain and state.game_domain.lower() != game:
+        if not state.game_domain:
+            raise NxmRoutingError(
+                f"The collection state in {directory} has no game domain; "
+                "run 'nexus-dl sync' there to create it properly."
+            )
+        if state.game_domain.lower() != game:
             continue
         candidates.append(directory)
 

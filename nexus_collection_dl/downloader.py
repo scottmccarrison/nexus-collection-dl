@@ -198,8 +198,8 @@ class Downloader:
                     nxm:// links). Transient: forwarded to the download-link
                     request only, never persisted.
             no_clobber: Refuse to replace an existing destination instead of
-                        atomically overwriting it (nxm:// flows where the
-                        target is not proven owned by this download).
+                        atomically overwriting it (nxm:// flows, which never
+                        replace any existing destination entry).
 
         Returns path to the downloaded file.
         """
@@ -311,9 +311,10 @@ class Downloader:
                 except FileExistsError:
                     raise DownloadError(
                         f"{filename}: refusing to overwrite an existing "
-                        "file at the destination; it appeared while this "
-                        "download was running. Remove it or choose another "
-                        "directory and retry."
+                        "file at the destination; nothing was replaced and "
+                        "the temporary download was removed. Remove the "
+                        "file and retry, or use 'nexus-dl nxm --output' to "
+                        "save this download elsewhere."
                     )
                 except OSError as e:
                     raise DownloadError(

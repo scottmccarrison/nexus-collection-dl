@@ -1799,10 +1799,17 @@ class ModManagerService:
             state = CollectionState(target)
             state.load()
 
-            if (
-                state.game_domain
-                and state.game_domain.lower() != info.game_domain.lower()
-            ):
+            # Fail closed on the game check (defense in depth behind the
+            # routing checks): a state with no game domain is never a
+            # wildcard that accepts links for any game.
+            if not state.game_domain:
+                return self._nxm_failure(
+                    info,
+                    f"The collection state in {target} has no game domain; "
+                    "run 'nexus-dl sync' there to create it properly.",
+                    collection_dir=target,
+                )
+            if state.game_domain.lower() != info.game_domain.lower():
                 return self._nxm_failure(
                     info,
                     f"This link is for '{info.game_domain}' but {target} "
@@ -1923,6 +1930,23 @@ class ModManagerService:
             # Cached manifest MD5 only (exact identity match); no extra
             # API calls and no guaranteed hash when unavailable.
             _attach_expected_md5(state, [download_info])
+            # Verified-before-publish is only real when there is something
+            # to verify against: with no positive byte size and no cached
+            # manifest MD5 the downloader would publish whatever arrived.
+            # Refuse the download instead (nothing is written); the
+            # browser-download + import workflow stays available.
+            if size_bytes <= 0 and not download_info.get("expected_md5"):
+                return self._nxm_failure(
+                    info,
+                    "Nexus Mods provided no file size and this collection "
+                    "has no cached checksum for this file, so the download "
+                    "could not be verified and nothing was written. "
+                    "Download the file in your browser and run 'nexus-dl "
+                    f"import {target}', or retry the link later.",
+                    collection_dir=target,
+                    mod_name=mod_name,
+                    filename=filename,
+                )
             signed = (
                 SignedLink(key=info.key, expires=info.expires)
                 if info.has_credentials
@@ -1943,11 +1967,14 @@ class ModManagerService:
                     target,
                     on_progress=on_download_progress,
                     signed=signed,
-                    # No-clobber unless this download provably owns and is
-                    # replacing its own existing (corrupt) archive: a file
-                    # created by anyone else between the precheck above and
-                    # the publish must never be overwritten.
-                    no_clobber=not (owned_by_this and dest_existed),
+                    # Never replace ANY existing destination entry on the
+                    # nxm path, including this file's own corrupt archive:
+                    # the publish itself is the enforcement point (a hard
+                    # link that fails when anything exists at the final
+                    # path), so a file created or replaced by anyone else
+                    # between the precheck above and the publish can never
+                    # be silently destroyed.
+                    no_clobber=True,
                 )
             except DownloadError as e:
                 # State is untouched and any previous files are intact:
@@ -2141,6 +2168,18 @@ class ModManagerService:
                 "File metadata from Nexus Mods is malformed (unexpected "
                 "file size); refusing to download without a verifiable "
                 "expected size.",
+                filename=filename,
+            )
+
+        # A standalone drop has no cached manifest to supply an MD5, so a
+        # positive byte size is the only possible verification: without
+        # it the download would be published unchecked. Refuse instead.
+        if size_bytes <= 0:
+            return self._nxm_failure(
+                info,
+                "Nexus Mods provided no file size for this file, so the "
+                "download could not be verified and nothing was written. "
+                "Retry the link later.",
                 filename=filename,
             )
 
