@@ -1011,3 +1011,67 @@ def test_nxm_boundary_strips_queryless_nxm_uri(cli_env):
     assert "nxm://" not in body and GAME not in body
     content = nxm_log_file(cli_env).read_text()
     assert "nxm://" not in content and GAME not in content
+
+
+# ---------------------------------------------------------------------------
+# Delta-review follow-ups: typed-branch variant redaction, parser-mirrored
+# boundary secret extraction
+# ---------------------------------------------------------------------------
+
+def test_nxm_typed_error_redacts_secret_variants(cli_env):
+    """Typed domain errors (here NexusAPIError, whose text can carry
+    server-reflected credentials) go through the same variant-aware
+    literal redaction as the catch-all: raw, encoded, and case-varied
+    forms never reach the terminal, the notification, or the log."""
+    from urllib.parse import quote
+
+    link_key = "FakeLinkKey-aB/9x"
+    api_key_value = "FakeApiKeyValue-XyZ789"
+    encoded = quote(link_key, safe="")
+    hostile = f"nxm://{GAME}/mods/1/files/2?key={encoded}&expires=1893456000"
+    FakeService.error = NexusAPIError(
+        f"server reflected apikey={api_key_value.upper()} "
+        f"key={encoded} enclower={encoded.lower()} raw={link_key}"
+    )
+    result = CliRunner().invoke(
+        cli_module.main, ["--api-key", api_key_value, "nxm", hostile]
+    )
+    assert result.exit_code == 1
+    fragments = (
+        link_key, api_key_value, api_key_value.upper(), api_key_value.lower(),
+        encoded, encoded.lower(), encoded.upper(), "nxm://",
+    )
+    for fragment in fragments:
+        assert fragment not in result.output
+    assert "server reflected" in result.output        # benign text survives
+    assert "[redacted]" in result.output
+    summary, body = cli_env["notifications"][0]
+    for fragment in fragments:
+        assert fragment not in body
+    content = nxm_log_file(cli_env).read_text()
+    assert "reason=api" in content
+    for fragment in fragments:
+        assert fragment not in content
+
+
+def test_boundary_secrets_mirror_parser_query_acceptance():
+    """Extraction mirrors the nxm parser, not parse_qs: percent-encoded
+    and case-varied parameter names are recognized, a literal '+' in a
+    value stays a '+', and both raw and decoded values join the scope."""
+    from types import SimpleNamespace
+
+    from nexus_collection_dl.cli import _boundary_secrets
+
+    ctx = SimpleNamespace(obj={"api_key": "FakeApiKeyValue-123"})
+    uri = (
+        "nxm://skyrimspecialedition/mods/1/files/2"
+        "?%6bey=Fake+Key%2FOne&EXPIRES=1893456000"
+    )
+    secrets = _boundary_secrets(ctx, uri)
+    assert "FakeApiKeyValue-123" in secrets
+    # '+' preserved as the parser does; parse_qs would yield "Fake Key/One"
+    assert "Fake+Key/One" in secrets
+    assert "Fake Key/One" not in secrets
+    # The raw still-encoded value is in scope too
+    assert "Fake+Key%2FOne" in secrets
+    assert "1893456000" in secrets

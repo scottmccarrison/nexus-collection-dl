@@ -559,3 +559,27 @@ def test_signed_request_keeps_its_own_timeout(api):
     api.get_download_url(GAME, 123, 456, key=KEY, expires=EXPIRES)
     _url, kwargs = api.session.calls[0]
     assert kwargs["timeout"] == SIGNED_REQUEST_TIMEOUT
+
+
+def test_redact_literal_values_catches_case_and_encoding_variants():
+    """Variant-aware literal redaction: the raw secret, case-varied
+    forms, and percent-encoded forms (either hex case, mixed with
+    literal characters) are all replaced."""
+    from urllib.parse import quote
+
+    from nexus_collection_dl.api import redact_literal_values
+
+    secret = "FakeKey-aB/9+x"
+    encoded = quote(secret, safe="")            # FakeKey-aB%2F9%2Bx
+    mixed = "FakeKey-aB%2f9%2bx"                # lowercase hex
+    text = (
+        f"raw={secret} upper={secret.upper()} lower={secret.lower()} "
+        f"enc={encoded} enclower={encoded.lower()} mixed={mixed}"
+    )
+    out = redact_literal_values(text, (secret,))
+    for form in (secret, secret.upper(), secret.lower(),
+                 encoded, encoded.lower(), mixed):
+        assert form not in out
+    assert "[redacted]" in out
+    # Benign labels around the secrets survive
+    assert "raw=" in out and "mixed=" in out

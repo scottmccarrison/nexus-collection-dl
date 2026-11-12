@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 import click
 from rich.console import Console
@@ -762,32 +762,25 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
         pass  # best-effort logging: a broken log must never break nxm
 
 
-def _secret_variants(value: str) -> list[str]:
-    """Every shape one literal secret can realistically appear in.
+def _boundary_secrets(ctx: click.Context, uri: str, min_length: int = 0) -> tuple:
+    """Literal secrets to redact from text leaving the nxm error boundary.
 
-    Literal redaction is exact and case-sensitive, and free-form
-    exception text can carry a credential raw, percent-encoded (either
-    hex case), or case-varied. Keys are long opaque strings, so
-    case-folded variants cannot collide with ordinary words.
-    """
-    encoded = quote(value, safe="")
-    variants: list[str] = []
-    for form in (value, encoded):
-        for cased in (form, form.lower(), form.upper()):
-            if cased and cased not in variants:
-                variants.append(cased)
-    return variants
+    Query extraction mirrors the nxm parser's acceptance rules rather
+    than parse_qs: parameter names are percent-decoded once and
+    case-folded (so 'KEY=' and '%6bey=' are both the 'key' parameter),
+    and values are percent-decoded once while a literal '+' stays a '+'
+    (parse_qs would turn it into a space, putting a value that is not
+    the real credential in scope and leaving the real one out). Both
+    the raw and the decoded value join the scope; redact_literal_values
+    matches every case and percent-encoding variant of each. Values are
+    never displayed, only used for replacement.
 
-
-def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
-    """Literal secrets to redact from unexpected-exception text.
-
-    The catch-all boundary prints and notifies free-form exception text,
-    which could embed the resolved API key or the raw URI's key/expires
-    query values verbatim, in percent-encoded form, or case-varied. Each
-    secret joins the redaction scope in all of those shapes (see
-    _secret_variants). Values are never displayed, only used for
-    replacement.
+    ``min_length`` drops short values from the scope: typed domain-error
+    messages contain deliberate guidance prose, and replacing a one or
+    two character "secret" would mangle ordinary words. Real Nexus API
+    keys and link credentials are long opaque strings (the key store
+    enforces the same 8-character floor), so the guard only ever skips
+    values that cannot be meaningful credentials.
     """
     base: list = []
     api_key = (ctx.obj or {}).get("api_key")
@@ -795,16 +788,50 @@ def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
         base.append(api_key)
     try:
         query = urlsplit(uri).query
-        for name in ("key", "expires"):
-            base.extend(v for v in parse_qs(query).get(name, []) if v)
     except ValueError:
-        pass
-    secrets: list = []
+        query = ""
+    for segment in query.split("&"):
+        if not segment or "=" not in segment:
+            continue
+        raw_name, raw_value = segment.split("=", 1)
+        if unquote(raw_name).lower() not in ("key", "expires"):
+            continue
+        for value in (raw_value, unquote(raw_value)):
+            if value:
+                base.append(value)
+    unique: list = []
     for value in base:
-        for variant in _secret_variants(str(value)):
-            if variant not in secrets:
-                secrets.append(variant)
-    return tuple(secrets)
+        if len(value) >= min_length and value not in unique:
+            unique.append(value)
+    return tuple(unique)
+
+
+# Same floor as keystore.MIN_KEY_LENGTH: real API keys and link
+# credentials are long opaque strings, so variant redaction of anything
+# shorter only risks mangling guidance prose, never protects a secret.
+_MIN_REDACT_SECRET_LEN = 8
+
+
+def _boundary_redact(
+    ctx: click.Context,
+    uri: str,
+    text: str,
+    strip_uris: bool = True,
+    min_secret_len: int = 0,
+) -> str:
+    """Full redaction scope for text leaving through the nxm boundary.
+
+    Literal secrets (API key and link credentials, in every case and
+    percent-encoding variant) are redacted. URI stripping additionally
+    applies to free-form unexpected text; typed domain errors skip it
+    because their messages are redacted at the source and may
+    deliberately carry a redacted API URL or mention the nxm:// scheme
+    in guidance.
+    """
+    out = redact_literal_values(
+        text, _boundary_secrets(ctx, uri, min_length=min_secret_len)
+    )
+    return sanitize_message(out) if strip_uris else out
 
 
 @main.command()
@@ -901,23 +928,26 @@ def nxm(
         sys.exit(1)
     except (NxmParseError, NxmRoutingError, HandlerError) as e:
         _log_nxm("error", f"reason={_nxm_reason(e)}")
-        fail(str(e))
+        # Typed errors are redacted at the source, but a reflected
+        # credential in any case/encoding variant is caught here too.
+        # Short values stay out of scope so deliberate guidance prose
+        # (which may contain those letters) is not mangled.
+        fail(_boundary_redact(ctx, uri, str(e), strip_uris=False,
+                              min_secret_len=_MIN_REDACT_SECRET_LEN))
     except (NexusAPIError, DownloadError, StateError) as e:
         _log_nxm("error", f"reason={_nxm_reason(e)}")
-        fail(str(e))
+        fail(_boundary_redact(ctx, uri, str(e), strip_uris=False,
+                              min_secret_len=_MIN_REDACT_SECRET_LEN))
     except Exception as e:
         # Outer boundary: any failure not matched above (including the
         # deferred service construction) still leaves one redacted status
         # line and the notification instead of an invisible traceback.
-        # The log carries a static reason code only. The printed text goes
-        # through the full redaction scope: known literal secrets first
-        # (API key, raw URI key/expires values), then URL/URI stripping
-        # covering ANY scheme with a query (a raw nxm:// link embeds its
-        # credentials there; the http-only pattern would miss it).
+        # The log carries a static reason code only. Free-form text gets
+        # the full scope: literal secrets in every case/encoding variant,
+        # then URL/URI stripping covering ANY scheme with a query and
+        # nxm:// with or without one.
         _log_nxm("error", "reason=error")
-        detail = sanitize_message(
-            redact_literal_values(str(e), _boundary_secrets(ctx, uri))
-        ).strip()
+        detail = _boundary_redact(ctx, uri, str(e)).strip()
         fail(detail or f"Unexpected failure ({type(e).__name__}).")
 
     if not result.success:

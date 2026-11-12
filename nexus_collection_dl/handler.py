@@ -38,8 +38,10 @@ _URL_RE = re.compile(r"https?://\S+")
 # nxm:// URIs are stripped by scheme, with or without a query: the
 # credentials normally ride in the query, but a query-less URI still
 # leaks account/mod identity and a hostile message could carry them in
-# the path or userinfo. Case-insensitive: URI schemes are.
-_NXM_URI_RE = re.compile(r"nxm://\S*", re.IGNORECASE)
+# the path or userinfo. Case-insensitive: URI schemes are. The negative
+# lookbehind anchors at a scheme-token boundary, so a different scheme
+# whose name merely ends in "nxm" (e.g. foo-nxm://) is left alone.
+_NXM_URI_RE = re.compile(r"(?<![A-Za-z0-9+.-])nxm://\S*", re.IGNORECASE)
 # Any-scheme URI carrying a query string: a raw link embeds its
 # credentials there, so scheme-agnostic stripping is needed wherever
 # free-form exception text can reach the user (the http(s) pattern
@@ -615,6 +617,7 @@ class DesktopInstaller:
         prior_content: str | None = None,
         default_at_start: str | None = None,
         registered: bool = False,
+        registration_uncertain: bool = False,
     ) -> bool:
         """Undo a partial install, leaving the system as this run found it.
 
@@ -626,32 +629,55 @@ class DesktopInstaller:
         cannot destroy a working entry; only an entry this run created is
         deleted.
 
-        One exception, because xdg-mime cannot unset a default: when this
-        run registered our entry and there is no other default to restore
-        to, the entry is KEPT even though the install failed. Deleting it
-        would strand the MIME default pointing at a missing file (no
-        working handler, dangling registration). Returns True when the
-        entry was kept for this reason, so the caller can report the
-        state honestly; False otherwise.
+        A run-created entry is NEVER deleted while the effective MIME
+        default still points at it: xdg-mime cannot unset a default, so
+        deleting would strand a dangling registration with no working
+        handler. The effective default is queried after the restore
+        attempt when possible; when the query is unavailable, a
+        successful registration (or an indeterminate one, e.g. a timeout
+        that may have applied) wins over the missing answer and the
+        entry is kept. Returns True when the entry was kept for this
+        reason, so the caller can report the state honestly.
         """
         if isinstance(default_at_start, str) and default_at_start:
-            with contextlib.suppress(Exception):
+            try:
                 self._runner(
                     ["xdg-mime", "default", default_at_start, NXM_MIME_TYPE]
                 )
+            except Exception:
+                pass  # best-effort; the query below decides what is safe
         if not wrote_entry:
             return False
         if prior_content is not None:
             with contextlib.suppress(Exception):
                 _atomic_write_text(self.entry_path, prior_content)
             return False
-        # After the restore attempt above, does the default point at our
-        # entry? Either nothing else was registered and this run made
-        # ours the default, or ours already was the default.
-        default_is_ours = registered and (
-            not default_at_start or default_at_start == DESKTOP_ENTRY_NAME
-        )
-        if default_is_ours:
+        # Decide from the best evidence available whether the effective
+        # default points at our entry: a live query first, inference from
+        # this run's outcome when the query cannot run.
+        query_ran = False
+        effective: str | None = None
+        try:
+            proc = self._runner(
+                ["xdg-mime", "query", "default", NXM_MIME_TYPE]
+            )
+            query_ran = getattr(proc, "returncode", 1) == 0
+            out = (getattr(proc, "stdout", "") or "").strip()
+            effective = out or None
+        except Exception:
+            query_ran = False
+        if query_ran and effective is not None:
+            points_at_ours = effective == DESKTOP_ENTRY_NAME
+        elif registered:
+            # A confirmed registration outranks an unavailable or empty
+            # query answer: fail safe and keep the entry.
+            points_at_ours = True
+        else:
+            # Only an indeterminate registration (timeout) with no query
+            # available keeps the entry; otherwise this run never became
+            # the default and deleting is safe.
+            points_at_ours = registration_uncertain and not query_ran
+        if points_at_ours:
             return True
         with contextlib.suppress(OSError):
             self.entry_path.unlink()
@@ -676,10 +702,23 @@ class DesktopInstaller:
         self.entry_dir.mkdir(parents=True, exist_ok=True)
 
         # Capture what a re-run must not destroy: the existing entry's
-        # contents, read BEFORE anything is modified. An unreadable
-        # pre-existing entry is a hard abort: replacing a file we could
-        # not snapshot means a failed rollback could only delete it.
+        # contents, read BEFORE anything is modified. A symlink is
+        # refused outright: exists()/read_text() follow the link, so a
+        # dangling link would read as absent (and be replaced), and a
+        # readable link's target content would be restored as a regular
+        # file, destroying the link either way. An unreadable entry is a
+        # hard abort too: never replace what cannot be snapshotted for
+        # rollback.
         prior_content: str | None = None
+        if self.entry_path.is_symlink():
+            raise DesktopEntryError(
+                f"The existing desktop entry {self.entry_path} is a "
+                "symlink. Refusing to replace it: a dangling link reads "
+                "as absent and a readable link's target cannot be "
+                "restored as a link by rollback. Remove the symlink (or "
+                "replace it with a regular file), then re-run 'nexus-dl "
+                "handler install'. Nothing was changed."
+            )
         if self.entry_path.exists():
             try:
                 prior_content = self.entry_path.read_text()
@@ -702,6 +741,7 @@ class DesktopInstaller:
 
         wrote_entry = False
         registered = False
+        registration_uncertain = False
         try:
             _atomic_write_text(self.entry_path, content)
             wrote_entry = True
@@ -720,6 +760,11 @@ class DesktopInstaller:
                 # domain errors so the rollback below runs and the CLI
                 # prints an actionable message instead of a traceback.
                 kind = "timed out" if isinstance(e, subprocess.TimeoutExpired) else "failed"
+                if isinstance(e, subprocess.TimeoutExpired):
+                    # The registration may or may not have applied before
+                    # the timeout: rollback treats the outcome as
+                    # indeterminate instead of assuming "not registered".
+                    registration_uncertain = True
                 raise DesktopEntryError(
                     f"Registering the nxm:// default handler {kind}"
                     f" ({type(e).__name__}). The desktop entry was rolled "
@@ -744,21 +789,30 @@ class DesktopInstaller:
             )
             self.config.save()
         except (DesktopEntryError, HandlerError, OSError, subprocess.SubprocessError) as e:
-            kept = self._rollback(wrote_entry, prior_content, current, registered)
+            kept = self._rollback(
+                wrote_entry, prior_content, current,
+                registered, registration_uncertain,
+            )
             if kept:
-                # Registration succeeded and no other default exists to
-                # restore: the entry was kept so the MIME default does not
-                # dangle. Report the real failure and the kept state.
+                # The default points at the entry this run wrote and
+                # could not be moved elsewhere, so the entry was kept.
+                # Report the real failure and the kept state honestly,
+                # including what removal can and cannot do.
                 raise DesktopEntryError(
                     "The desktop entry was written and registered as the "
                     "nxm:// handler, but the install did not complete: "
                     f"{sanitize_message(str(e))}. The entry at "
-                    f"{self.entry_path} was KEPT because it is now the "
-                    "registered default and xdg-mime cannot unset one; the "
-                    "handler configuration was not saved. Fix the "
+                    f"{self.entry_path} was KEPT because it is the "
+                    "registered default and xdg-mime cannot unset one; "
+                    "the handler configuration was not saved. Fix the "
                     "underlying problem (permissions, disk space) and "
-                    "re-run 'nexus-dl handler install' to finish, or run "
-                    "'nexus-dl handler uninstall' to remove it."
+                    "re-run 'nexus-dl handler install' to finish. To "
+                    "back out instead, run 'nexus-dl handler uninstall': "
+                    "it removes the entry, and since no previous default "
+                    "was recorded the nxm:// registration will remain as "
+                    "an inert reference to the removed entry (launchers "
+                    "ignore missing entries) until another handler is "
+                    "chosen or nexus-dl is reinstalled."
                 ) from e
             raise
         return self.entry_path
@@ -820,6 +874,20 @@ class DesktopInstaller:
             return "NXM handler was not installed; nothing to remove."
         if restored:
             return f"NXM handler removed; previous default '{restored}' restored."
+        if current == DESKTOP_ENTRY_NAME:
+            # Honest about what removal cannot do: xdg-mime has no unset,
+            # and no previous default was recorded to restore, so the
+            # scheme registration outlives the entry as an inert
+            # reference (launchers ignore entries whose file is gone).
+            return (
+                "NXM handler removed. No previous default was recorded "
+                "and xdg-mime cannot unset one, so the nxm:// "
+                "registration may still reference the removed entry. "
+                "The reference is inert (launchers ignore missing "
+                "entries); choosing another handler in your desktop "
+                "settings or re-running 'nexus-dl handler install' "
+                "replaces it."
+            )
         return "NXM handler removed."
 
     def status(self) -> dict[str, Any]:

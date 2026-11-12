@@ -260,6 +260,27 @@ _INTERNAL_FILENAMES = frozenset({
 _MAGIC_VERIFIED_SUFFIXES = frozenset({".zip", ".7z", ".rar"})
 
 
+def _retained_archive_is_sane(archive: Path, expected_md5: str | None) -> bool:
+    """Offline sanity of a retained archive before trusting it.
+
+    Requires a real file, valid magic bytes for suffixes whose real
+    content always carries a signature, and, when the cached manifest
+    knows a well-formed hash for the identity, matching bytes. The state
+    stores no expected byte size, so the hash is the offline
+    expected-content check when one is known.
+    """
+    if not archive.is_file():
+        return False
+    if (
+        archive.suffix.lower() in _MAGIC_VERIFIED_SUFFIXES
+        and sniff_archive_magic(archive) is None
+    ):
+        return False
+    if expected_md5 is not None and _file_md5(archive) != expected_md5:
+        return False
+    return True
+
+
 def _as_int(value: Any) -> int | None:
     """Best-effort int conversion for manifest identity fields."""
     if isinstance(value, bool):
@@ -1887,23 +1908,16 @@ class ModManagerService:
                 and not no_extract
             ):
                 archive = target / existing.filename
-                # Offline integrity preflight on top of the magic check.
-                # The state stores no expected byte size, so the cached
-                # manifest's identity-scoped hash is the only expected-
-                # content datum available without network (the same
-                # verification 'import' uses): when a well-formed hash is
-                # known, the retained bytes must match it, otherwise the
-                # archive is not trusted for extraction.
+                # Offline integrity preflight: real file, valid magic for
+                # magic-verified suffixes, and a match against the cached
+                # manifest hash when one is known (the state stores no
+                # expected byte size, so the hash is the offline
+                # expected-content datum; the same verification 'import'
+                # uses). An archive that fails any check is not trusted
+                # for extraction.
                 by_identity_md5, _ = _expected_md5_maps(state.manifest_data)
                 expected_md5 = by_identity_md5.get((info.mod_id, info.file_id))
-                if (
-                    archive.is_file()
-                    and (
-                        archive.suffix.lower() not in _MAGIC_VERIFIED_SUFFIXES
-                        or sniff_archive_magic(archive) is not None
-                    )
-                    and (expected_md5 is None or _file_md5(archive) == expected_md5)
-                ):
+                if _retained_archive_is_sane(archive, expected_md5):
                     # Failed-extraction recovery with no download traffic:
                     # a pending entry whose verified archive was retained
                     # on disk finishes its extraction from that archive
@@ -2040,12 +2054,41 @@ class ModManagerService:
                     collection_dir=target,
                     filename=filename,
                 )
-            # When this file's own artifact still occupies the destination
-            # it failed the sanity checks above (corrupt, unreadable, or a
-            # dangling link): the strict no-clobber publish is guaranteed
-            # to refuse the fresh download, so the refusal below is
-            # extended with the recovery steps for exactly that situation.
-            corrupt_owned_dest = dest_existed and owned_by_this
+            # Diagnose why this file's own artifact still occupies the
+            # destination, so the guaranteed no-clobber refusal below
+            # names the real situation instead of guessing "corrupt":
+            # either the artifact failed the sanity checks, or a
+            # --no-extract run skipped the finish-extraction recovery for
+            # an otherwise sane retained archive.
+            owned_dest_hint = ""
+            if dest_existed and owned_by_this:
+                owned_dest_hint = (
+                    " The existing file is this collection's own archive "
+                    "for this download, and it failed the sanity checks "
+                    "(corrupt or unreadable). Remove it and click the "
+                    "download link again, or download the file in your "
+                    f"browser and run 'nexus-dl import {target}'."
+                )
+                if (
+                    no_extract
+                    and existing is not None
+                    and existing.download_status == "pending_download"
+                ):
+                    retained = target / existing.filename
+                    by_identity, _ = _expected_md5_maps(state.manifest_data)
+                    known_md5 = by_identity.get((info.mod_id, info.file_id))
+                    if _retained_archive_is_sane(retained, known_md5):
+                        owned_dest_hint = (
+                            " The destination holds this file's retained "
+                            "archive, which passed the sanity checks, but "
+                            "this run passed --no-extract, so the "
+                            "finish-extraction recovery was skipped and "
+                            "the fresh download was refused rather than "
+                            "replace the retained file. Re-run without "
+                            "--no-extract to finish the extraction from "
+                            "the retained archive, or remove the file to "
+                            "force a fresh download."
+                        )
 
             try:
                 size_bytes = _metadata_size_bytes(selected)
@@ -2128,15 +2171,8 @@ class ModManagerService:
                 # State is untouched and any previous files are intact:
                 # a failed download never claims completion.
                 message = str(e)
-                if corrupt_owned_dest and "refusing to overwrite" in message:
-                    message += (
-                        " The existing file is this collection's own "
-                        "archive for this download, and it failed the "
-                        "sanity checks (corrupt or unreadable). Remove it "
-                        "and click the download link again, or download "
-                        "the file in your browser and run 'nexus-dl "
-                        f"import {target}'."
-                    )
+                if owned_dest_hint and "refusing to overwrite" in message:
+                    message += owned_dest_hint
                 return self._nxm_failure(
                     info, message, collection_dir=target,
                     mod_name=mod_name, filename=filename,

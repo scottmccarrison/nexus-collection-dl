@@ -1716,3 +1716,27 @@ def test_recovery_warnings_are_truthful_on_success(svc, tmp_path, monkeypatch):
     state = CollectionState(cdir)
     state.load()
     assert state.mods[FILE_ID].download_status == "downloaded"
+
+
+def test_no_extract_reclick_message_distinguishes_retained_archive(
+    svc, tmp_path, monkeypatch
+):
+    """--no-extract re-click on a pending entry whose retained archive is
+    sane: the refusal must not falsely claim the archive failed the
+    sanity checks, and must name the real way out."""
+    zip_bytes = make_zip()
+    cdir = make_collection(tmp_path, mods=[pending_entry()])
+    (cdir / "TestMod-1.0.zip").write_bytes(zip_bytes)
+    fake = FakeNexusAPI(files=files_meta(zip_bytes))
+    svc._api = fake
+    patch_downloader(monkeypatch, zip_bytes)
+    before = state_raw(cdir)
+
+    result = svc.add_nxm(uri(), mods_dir=cdir, no_extract=True)
+
+    assert not result.success
+    assert "refusing to overwrite" in result.error
+    assert "--no-extract" in result.error
+    assert "failed the sanity checks" not in result.error
+    assert (cdir / "TestMod-1.0.zip").read_bytes() == zip_bytes
+    assert state_raw(cdir) == before

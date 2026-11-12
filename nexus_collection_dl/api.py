@@ -46,15 +46,37 @@ def redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def _secret_pattern(secret: str) -> "re.Pattern[str]":
+    """Regex matching one secret in any case or percent-encoding mix.
+
+    Per character the pattern accepts the literal character (matched
+    case-insensitively) or the percent-encoding of each of its UTF-8
+    bytes (either hex case, covered by the same flag). Together this
+    catches the raw value, fully encoded forms in both hex cases, and
+    arbitrary mixed encoded/literal forms, which exact case-sensitive
+    literal replacement misses. Credentials are long opaque strings, so
+    a false match on ordinary prose is not a practical concern, and any
+    match errs toward more redaction.
+    """
+    parts = []
+    for ch in secret:
+        alts = [re.escape(ch)]
+        for byte in ch.encode("utf-8"):
+            alts.append(f"%{byte:02x}")
+        parts.append("(?:" + "|".join(alts) + ")")
+    return re.compile("".join(parts), re.IGNORECASE)
+
+
 def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
     """Remove literal credential values from text.
 
     Defense in depth for error paths: a server that reflects a download
     key in an error body or a hostile response URL can never surface the
     credential. Every explicitly provided secret is redacted regardless
-    of length (a caller-supplied credential is always worth protecting);
-    only None, empty, and whitespace-only values are skipped so unrelated
-    text is not mangled.
+    of length (a caller-supplied credential is always worth protecting),
+    in its raw form and in case-varied or percent-encoded forms (see
+    _secret_pattern); only None, empty, and whitespace-only values are
+    skipped so unrelated text is not mangled.
     """
     out = str(text)
     for secret in secrets:
@@ -62,7 +84,7 @@ def redact_literal_values(text: str, secrets: Iterable[Any]) -> str:
             continue
         value = str(secret)
         if value and not value.isspace():
-            out = out.replace(value, "[redacted]")
+            out = _secret_pattern(value).sub("[redacted]", out)
     return out
 
 

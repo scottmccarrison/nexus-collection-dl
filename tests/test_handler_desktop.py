@@ -1115,3 +1115,126 @@ def test_failed_install_without_prior_default_keeps_registered_entry(
                 if c[:2] == ["xdg-mime", "default"]
                 and c[2] != DESKTOP_ENTRY_NAME]
     assert not cfg_path.exists()                     # config not saved
+
+
+# ---------------------------------------------------------------------------
+# Delta-review follow-ups: symlink abort, restore-failure keep path,
+# uninstall honesty, nxm scheme-token boundary
+# ---------------------------------------------------------------------------
+
+def test_install_aborts_on_symlink_entry(exe, cfg_path, tmp_path):
+    """A symlinked entry is refused without mutation: a dangling link
+    reads as 'absent' through exists() and would be replaced then
+    unlinked as run-created, and a readable link's target would be
+    restored as a regular file, destroying the link either way."""
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    entry_file = apps / DESKTOP_ENTRY_NAME
+    target_file = tmp_path / "real-entry.desktop"
+    target_file.write_text("[Desktop Entry]\nType=Application\n")
+    entry_file.symlink_to(target_file)
+    runner = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    cfg = HandlerConfig(cfg_path)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=apps, executable=exe)
+
+    with pytest.raises(DesktopEntryError, match="symlink"):
+        inst.install()
+
+    assert entry_file.is_symlink()                     # link intact
+    assert target_file.read_text() == "[Desktop Entry]\nType=Application\n"
+    assert not [c for c in runner.calls if c[:2] == ["xdg-mime", "default"]]
+    assert not cfg_path.exists()
+
+    # Dangling link: exists() says absent, but it must still abort
+    entry_file.unlink()
+    entry_file.symlink_to(tmp_path / "nowhere.desktop")
+    runner2 = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    inst2 = DesktopInstaller(config=HandlerConfig(cfg_path), runner=runner2,
+                             entry_dir=apps, executable=exe)
+    with pytest.raises(DesktopEntryError, match="symlink"):
+        inst2.install()
+    assert entry_file.is_symlink()                     # still a dangling link
+
+
+class StatefulMimeRunner:
+    """xdg-mime stand-in tracking the real default: registering our entry
+    succeeds; restoring a previous default fails (rc 1)."""
+
+    def __init__(self, initial_default):
+        self.calls = []
+        self.default = initial_default
+
+    def __call__(self, argv):
+        self.calls.append(list(argv))
+        prog = argv[0]
+        if prog == "update-desktop-database":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[:3] == ["xdg-mime", "query", "default"]:
+            return SimpleNamespace(returncode=0, stdout=self.default or "",
+                                   stderr="")
+        if argv[:2] == ["xdg-mime", "default"]:
+            target = argv[2]
+            if target == DESKTOP_ENTRY_NAME:
+                self.default = DESKTOP_ENTRY_NAME
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=1, stdout="", stderr="no")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def test_rollback_keeps_entry_when_restore_fails_and_default_still_ours(
+    exe, cfg_path, tmp_path, monkeypatch
+):
+    """Registration succeeded but restoring the prior default failed, so
+    the effective default still points at our entry: rollback must keep
+    the entry instead of deleting it and stranding the default."""
+    runner = StatefulMimeRunner(initial_default="vortex-nxm.desktop")
+    cfg = HandlerConfig(cfg_path)
+
+    def fail_save(self):
+        raise HandlerError("Could not write handler config: disk on fire")
+
+    monkeypatch.setattr(HandlerConfig, "save", fail_save)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps", executable=exe)
+
+    with pytest.raises(DesktopEntryError) as excinfo:
+        inst.install()
+
+    entry = tmp_path / "apps" / DESKTOP_ENTRY_NAME
+    assert entry.exists()                              # kept, not dangling
+    assert entry.read_text() == build_desktop_entry_content(exe.resolve())
+    assert "KEPT" in str(excinfo.value)
+    assert runner.default == DESKTOP_ENTRY_NAME        # default still ours
+    # The restore was attempted toward the prior handler (and failed)
+    assert ["xdg-mime", "default", "vortex-nxm.desktop",
+            NXM_MIME_TYPE] in runner.calls
+    assert not cfg_path.exists()
+
+
+def test_uninstall_without_previous_default_discloses_residual(tmp_path, cfg_path):
+    """Honest recovery guidance: with no recorded previous default, the
+    residual inert reference is disclosed instead of implied away."""
+    _apps, entry, cfg = _installed_env(tmp_path, cfg_path, previous=None)
+    runner = FakeRunner(query_default=DESKTOP_ENTRY_NAME)
+    inst = DesktopInstaller(config=cfg, runner=runner,
+                            entry_dir=tmp_path / "apps")
+
+    message = inst.uninstall()
+
+    assert not entry.exists()
+    assert "cannot unset" in message
+    assert "inert" in message
+    assert "handler install" in message
+
+
+def test_sanitize_message_nxm_scheme_boundary():
+    # A different scheme whose name merely ends in "nxm" is left alone
+    assert handler_module.sanitize_message("foonxm://a/b") == "foonxm://a/b"
+    assert handler_module.sanitize_message("foo-nxm://a/b") == "foo-nxm://a/b"
+    # Real nxm URIs are stripped at start, mid-text, and inside punctuation
+    out = handler_module.sanitize_message(
+        "nxm://start/mods/1 mid nxm://x/mods/2/files/3 (nxm://y/mods/4)"
+    )
+    assert "nxm://" not in out
+    assert out.count("[url redacted]") == 3
