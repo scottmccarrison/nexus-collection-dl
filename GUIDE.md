@@ -384,6 +384,122 @@ The `key` and `expires` parts of a link are temporary credentials tied to your a
 
 Collection links (`nxm://.../collections/...`) are not handled this way - use `nexus-dl sync` with the collection URL instead.
 
+## Using the interactive shell
+
+If you find yourself typing the same directory paths over and over, `nexus-dl shell` gives you a prompt to work in instead. It covers the everyday jobs in one place: browsing collections and games, listing and removing mods, adding a mod by link, syncing a collection, and checking status.
+
+```bash
+nexus-dl shell ~/mods/starfield
+```
+
+The directory you pass is the root (`ROOT_DIR` in the help text). Leave it out and the shell uses the directory you're in. It treats a collection as the root folder itself or any immediate subfolder that holds `.nexus-state.json` (the state file `sync` creates). Nothing deeper is scanned, and a folder with a broken state file is skipped instead of blocking the list.
+
+### A sample session
+
+Here's a complete session. The output is real; the pasted `nxm://` link is the one thing not shown literally, since the shell never echoes a link back (more on that below).
+
+```
+$ nexus-dl shell ~/mods/starfield
+nexus-dl shell. Type /help for commands, /quit to exit.
+
+nexus-dl> /help
+Shell commands
+Command                  | Description
+/help                    | show this command list
+/collections             | list collections under the root
+/games                   | list games with collection and mod counts
+/use <index|name>        | select the collection other commands work on
+/mods                    | list tracked mods (default: current collection)
+/add <url>               | add one mod (nxm:// link or https:// mod page)
+/sync <collection-url>   | sync a collection into the root
+/remove <file_id|mod:id> | remove a mod from the current collection
+/status                  | show collection status vs the latest revision
+/quit                    | leave the shell (also /exit, or Ctrl-D)
+Bare nxm:// or https:// links on a line are handled as /add.
+
+nexus-dl> /collections
+Collections under $HOME/mods/starfield
+# | Name           | Game      | Mods | Pending
+1 | Clean Visuals  | starfield |    2 |       0
+2 | Weightless QoL | starfield |    3 |       1
+
+nexus-dl> /use Weightless QoL
+Using 'Weightless QoL' ($HOME/mods/starfield/Weightless QoL).
+
+nexus-dl> /mods
+Mods in Weightless QoL
+file_id | Name                       | Version | Download status
+9034551 | Compact Inventory UI       | 0.9     | pending_download
+9012345 | Faster Scanning            | 1.1     | downloaded
+8842117 | Starfield Community Patch  | 2.4     | downloaded
+
+nexus-dl> nxm://starfield/mods/.../files/...?key=REDACTED
+Downloaded 'Ship Builder Categories' into $HOME/mods/starfield/Weightless QoL.
+Archive extracted. Run 'nexus-dl deploy' when ready; nothing was deployed automatically.
+
+nexus-dl> /remove 9012345
+Remove 'Faster Scanning' (file_id 9012345, mod_id 110477) and all its files?
+this removes the mod from the collection and it stays removed through sync/update; files on disk are kept; re-add restores it
+Remove 'Faster Scanning'? [yes/no]: yes
+Removed 'Faster Scanning' (mod_id 110477); file(s) 9012345 left the collection.
+
+nexus-dl> /status
+Collection: Weightless QoL
+Installed revision: 7
+Latest revision: 8 (update available)
+Mod status
+Name                       | Version | Status
+Compact Inventory UI       | 0.9     | pending_download
+Starfield Community Patch  | 2.4     | update_available
+
+nexus-dl> /quit
+Goodbye.
+```
+
+A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, `/add <url>` adds one mod from a mod page URL (free accounts get the manual download instructions, same as the plain `add` command), and `/sync <collection-url>` syncs a collection into the root. `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
+
+```
+nexus-dl> hello world
+Error: Unknown input. For the command list, try /help. Bare nxm or https links are handled as /add.
+```
+
+### Picking a collection with /use
+
+Most commands work on one selected collection, and `/use` picks it two ways:
+
+- **The index from `/collections`** (the `#` column). Always unambiguous, even when two collections share a name.
+- **A name.** An exact case-sensitive match wins first; if there isn't one, a unique case-insensitive match is used. If the name fits more than one collection, the shell refuses to guess and lists the indexes:
+
+```
+nexus-dl> /use DUP
+Error: 'DUP' matches 2 collections (names differ only by case); pick one by index:
+  1: Dup [starfield]
+  2: dup [starfield]
+```
+
+An unknown name gets `no collection named '...'` plus the same listing, so you can always fall back to an index.
+
+### Removing a mod
+
+`/remove` takes one id: a bare number is the `file_id` from the `/mods` table, and `mod:<id>` is the mod_id (the id of the mod's page on Nexus; the confirmation line shows both). Either way it removes the whole mod, meaning every file entry that belongs to that mod page, not just the one file you named. Before anything happens, the shell prints what will go and asks for confirmation. Only `yes` confirms; "no", Ctrl-C, Ctrl-D, or anything else aborts with `Cancelled; nothing was removed.`
+
+What removal actually does, spelled out because "remove" can mean several things:
+
+- **State only.** The mod's entries are deleted from `.nexus-state.json` and a tombstone (the `removed_mods` key) is written for its mod page. Files on disk are never touched: extracted content and kept archives stay exactly where they are. That's deliberate, since a collection's extraction tree is merged into one folder where mods share and overwrite paths, so payload files can't be cleanly attributed back to a single mod. Cleaning up deployed files is `undeploy`'s job.
+- **The removal sticks.** `sync` and `update` honor the tombstone and skip the mod (the summary reports `N removed mod(s) skipped`), so a later collection revision can't quietly reinstall it. The tombstone keys on the mod page (mod_id), not on file_id, so new file ids in a newer revision still match.
+- **Re-adding restores it.** Adding the mod again (link, `add`, or `import`) clears the tombstone and brings the mod back.
+- **One downgrade caveat.** Older nexus-dl versions don't know about the `removed_mods` key: they ignore it and drop it the next time they save state, so running an older build can resurrect removed mods at the next sync or update.
+
+Removing an id that isn't in `/mods` fails with `No mod file with file_id ... in ...` and changes nothing.
+
+### Pasting nxm:// links
+
+Pasting an `nxm://` link on a line by itself is the same as `/add` with that link. The shell never echoes the link back: everything it prints goes through a redactor that covers the link and its `key`/`expires` credentials, so even error messages can't reflect them. That's also why the transcript above shows `?key=REDACTED` instead of a real link. A link that expired or belongs to a different account gets `Click 'Mod manager download' on the Nexus website again, then retry.` and nothing is written.
+
+### If a link click seems to do nothing
+
+If you're pasting links here because clicking **Mod manager download** in the browser produced nothing visible, that's usually the click-through side rather than the shell: desktop notifications are switched off, or the handler isn't installed. Start with "Clicking a link seems to do nothing" in [Troubleshooting](#troubleshooting); the short version is to check `~/.local/state/nexus-dl/nxm.log` first, because a new line there means the click ran and only the feedback is missing.
+
 ## Using the web UI
 
 If you do not want to memorize terminal commands, the web UI is probably the better option for day-to-day mod management. The CLI is faster for one-off operations and scripting, but the web UI lets you do almost everything from a browser with real-time progress feedback.

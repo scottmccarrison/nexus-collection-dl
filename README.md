@@ -343,6 +343,18 @@ Matches files you downloaded through the browser to pending mods, extracts archi
 nexus-dl status ~/mods/starfield
 ```
 
+### Interactive shell
+
+For browsing and quick changes without retyping paths, `nexus-dl shell` opens an interactive prompt over the same service layer:
+
+```bash
+nexus-dl shell ~/mods/starfield
+```
+
+List collections and games, pick one with `/use`, then `/mods`, `/add`, `/sync`, `/remove`, and `/status` work on it (paste an `nxm://` link on its own line to add a mod; the link is never echoed back). `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
+
+Honest note on `/remove`: it drops the mod's entries from collection state and records a tombstone so `sync`/`update` skip the mod from then on, but it never deletes files already on disk (a collection's extraction tree is merged, so payload files can't be attributed back to one mod). Re-adding the mod clears the tombstone and restores it.
+
 ## Free vs Premium accounts
 
 Both free and Premium Nexus Mods accounts work with `nexus-dl`. The difference is how mod files get downloaded.
@@ -431,6 +443,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
+- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/status`) over the same commands.
 
 Both the web UI and CLI share the same service layer, so all operations behave identically regardless of interface.
 
