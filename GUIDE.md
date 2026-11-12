@@ -350,7 +350,7 @@ nexus-dl handler map starfield "$HOME/mods/starfield/My Collection"
 nexus-dl handler install
 ```
 
-All three steps are opt-in and touch only your own user's settings. `handler install` writes a small `.desktop` file and remembers which app handled nxm:// links before; `nexus-dl handler uninstall` puts that back. Check everything at any time with `nexus-dl handler status`. Re-running `handler install` is safe and idempotent: it always rewrites the entry (so entries from older versions get refreshed) and runs a best-effort self-test for a reachable notification daemon; if none is found it warns and points you at the status log as the fallback feedback channel.
+All three steps are opt-in and touch only your own user's settings. `handler install` writes a small `.desktop` file and remembers which app handled nxm:// links before; `nexus-dl handler uninstall` puts that back. Check everything at any time with `nexus-dl handler status`. Re-running `handler install` is safe and idempotent: it always rewrites the entry (so entries from older versions get refreshed) and probes what click-through needs (xdg-mime, notify-send, and your desktop's notification switch where one is known), warning about anything missing or switched off and never blocking the install because of it. It also runs a best-effort self-test for a reachable notification daemon; if none is found it warns and points you at the status log as the fallback feedback channel.
 
 If you are testing this for the first time, a good disposable target is a fresh collection: run `nexus-dl sync "<collection-url>" "$HOME/mods/nxm-smoke"`, map the game to the subfolder sync prints, and work there. (If you cloned the source and installed with `uv sync`, run `uv sync --extra dev` too when you want to run the test suite.)
 
@@ -358,13 +358,13 @@ If you are testing this for the first time, a good disposable target is a fresh 
 
 No daemon or background service runs anywhere. Your browser asks the desktop environment to open the nxm:// link; most browsers show a first-run "Launch application" confirmation for nxm:// links (allow it, and tick the remember box if you do not want to be asked again). The desktop environment looks up the registered handler and launches nexus-dl as a short-lived process with the link as its argument. The click runs headless: no terminal window opens. nexus-dl downloads that one file into the mapped collection folder, verifies it, extracts it, and updates the collection state. The outcome arrives as a desktop notification, for successes and failures alike (the registered handler asks for notifications explicitly), and then the process exits. Nothing is deployed to your game - run `nexus-dl deploy` when you're ready, exactly as usual.
 
-Every run also appends one redacted status line to `~/.local/state/nexus-dl/nxm.log`: a timestamp, the outcome, and mod/file ids or a fixed reason code, never the link or its credentials. If you do not see a notification, check that log; it is the diagnostic fallback (see the troubleshooting section). If `handler install` warned that no notification daemon was detected, notifications will not appear in that session and the log is your primary feedback channel.
+Every run also appends one redacted status line to `~/.local/state/nexus-dl/nxm.log`: a timestamp, the outcome, and mod/file ids or a fixed reason code, never the link or its credentials. If you do not see a notification, check that log; it is the diagnostic fallback (see the troubleshooting section). If `handler install` warned that no notification daemon was detected, notifications will not appear in that session and the log is your primary feedback channel. The most common cause on Linux Mint is Settings > Notifications > "Display notifications" being off (GNOME hides the same switch behind "Show banners"): the download still works, only the confirmation is missing, and `handler install` warns when it finds the switch off.
 
 What clicking the button again does depends on whether the verified archive is still on disk. The default flow extracts the archive and then deletes it, so a re-click downloads and verifies a fresh copy; this is deliberate, and the extracted files are already in place. A re-click with the archive retained triggers no download: if the entry is already marked downloaded (you ran with `--no-extract`), nexus-dl reports "already downloaded" with zero network traffic and changes nothing; if an earlier extraction failed and kept the archive, the click finishes the extraction from that archive without re-downloading it (when track-sync is enabled for the collection, a background tracked-mod sync may still make API calls). Extraction publishes files one by one rather than atomically as a set, so a rare mid-extraction failure can leave some files in place while the error is reported; re-running the extraction is safe and overwrites the partial set.
 
 A full smoke test looks like this: finish the setup above, click **Mod manager download** once on a mod file page, accept the browser's launch confirmation, check for the desktop notification, the extracted mod in your collection folder, and the redacted success line in `~/.local/state/nexus-dl/nxm.log`. A second click re-downloads and re-verifies the file (the zero-network dedupe only shows up with a retained archive, for example after running with `--no-extract`). Run `nexus-dl handler uninstall` when you want your previous handler back.
 
-Platform notes: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox. GNOME and KDE should behave the same through xdg-mime but are untested. Browsers installed as Flatpak or Snap generally cannot launch host desktop handlers, so click-through from those is unsupported; use a native browser build, or copy the link and run `nexus-dl nxm` yourself (see below).
+Platform notes: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox. GNOME, MATE, XFCE, Budgie, and KDE (including KIO-based distros like CachyOS) are expected to work through the standard xdg-mime and desktop-entry mechanisms but are untested; the README's platform support table has the details. nexus-dl never gates install on which desktop you run. Browsers installed as Flatpak or Snap generally cannot launch host desktop handlers, so click-through from those is unsupported; use a native browser build, or copy the link and run `nexus-dl nxm` yourself (see below).
 
 ### Running a link yourself (advanced)
 
@@ -496,7 +496,23 @@ Clicks run headless, so there is no terminal window to watch. The outcome arrive
 tail -n 5 ~/.local/state/nexus-dl/nxm.log
 ```
 
-If the file has no new line after a click, the handler never ran: check `nexus-dl handler status` (entry installed, still the default, executable path valid), and remember that Flatpak/Snap browsers usually cannot launch host handlers. If lines appear but no notification does, your session has no reachable notification daemon; re-run `nexus-dl handler install` to see the self-test warning, and rely on the log for outcomes.
+If the file has no new line after a click, the handler never ran: check `nexus-dl handler status` (entry installed, still the default, executable path valid), and remember that Flatpak/Snap browsers usually cannot launch host handlers.
+
+If lines appear but no notification does, the click worked and only the feedback is missing. Two common causes. First, notifications are switched off in your desktop's settings: Linux Mint/Cinnamon ships with Settings > Notifications > "Display notifications" off, and GNOME hides the same switch behind "Show banners". `nexus-dl handler install` warns when it finds the switch off; the terminal fixes are:
+
+```bash
+# Cinnamon (Linux Mint)
+gsettings set org.cinnamon.desktop.notifications display-notifications true
+
+# GNOME
+gsettings set org.gnome.desktop.notifications show-banners true
+```
+
+Second, the session has no notification tooling: nexus-dl needs `notify-send` (package `libnotify`), and tiling setups (i3, Sway, Hyprland) need a notification daemon like `dunst` or `mako`. The install probe warns about both. Rely on the log for outcomes either way.
+
+### Clicking a link downloads the file again
+
+This is by design in the default flow: the archive is deleted after a successful extraction, so there is nothing left for a second click to dedupe against, and the click downloads and verifies a fresh copy. Nothing breaks, and the extracted files are already in place. A re-click is only free when the verified archive was kept (for example with `--no-extract`): then nexus-dl reports "already downloaded" and makes no network calls.
 
 ### Mods downloaded but game doesn't see them
 
@@ -510,4 +526,4 @@ Downloading puts files in a staging area. Deploying links them into the game dir
 
 ### Something else went wrong
 
-Check the [Issues page](https://github.com/scottmccarrison/nexus-collection-dl/issues) on GitHub to see if someone has reported the same problem, or open a new issue with the error message you're seeing.
+Start with [Discussion #61: Start here: common problems and fixes](https://github.com/scottmccarrison/nexus-collection-dl/discussions/61): it collects the common failures, and it is the place to ask for help. Feature ideas and roadmap talk belong in [Discussion #64](https://github.com/scottmccarrison/nexus-collection-dl/discussions/64). For a bug, check the [Issues page](https://github.com/scottmccarrison/nexus-collection-dl/issues) to see if someone has reported the same problem, or open a new issue with the error message you're seeing.

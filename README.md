@@ -258,10 +258,38 @@ Notes:
 - Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: the nxm:// link comes from the "Mod manager download" button (right-click it and copy the link address).
 - Downloads are verified before they are published (exact size, manifest MD5 when known); a file with neither a positive expected size nor a well-formed cached checksum is refused with nothing written. A re-click with the verified archive still on disk triggers no download traffic: an entry already marked downloaded reports "already downloaded" with zero network calls, and an entry whose extraction failed finishes extracting from the retained archive, verified against the cached manifest hash when one is known (with track-sync enabled, a background tracked-mod sync may still make API calls); the default flow deletes the archive after a successful extraction, so a re-click then re-downloads and re-verifies it.
 - Extraction publishes staged files one by one, not atomically as a set: a rare mid-publication failure (disk full, permissions) can leave a subset of extracted files in place while the error is reported and staging is cleaned up; re-running (the link or `nexus-dl import`) is safe and overwrites the partial set.
-- Re-running `handler install` is idempotent: the desktop entry is always rewritten (refreshing entries from older versions), and install performs a best-effort notification-daemon self-test, warning visibly and pointing at `~/.local/state/nexus-dl/nxm.log` when no daemon is reachable.
-- Platform caveats: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox; GNOME and KDE are untested. Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported: use a native browser build or run `nexus-dl nxm` on a copied link.
+- Re-running `handler install` is idempotent: the desktop entry is always rewritten (refreshing entries from older versions). Install also probes what the click flow needs (xdg-mime, notify-send, and the desktop's notification switch where one is known), warns about anything missing or switched off, and runs a best-effort notification-daemon self-test pointing at `~/.local/state/nexus-dl/nxm.log`. Warnings never block the install.
+- Platform support and the notification gotchas have their own subsections below. The one universal limit: Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported - use a native browser build or run `nexus-dl nxm` on a copied link.
 - `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
 - Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
+
+#### Platform support
+
+The click-through flow was live-tested end to end on one machine: Linux Mint (Cinnamon) with Firefox. Everything else below is expected to work through standard mechanisms and honestly marks itself as untested. nexus-dl never gates install on desktop identity: `handler install` probes the tools and settings that actually matter (xdg-mime, notify-send, and the notification switch where one is known) and warns about what it finds.
+
+| Desktop | Status | Notes |
+|---|---|---|
+| Cinnamon (Linux Mint) | Tested live | With Firefox. Mint ships with Settings > Notifications > "Display notifications" off; the install probe warns when it finds the switch off (see [Notifications](#notifications)). |
+| GNOME | Expected to work, untested | Standard xdg-mime/desktop-entry handling. Its `show-banners` switch must be on for click notifications; the install probe warns when it finds it off. |
+| MATE, XFCE, Budgie | Expected to work, untested | GIO-family desktops; standard xdg-mime/desktop-entry handling. No notification switch to probe. |
+| KDE Plasma (including CachyOS) | Expected to work, untested | KIO-based rather than GIO, but scheme handlers register through the same xdg-mime/desktop-entry mechanisms and notify-send works. No notification switch to probe. |
+| Tiling setups (i3, Sway, Hyprland) | Expected to work, untested | Needs a notification daemon (`dunst`, `mako`, ...) for click feedback. |
+| Flatpak/Snap browsers | Unsupported | Sandboxed browsers generally cannot launch host desktop handlers. Use a native browser build, or copy the link and run `nexus-dl nxm` yourself. |
+
+#### Notifications
+
+The desktop notification is the normal confirmation for a click: successes and failures both report one, and every run also appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` whatever the desktop does. Two things silently take the notification away while the download still works:
+
+- **The desktop's notification switch is off.** Linux Mint/Cinnamon ships with Settings > Notifications > "Display notifications" off, so a fresh Mint install shows nothing after a click even though the download worked. This was a real support trap; GNOME hides the same switch behind "Show banners". `nexus-dl handler install` probes the switch where it is known and warns when it finds it off. Fixes:
+  - Cinnamon: `gsettings set org.cinnamon.desktop.notifications display-notifications true`
+  - GNOME: `gsettings set org.gnome.desktop.notifications show-banners true`
+- **No notification tooling.** nexus-dl asks for notifications through `notify-send` (package `libnotify`), and tiling setups need a notification daemon (`dunst`, `mako`, ...). Without them clicks complete silently; the install probe warns about both.
+
+When in doubt, the log is the reliable channel: `tail -n 5 ~/.local/state/nexus-dl/nxm.log` after a click.
+
+#### Common problems
+
+For a click that seems to do nothing, start with the [troubleshooting section](GUIDE.md#troubleshooting): short version, check the log first, because a new line means the click ran and only the feedback is missing. A second click re-downloads and re-verifies a file the default flow already extracted; that is by design (the archive is deleted after extraction), and re-clicks are free only when the verified archive was kept. Peer support and a fuller problem list live in [Discussion #61: Start here: common problems and fixes](https://github.com/scottmccarrison/nexus-collection-dl/discussions/61).
 
 ### Register local mods
 
@@ -427,6 +455,18 @@ sudo dnf install unrar
 # macOS
 brew install unrar
 ```
+
+## Testing beta builds
+
+The `beta` branch carries new work that is usable but lightly tested. It is always ahead of `main`, and behavior can change between beta points. Testing so far is single-machine (Linux Mint/Cinnamon with Firefox); the current beta (v0.3.0-beta.1) adds the native `nxm://` click-through handler described above.
+
+Install or switch to the beta channel:
+
+```bash
+uv tool install "nexus-collection-dl @ git+https://github.com/scottmccarrison/nexus-collection-dl@beta"
+```
+
+Report what you find in [Discussion #62: Beta testing program: v0.3.0-beta.1](https://github.com/scottmccarrison/nexus-collection-dl/discussions/62) (pinned). Include the redacted lines from `~/.local/state/nexus-dl/nxm.log`; they contain no credentials.
 
 ## License
 
