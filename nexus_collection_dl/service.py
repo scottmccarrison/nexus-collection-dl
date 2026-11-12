@@ -122,6 +122,10 @@ class SyncResult:
     pending_downloads: list[PendingDownload] = field(default_factory=list)
     collection_dir: Path | None = None
     conflicts: list[FileConflict] = field(default_factory=list)
+    # Distinct mod_ids skipped because they are tombstoned as removed.
+    # Counted per mod page, never per file: a multi-file mod whose page
+    # was removed is skipped once.
+    removed_skipped: int = 0
 
 
 @dataclass
@@ -137,6 +141,9 @@ class UpdateResult:
     tracked: int = 0
     untracked: int = 0
     pending_downloads: list[PendingDownload] = field(default_factory=list)
+    # Distinct mod_ids skipped because they are tombstoned as removed
+    # (see SyncResult.removed_skipped).
+    removed_skipped: int = 0
 
 
 @dataclass
@@ -570,6 +577,36 @@ def _resolve_import_match(
     return None, ambiguous, []
 
 
+def _filter_removed_mods(
+    mods: list[dict[str, Any]], state: CollectionState
+) -> tuple[list[dict[str, Any]], int]:
+    """Drop manifest entries whose mod_id is tombstoned as removed.
+
+    This is the ONE service-level tombstone filter, applied to the
+    manifest input of sync and update before anything consumes it
+    (comparison, pending registration, downloads, load order generation).
+    Filtering at the input keeps every comparison bucket
+    (to_install/up_to_date/to_update) consistent and maintains the
+    invariant that no state entry exists for a tombstoned mod: nothing
+    downstream can register or download a removed page. Tombstones key
+    on mod_id, so a revision bump (new file_id, same mod page) is
+    skipped just the same.
+
+    Returns (filtered_mods, skipped_count) where skipped_count is the
+    number of DISTINCT mod_ids skipped: a multi-file mod whose page was
+    removed is counted once, not once per file.
+    """
+    kept: list[dict[str, Any]] = []
+    skipped_ids: set[int] = set()
+    for mod in mods:
+        mod_id = _as_int(mod.get("mod_id"))
+        if mod_id is not None and state.is_removed(mod_id):
+            skipped_ids.add(mod_id)
+            continue
+        kept.append(mod)
+    return kept, len(skipped_ids)
+
+
 @dataclass
 class CollectionSummary:
     """One collection discovered by a local scan (see list_collections)."""
@@ -851,17 +888,33 @@ class ModManagerService:
         mods_dir = mods_dir / dir_name
         mods_dir.mkdir(parents=True, exist_ok=True)
         with CollectionLock(mods_dir):
-            mods = collection_data["mods"]
+            # Initialize state first: the tombstone filter below reads it.
+            state = CollectionState(mods_dir)
+            if state.exists():
+                state.load()
+
+            # The single tombstone filter, applied to the manifest input so
+            # every consumer sees the same filtered manifest: the free-account
+            # pending registration, the premium download paths (including the
+            # empty-state full download), compare_with_collection, and load
+            # order generation. removed_skipped counts DISTINCT mod_ids.
+            manifest_mods, removed_skipped = _filter_removed_mods(
+                collection_data["mods"], state
+            )
+            collection_data = {**collection_data, "mods": manifest_mods}
+            if removed_skipped:
+                progress(
+                    "fetch", 0.06,
+                    f"Skipping {removed_skipped} removed mod(s)",
+                )
+
+            mods = manifest_mods
             dupes = collection_data.get("duplicates_removed", 0)
             if dupes:
                 progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
             if skip_optional:
                 mods = [m for m in mods if not m.get("optional", False)]
 
-            # Initialize state
-            state = CollectionState(mods_dir)
-            if state.exists():
-                state.load()
             state.set_collection_info(
                 url=collection_info.url,
                 name=collection_data["name"],
@@ -873,7 +926,10 @@ class ModManagerService:
                 # Empty collection or every mod optional and skipped: persist the
                 # collection info so status/update recognize this collection.
                 state.save()
-                return SyncResult(0, 0, [], [], collection_dir=mods_dir)
+                return SyncResult(
+                    0, 0, [], [], collection_dir=mods_dir,
+                    removed_skipped=removed_skipped,
+                )
 
             if not is_premium:
                 # Free user: register mods as pending_download
@@ -920,6 +976,7 @@ class ModManagerService:
                     load_order_files=load_order_files,
                     pending_downloads=pending_downloads,
                     collection_dir=mods_dir,
+                    removed_skipped=removed_skipped,
                 )
 
             # Premium user: download directly
@@ -1027,6 +1084,7 @@ class ModManagerService:
                 untracked=untracked,
                 collection_dir=mods_dir,
                 conflicts=conflicts,
+                removed_skipped=removed_skipped,
             )
 
     def update(
@@ -1058,7 +1116,22 @@ class ModManagerService:
             )
 
             new_revision = collection_data["revision"]
-            mods = collection_data["mods"]
+            # The single tombstone filter, applied to the manifest input so
+            # every consumer sees the same filtered manifest (comparison
+            # buckets, pending registration, downloads, load order). This is
+            # the revision-bump guard: an entry with a NEW file_id for a
+            # removed mod page is skipped just the same. removed_skipped
+            # counts DISTINCT mod_ids.
+            manifest_mods, removed_skipped = _filter_removed_mods(
+                collection_data["mods"], state
+            )
+            collection_data = {**collection_data, "mods": manifest_mods}
+            if removed_skipped:
+                progress(
+                    "fetch", 0.06,
+                    f"Skipping {removed_skipped} removed mod(s)",
+                )
+            mods = manifest_mods
             dupes = collection_data.get("duplicates_removed", 0)
             if dupes:
                 progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
@@ -1143,6 +1216,7 @@ class ModManagerService:
                 tracked=tracked,
                 untracked=untracked,
                 pending_downloads=pending_downloads,
+                removed_skipped=removed_skipped,
             )
 
     def add_mod(
@@ -1221,6 +1295,9 @@ class ModManagerService:
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[selected_file_id].phase = 999
+                # Registering this mod is an explicit re-add, so its removal
+                # tombstone (if any) is cleared with the same commit.
+                state.clear_removed(mod_info.mod_id)
                 state.save()
 
                 pending = PendingDownload(
@@ -1275,6 +1352,9 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            # Registering this mod is an explicit re-add, so its removal
+            # tombstone (if any) is cleared with the same commit.
+            state.clear_removed(mod_info.mod_id)
             state.save()
 
             self._maybe_sync_tracked(state)
@@ -1346,6 +1426,18 @@ class ModManagerService:
         regenerated from the remaining mods unless no_load_order is set;
         a regeneration failure after the save is reported as a warning
         because the removal itself is already persisted.
+
+        Removal is recorded as a tombstone so it survives sync/update:
+        the tombstone keys on mod_id (the Nexus mod page), so a later
+        collection revision that assigns a new file id to the same page
+        cannot silently reinstall it. Tombstones apply to positive
+        Nexus mod_ids only: local synthetic mods (negative ids from
+        add_local) are removed without one (nothing in sync/update can
+        reinstall them), and legacy entries whose mod_id defaults to 0
+        are removed without tombstoning id 0 (0 is not a real mod page).
+        A tombstone is cleared by explicitly re-adding the mod. Note
+        that older builds ignore the removed_mods key and drop it on
+        save, so a downgrade can resurrect removed mods.
         """
         if (file_id is None) == (mod_id is None):
             raise ValueError("exactly one of file_id or mod_id is required")
@@ -1374,7 +1466,11 @@ class ModManagerService:
                 for fid, ms in state.mods.items()
                 if ms.mod_id == target_mod_id
             )
+            removed_name = state.mods[removed_file_ids[0]].name if removed_file_ids else ""
             state.remove_mod(target_mod_id)
+            # Tombstone positive Nexus mod pages only (see docstring).
+            if target_mod_id > 0:
+                state.mark_removed(target_mod_id, removed_name)
             try:
                 state.save()
             except Exception as e:
@@ -1811,10 +1907,25 @@ class ModManagerService:
             state = CollectionState(mods_dir)
             state.load()
 
-            # Sorted by file_id so contested files resolve deterministically
-            pending = sorted(state.get_pending_mods(), key=lambda ms: ms.file_id)
+            # Sorted by file_id so contested files resolve deterministically.
+            # Tombstoned mods are never re-registered by import: a pending
+            # entry whose mod_id is tombstoned as removed is skipped (it
+            # stays pending and is surfaced by update's to_remove) rather
+            # than fulfilled, because fulfilling it would resurrect a mod
+            # the user removed. Extraction-failure recovery still works:
+            # that path commits its pending entry AFTER clearing the
+            # tombstone, so the entry is not tombstoned when import sees it.
+            pending = sorted(
+                (ms for ms in state.get_pending_mods()
+                 if not state.is_removed(ms.mod_id)),
+                key=lambda ms: ms.file_id,
+            )
             if not pending:
-                return ImportResult(matched=0, extracted=0, still_pending=0, errors=[], load_order_files=[])
+                return ImportResult(
+                    matched=0, extracted=0,
+                    still_pending=len(state.get_pending_mods()),
+                    errors=[], load_order_files=[],
+                )
 
             # Candidate files: skip hidden files (.nexus-state.json, .DS_Store,
             # config dotfiles) and files this tool generates inside the mods dir,
@@ -1925,6 +2036,9 @@ class ModManagerService:
                 mod_state.download_status = "downloaded"
                 mod_state.browser_url = ""
                 mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+                # Importing this mod's file is an explicit re-add of the mod
+                # page, so any tombstone for it is cleared with the commit.
+                state.clear_removed(mod_state.mod_id)
                 # Persist before any destructive cleanup so a mid-run failure
                 # cannot lose progress for already-imported items.
                 state.save()
@@ -2066,7 +2180,24 @@ class ModManagerService:
                     or sniff_archive_magic(archive) is not None
                 ):
                     # Proven local duplicate: the artifact exists and is
-                    # sane, so this is a no-op with zero network calls.
+                    # sane, so this is a no-op with zero network calls and,
+                    # when no tombstone is set, zero writes. Re-clicking a
+                    # removed mod's download link is explicit re-add intent,
+                    # so a tombstone for the page is cleared here too (and
+                    # only then is state saved).
+                    dup_warnings: list[str] = []
+                    if state.is_removed(info.mod_id):
+                        state.clear_removed(info.mod_id)
+                        try:
+                            state.save()
+                        except (OSError, StateError) as e:
+                            dup_warnings.append(
+                                "The file was already downloaded, but the "
+                                "record of its earlier removal could not be "
+                                f"cleared: {e}. Nothing else failed; fix "
+                                "the underlying problem (permissions, disk "
+                                "space) and re-run to clear it."
+                            )
                     return NxmResult(
                         success=True,
                         status="already_downloaded",
@@ -2076,6 +2207,7 @@ class ModManagerService:
                         mod_name=existing.name,
                         filename=existing.filename,
                         collection_dir=target,
+                        warnings=dup_warnings,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
                 # flag; fall through and re-download. Note this is the
@@ -2141,6 +2273,10 @@ class ModManagerService:
                     existing.download_status = "downloaded"
                     existing.browser_url = ""
                     existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    # Committing this completion is explicit re-add intent,
+                    # so the page's removal tombstone (if any) is cleared
+                    # with the same save.
+                    state.clear_removed(info.mod_id)
                     try:
                         state.save()
                     except (OSError, StateError) as e:
@@ -2380,6 +2516,11 @@ class ModManagerService:
                         download_info["download_status"] = "pending_download"
                         state.add_mod(download_info)
                         state.mods[info.file_id].phase = 999
+                        # Committing this pending entry is explicit re-add
+                        # intent: clear the page's removal tombstone with the
+                        # same commit so `nexus-dl import` can finish the
+                        # recovery (import skips tombstoned entries).
+                        state.clear_removed(info.mod_id)
                         state.save()
                     elif existing.download_status == "downloaded":
                         # Recover a previously-downloaded entry: without
@@ -2393,12 +2534,19 @@ class ModManagerService:
                         # extraction. Best-effort save under the already-
                         # held collection lock: a save failure must not
                         # mask the extraction error, and the prior on-disk
-                        # state (and in-memory status) is left standing.
+                        # state (and in-memory status and tombstones) is
+                        # left standing.
                         existing.download_status = "pending_download"
+                        # Committing the pending regression is explicit
+                        # re-add intent (see the branch above).
+                        removed_snapshot = state.removed_mods.get(info.mod_id)
+                        state.clear_removed(info.mod_id)
                         try:
                             state.save()
                         except (OSError, StateError) as save_exc:
                             existing.download_status = "downloaded"
+                            if removed_snapshot is not None:
+                                state.removed_mods[info.mod_id] = removed_snapshot
                             state_note = (
                                 " The collection state could not be "
                                 f"updated ({save_exc}), so the entry "
@@ -2430,6 +2578,10 @@ class ModManagerService:
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
+            # Completing this download is explicit re-add intent, so the
+            # page's removal tombstone (if any) is cleared with the same
+            # save that marks the file downloaded.
+            state.clear_removed(info.mod_id)
             try:
                 state.save()
             except (OSError, StateError) as e:
