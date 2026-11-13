@@ -9,6 +9,7 @@ is fake and asserted absent from all output.
 """
 
 import io
+import re
 from pathlib import Path
 
 import pytest
@@ -16,15 +17,23 @@ from click.testing import CliRunner
 from rich.console import Console
 
 from nexus_collection_dl import cli as cli_module
+from nexus_collection_dl import service as service_module
 from nexus_collection_dl import updater as updater_module
 from nexus_collection_dl.service import (
     AddResult,
+    HealthProbes,
     ModManagerService,
     NxmResult,
     PendingDownload,
     SyncResult,
 )
-from nexus_collection_dl.shell import _MAX_INPUT_FAILURES, run_shell
+from nexus_collection_dl.shell import (
+    _COMMAND_HELP,
+    _HELP_BY_NAME,
+    _MAX_INPUT_FAILURES,
+    _ShellSession,
+    run_shell,
+)
 from nexus_collection_dl.state import (
     CollectionState,
     StateBusyError,
@@ -518,7 +527,7 @@ def test_busy_lock_error_keeps_loop_alive(shell_env, tmp_path, monkeypatch):
     )
 
     result = run_cli(
-        root, "/use 1\n/status\n/help\n/quit\n",
+        root, "/use 1\n/status 1\n/help\n/quit\n",
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
@@ -555,7 +564,7 @@ def test_keyboard_interrupt_during_service_call_reports_interruption(
     FakeShellService.status_error = KeyboardInterrupt()
 
     result = run_cli(
-        root, "/use 1\n/status\n/quit\n",
+        root, "/use 1\n/status 1\n/quit\n",
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
@@ -923,9 +932,15 @@ def test_remove_rejects_non_numeric_id(shell_env, tmp_path):
 def test_status_renders_revision_and_mod_table(
     shell_env, tmp_path, monkeypatch
 ):
+    """/status <target> keeps the revision comparison (network) and adds
+    the collection's local details: counts, stored URL, state path."""
     from nexus_collection_dl.service import ModStatus, StatusResult
 
     root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    # Tombstone one mod page so the local detail counts it.
+    state = reload_state(root / "Test Collection")
+    state.mark_removed(123, "Test Mod")
+    state.save()
     FakeShellService.status_result = StatusResult(
         collection_name="Test Collection",
         collection_url=COLLECTION_URL,
@@ -942,7 +957,7 @@ def test_status_renders_revision_and_mod_table(
     )
 
     result = run_cli(
-        root, "/use 1\n/status\n/quit\n",
+        root, "/use 1\n/status 1\n/quit\n",
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
@@ -951,6 +966,14 @@ def test_status_renders_revision_and_mod_table(
     assert "update available" in out
     assert "Test Mod" in out
     assert "update_available" in out
+    # Local details alongside the network comparison.
+    assert f"State path: {root / 'Test Collection' / STATE_FILENAME}" in out
+    assert f"Collection URL: {COLLECTION_URL}" in out
+    assert "Local: 1 mod(s), 0 pending, 1 removed (tombstoned)" in out
+    # The revision check ran exactly once, for the target collection.
+    assert FakeShellService.calls == [
+        {"method": "get_status", "mods_dir": root / "Test Collection"}
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1015,7 @@ def test_oserror_mid_command_renders_and_continues(
     FakeShellService.status_error = OSError("No such device or address")
 
     result = run_cli(
-        root, "/use 1\n/status\n/help\n/quit\n",
+        root, "/use 1\n/status 1\n/help\n/quit\n",
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
@@ -1107,3 +1130,383 @@ def test_quit_exit_and_eof_all_leave_zero(shell_env, tmp_path):
     for script in ("/quit\n", "/exit\n", ""):
         result = run_cli(root, script)
         assert result.exit_code == 0
+
+
+# ---------------------------------------------------------------------------
+# per-command help: <command> --help and /help <command>
+# ---------------------------------------------------------------------------
+
+def test_add_help_shows_usage_and_executes_nothing(shell_env, tmp_path, monkeypatch):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, "/add --help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "/add <url>" in out
+    assert "add one mod (https:// mod page or nxm:// link)" in out
+    assert "/add https://www.nexusmods.com/skyrimspecialedition/mods/12345" in out
+    assert "/add nxm://skyrimspecialedition/mods/12345/files/67890" in out
+    # Help renders instead of executing.
+    assert FakeShellService.calls == []
+
+
+def test_sync_help_shows_three_target_forms_and_executes_nothing(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, "/sync --help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "/sync [<index|name|url>]" in out
+    assert (
+        "/sync https://next.nexusmods.com/skyrimspecialedition/collections/abc123"
+    ) in out
+    assert "/sync 2" in out
+    assert FakeShellService.calls == []
+
+
+def test_remove_help_shows_usage_and_executes_nothing(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, "/remove --help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "/remove <file_id|mod:id>" in out
+    assert "/remove 456" in out
+    assert "/remove mod:123" in out
+    assert FakeShellService.calls == []
+
+
+def test_help_command_alias_shows_the_same_help(shell_env, tmp_path, monkeypatch):
+    """/help add renders the /add help and executes nothing."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, "/help add\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "/add <url>" in out
+    assert "/add https://www.nexusmods.com/skyrimspecialedition/mods/12345" in out
+    assert FakeShellService.calls == []
+
+
+def test_help_specs_cover_every_registered_command():
+    """Every command in the registry (aliases included) has help text."""
+    assert set(_HELP_BY_NAME) == {
+        command.lstrip("/") for command in _ShellSession._COMMANDS
+    }
+
+
+@pytest.mark.parametrize("command", sorted(_ShellSession._COMMANDS))
+def test_every_registered_command_has_a_help_path(
+    shell_env, tmp_path, monkeypatch, command
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, f"{command} --help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Error:" not in out
+    assert _HELP_BY_NAME[command.lstrip("/")].form in out
+    assert FakeShellService.calls == []
+
+
+def test_bare_help_line_shows_the_command_list(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(root, "--help\n/quit\n")
+    assert result.exit_code == 0
+    out = result.output
+    assert "Shell commands" in out
+    assert "/add <url>" in out
+    assert "Unknown input" not in out
+
+
+def test_unknown_command_help_flag_uses_the_usual_path(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root, "/frobnicate --help\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert "Unknown command '/frobnicate'" in result.output
+    assert "try /help" in result.output
+    assert FakeShellService.calls == []
+
+
+def test_help_flag_only_triggers_as_the_sole_argument(
+    shell_env, tmp_path, monkeypatch
+):
+    """--help must never swallow a real argument that merely contains it."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    url = "https://next.nexusmods.com/games/collections/--help"
+    result = run_cli(
+        root, f"/sync {url}\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    # The URL synced as data; it was not answered with help text.
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": url, "mods_dir": root}
+    ]
+    assert "usage:" not in result.output
+
+
+def test_collection_named_help_flag_is_reachable_by_index(shell_env, tmp_path):
+    root = tmp_path / "root"
+    write_collection(root / "weird", name="--help")
+    write_collection(root / "normal", name="Normal")
+
+    # /use --help shows help instead of selecting (documented collision).
+    result = run_cli(root, "/use --help\n/quit\n")
+    assert "usage:" in result.output
+    assert "Using" not in result.output
+
+    # The index form still selects the collection named "--help".
+    result = run_cli(root, "/use 1\n/quit\n")
+    assert "Using '--help'" in result.output
+
+
+# ---------------------------------------------------------------------------
+# bare /status: tool-wide local report (no network, no selection needed)
+# ---------------------------------------------------------------------------
+
+def fake_health_probes(**overrides):
+    """Deterministic HealthProbes: no host probes, nothing to warn about."""
+    fields = dict(
+        api_key_source=lambda: ("stored", None),
+        handler_status=lambda: {
+            "entry_installed": True,
+            "is_default": True,
+            "current_default": "nexus-dl-nxm.desktop",
+            "xdg_mime_available": True,
+        },
+        notifications_enabled=lambda: None,
+        notification_setting=lambda: None,
+        capability_warnings=lambda: [],
+        lock_state=lambda d: "free",
+    )
+    fields.update(overrides)
+    return HealthProbes(**fields)
+
+
+def use_fake_probes(monkeypatch, **overrides):
+    """Route collect_health's host probes through deterministic fakes."""
+    monkeypatch.setattr(
+        service_module, "default_health_probes",
+        lambda: fake_health_probes(**overrides),
+    )
+
+
+def test_bare_status_is_local_only_and_needs_no_collection(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(
+        tmp_path,
+        ("Alpha Pack", [
+            mod_entry(file_id=1, mod_id=10, name="A Mod"),
+            mod_entry(file_id=2, mod_id=20, name="B Mod",
+                      download_status="pending_download"),
+        ]),
+        ("Beta Pack", [mod_entry(file_id=3, mod_id=30, name="C Mod")]),
+    )
+    use_fake_probes(monkeypatch)
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    # No collection selected and no network: get_status must not run.
+    assert FakeShellService.calls == []
+    # (a) overview and totals
+    assert "Games and collections" in out
+    assert GAME in out
+    assert "Total: 1 game(s), 2 collection(s), 3 mod(s), 1 pending." in out
+    # (b) removal summary renders per collection
+    assert "Tombstoned mods" in out
+    # (c) health lines
+    assert "Health" in out
+    assert "API key: stored (keystore)" in out
+    assert "nxm handler: installed and the default nxm:// handler" in out
+
+
+def test_bare_status_removal_summary_counts_tombstones(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(
+        tmp_path,
+        ("Alpha Pack", [mod_entry(file_id=1, mod_id=10, name="A Mod")]),
+        ("Beta Pack", [mod_entry(file_id=2, mod_id=20, name="B Mod")]),
+    )
+    state = reload_state(root / "Alpha Pack")
+    state.mark_removed(10, "A Mod")
+    state.mark_removed(11, "Other Removed")
+    state.save()
+    use_fake_probes(monkeypatch)
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Tombstoned mods" in out
+    assert "Total removed (tombstoned): 2 mod(s)." in out
+    assert re.search(r"Alpha Pack.*\b2\b", out)
+    assert re.search(r"Beta Pack.*\b0\b", out)
+
+
+def test_bare_status_health_reports_missing_key_and_handler(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    use_fake_probes(
+        monkeypatch,
+        api_key_source=lambda: (None, None),
+        handler_status=lambda: {
+            "entry_installed": False, "is_default": False,
+            "current_default": None, "xdg_mime_available": True,
+        },
+    )
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "WARN API key: not set" in out
+    assert "handler set-api-key" in out
+    assert "WARN nxm handler: not installed" in out
+    assert "nexus-dl handler install" in out
+    assert "API key: stored" not in out
+
+
+def test_status_health_warns_with_gsettings_fix_when_notifications_disabled(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    fix = ("gsettings set org.cinnamon.desktop.notifications"
+           " display-notifications true")
+    use_fake_probes(
+        monkeypatch,
+        notification_setting=lambda: (
+            "org.cinnamon.desktop.notifications", "display-notifications", fix,
+        ),
+        notifications_enabled=lambda: False,
+    )
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "WARN Notifications: disabled" in out
+    assert fix in out
+
+
+def test_status_health_is_silent_for_an_unknown_desktop(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    use_fake_probes(monkeypatch)  # notification_setting -> None: unknown
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Notifications" not in out
+    assert "gsettings" not in out
+
+
+def test_status_health_surfaces_invalid_state_files(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Good Collection", [mod_entry()]))
+    broken = root / "Broken Dir"
+    broken.mkdir()
+    (broken / STATE_FILENAME).write_text("{ not json")
+    use_fake_probes(monkeypatch)
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "WARN State files: 1 unreadable state file(s)" in out
+    assert "Broken Dir" in out
+    # The healthy collection still renders in the overview.
+    assert GAME in out
+
+
+def test_status_health_check_failure_renders_error_and_status_completes(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+
+    def boom():
+        raise RuntimeError("probe exploded")
+
+    use_fake_probes(monkeypatch, handler_status=boom)
+    result = run_cli(
+        root, "/status\n/games\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "ERROR nxm handler: check failed (RuntimeError" in out
+    # A failing check is a line, not a traceback, and the other checks
+    # and commands still ran.
+    assert "Traceback" not in out
+    assert "API key: stored (keystore)" in out
+    assert "Games" in out
+
+
+def test_status_output_never_carries_the_api_key(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    use_fake_probes(monkeypatch, api_key_source=lambda: ("flag", None))
+    svc = FakeShellService(api_key="SUPERSECRETKEYVALUE")
+    code, out = run_direct(svc, root, ["/status", "/quit"])
+    assert code == 0
+    assert "API key: passed to this session" in out
+    assert "SUPERSECRETKEYVALUE" not in out
+
+
+def test_bare_status_works_on_an_empty_root(shell_env, tmp_path, monkeypatch):
+    root = tmp_path / "empty"
+    root.mkdir()
+    use_fake_probes(monkeypatch)
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "No collections found under" in out
+    assert "Health" in out
+    assert FakeShellService.calls == []
+
+
+def test_status_help_documents_the_tool_wide_default(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(root, "/status --help\n/quit\n")
+    assert result.exit_code == 0
+    out = result.output
+    assert "/status [<index|name>]" in out
+    assert "tool-wide" in out
+    assert "needs network" in out

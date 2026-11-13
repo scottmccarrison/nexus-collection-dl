@@ -33,7 +33,22 @@ from .downloader import (
     validate_download_filename,
 )
 from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
-from .handler import NxmRoutingError, resolve_collection_dir
+from .handler import (
+    DesktopInstaller,
+    NxmRoutingError,
+    _desktop_notification_setting,
+    capability_warnings,
+    notifications_enabled_in_desktop,
+    resolve_collection_dir,
+)
+from .keystore import (
+    ENV_VAR_NAME,
+    SOURCE_ENV,
+    SOURCE_FLAG,
+    SOURCE_STORED,
+    KeyStoreError,
+    resolve_api_key,
+)
 from .loadorder import LoadOrderGenerator
 from .loot_sort import (
     is_bethesda_game,
@@ -49,6 +64,7 @@ from .state import (
     CollectionLock,
     LoadOrderRegenError,
     StateError,
+    LOCK_FILENAME,
     STATE_FILENAME,
 )
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
@@ -650,14 +666,38 @@ class RemoveModResult:
     warnings: list[str]
 
 
-def list_collections(root: Path) -> list[CollectionSummary]:
-    """List collections under root from local state only (read-only).
+@dataclass
+class SkippedCollection:
+    """One candidate collection dir a scan could not read (see scan_collections).
 
-    Scans root itself plus its immediate subdirectories for
-    .nexus-state.json files, so both a collections root and a single
-    collection directory are valid inputs. Invalid or unreadable state
-    files are skipped silently: one broken collection must never hide
-    the healthy ones. Never touches the network. Sorted by name.
+    ``reason`` is a short, secret-free diagnostic (the exception type
+    plus the first line of its message, truncated) so a diagnostic view
+    can name broken state files without echoing their contents.
+    """
+
+    name: str
+    path: Path
+    reason: str
+
+
+@dataclass
+class CollectionScan:
+    """Result of scan_collections: readable collections plus skipped ones."""
+
+    collections: list[CollectionSummary]
+    skipped: list[SkippedCollection]
+
+
+def scan_collections(root: Path) -> CollectionScan:
+    """Scan root for collections, reporting the ones that could not be read.
+
+    Same candidate rules as list_collections (root itself plus its
+    immediate subdirectories holding .nexus-state.json) and the same
+    tolerance for broken states, but skipped directories are reported
+    with a short reason instead of dropped silently, so callers that
+    want a diagnostic view (the shell's /status health report) can
+    surface them without changing list_collections' silent-skip
+    contract. Never touches the network. Sorted by name.
     """
     root = Path(root)
     candidates: list[Path] = []
@@ -671,14 +711,23 @@ def list_collections(root: Path) -> list[CollectionSummary]:
         )
 
     summaries: list[CollectionSummary] = []
+    skipped: list[SkippedCollection] = []
     for cdir in candidates:
         try:
             state = CollectionState(cdir)
             state.load()
-        except Exception:
+        except Exception as e:
             # Unreadable, malformed, or partially hand-edited state:
-            # skip this collection silently. (load() can surface
+            # record it and keep scanning. (load() can surface
             # StateError, OSError, or int()/type errors on bad keys.)
+            reason = (str(e) or type(e).__name__).strip().splitlines()[0]
+            skipped.append(
+                SkippedCollection(
+                    name=cdir.name,
+                    path=cdir,
+                    reason=f"{type(e).__name__}: {reason[:60]}",
+                )
+            )
             continue
         summaries.append(
             CollectionSummary(
@@ -690,7 +739,19 @@ def list_collections(root: Path) -> list[CollectionSummary]:
             )
         )
     summaries.sort(key=lambda s: (s.name.lower(), str(s.path)))
-    return summaries
+    return CollectionScan(collections=summaries, skipped=skipped)
+
+
+def list_collections(root: Path) -> list[CollectionSummary]:
+    """List collections under root from local state only (read-only).
+
+    Scans root itself plus its immediate subdirectories for
+    .nexus-state.json files, so both a collections root and a single
+    collection directory are valid inputs. Invalid or unreadable state
+    files are skipped silently: one broken collection must never hide
+    the healthy ones. Never touches the network. Sorted by name.
+    """
+    return scan_collections(root).collections
 
 
 def list_mods(mods_dir: Path) -> list[ModSummary]:
@@ -730,6 +791,41 @@ def get_collection_url(mods_dir: Path) -> str:
     state = CollectionState(mods_dir)
     state.load()
     return state.collection_url
+
+
+@dataclass
+class CollectionLocalDetails:
+    """Local-only snapshot of one collection (see collection_local_details)."""
+
+    name: str
+    game_domain: str
+    mod_count: int
+    pending_count: int
+    tombstone_count: int
+    collection_url: str
+    state_path: Path
+
+
+def collection_local_details(mods_dir: Path) -> CollectionLocalDetails:
+    """Read one collection's local counts and metadata (read-only, no network).
+
+    Reports tracked mods, pending downloads, removal tombstones
+    (state.removed_mods), the collection_url recorded at the last sync,
+    and the state file path. Raises StateError exactly like list_mods
+    when the state cannot be read.
+    """
+    mods_dir = Path(mods_dir)
+    state = CollectionState(mods_dir)
+    state.load()
+    return CollectionLocalDetails(
+        name=state.collection_name or mods_dir.name,
+        game_domain=state.game_domain,
+        mod_count=len(state.mods),
+        pending_count=len(state.get_pending_mods()),
+        tombstone_count=len(state.removed_mods),
+        collection_url=state.collection_url,
+        state_path=mods_dir / STATE_FILENAME,
+    )
 
 
 class ModManagerService:
@@ -3122,3 +3218,372 @@ def _select_mod_file(
         return max(non_archived, key=lambda f: f.get("file_id", 0))
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# health report (read-only tool-wide diagnostics; see collect_health)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HealthCheck:
+    """One line of the /status health report (see collect_health)."""
+
+    label: str
+    # "OK", "WARN", or "ERROR" (ERROR = the check itself failed).
+    status: str
+    detail: str
+    remedy: str | None = None
+
+
+def _probe_api_key_source() -> tuple[str | None, str | None]:
+    """(source, error) for the effective API key; the value is discarded.
+
+    Wraps keystore.resolve_api_key so the health report can say where a
+    key comes from without any secret reaching it by construction: the
+    resolved value is dropped here and never leaves this function.
+    """
+    try:
+        _value, source = resolve_api_key(None)
+    except KeyStoreError as e:
+        return None, str(e)
+    return source, None
+
+
+def _probe_handler_status() -> dict:
+    """Read-only desktop-handler diagnostics (handler.DesktopInstaller)."""
+    return DesktopInstaller().status()
+
+
+def _flock_held(lock_path: Path) -> bool | None:
+    """Is a kernel flock currently held on lock_path? None when unknowable.
+
+    Reads /proc/locks (Linux) and matches FLOCK entries by device and
+    inode, which is strictly read-only: probing with a real flock would
+    momentarily conflict with a concurrent writer and could make it see
+    a spurious busy error. flock locks are released by the kernel when
+    the holding process exits, so an entry here always means a live
+    holder and no lock file can ever be "stale".
+    """
+    try:
+        st = os.stat(lock_path)
+        lines = (Path("/proc/locks")).read_text().splitlines()
+    except OSError:
+        return None
+    major, minor = os.major(st.st_dev), os.minor(st.st_dev)
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 6 or parts[1] != "FLOCK":
+            continue
+        try:
+            dev_major, dev_minor, inode = parts[5].split(":")
+            found = (
+                int(dev_major, 16),
+                int(dev_minor, 16),
+                int(inode, 10),
+            )
+        except ValueError:
+            continue
+        if found == (major, minor, st.st_ino):
+            return True
+    return False
+
+
+def _lock_state(dir_path: Path) -> str:
+    """One collection's state-lock state: "held", "free", or "unknown"."""
+    lock_path = Path(dir_path) / LOCK_FILENAME
+    try:
+        if not lock_path.is_file():
+            return "free"
+    except OSError:
+        return "unknown"
+    held = _flock_held(lock_path)
+    if held is None:
+        return "unknown"
+    return "held" if held else "free"
+
+
+@dataclass
+class HealthProbes:
+    """Injectable host-probe seams for collect_health.
+
+    Defaults call the real helpers; tests replace the fields so no host
+    subprocess (xdg-mime, gsettings, notify-send) ever runs in a test.
+    Every callable may raise: collect_health renders an unexpected
+    failure as an ERROR line and keeps going. None of them ever handle
+    secret values except api_key_source's default, which discards the
+    key inside _probe_api_key_source.
+    """
+
+    # (source, error) for the effective API key; never the value.
+    api_key_source: Callable[
+        [], tuple[str | None, str | None]
+    ] = _probe_api_key_source
+    # DesktopInstaller().status(): entry installed, xdg-mime default.
+    handler_status: Callable[[], dict] = _probe_handler_status
+    # True/False, or None when the desktop/switch is unknown.
+    notifications_enabled: Callable[[], "bool | None"] = (
+        lambda: notifications_enabled_in_desktop()
+    )
+    # (schema, key, fix command) for this desktop, or None when unknown.
+    notification_setting: Callable[[], "tuple[str, str, str] | None"] = (
+        lambda: _desktop_notification_setting()
+    )
+    # xdg-mime / notify-send findings (handler.capability_warnings).
+    capability_warnings: Callable[[], list[str]] = (
+        lambda: capability_warnings()
+    )
+    # Per-collection lock state: "free", "held", or "unknown".
+    lock_state: Callable[[Path], str] = _lock_state
+
+
+def default_health_probes() -> HealthProbes:
+    """Real host probes for collect_health; tests substitute fakes."""
+    return HealthProbes()
+
+
+def _health_api_key(
+    probes: HealthProbes, api_key_present: bool
+) -> list[HealthCheck]:
+    """API-key availability and source; the value is never inspected."""
+    source, error = probes.api_key_source()
+    if error:
+        return [
+            HealthCheck(
+                "API key",
+                "WARN",
+                "the stored key file could not be read",
+                f"{error}",
+            )
+        ]
+    if source == SOURCE_STORED:
+        return [HealthCheck("API key", "OK", "stored (keystore)")]
+    if source == SOURCE_ENV:
+        return [
+            HealthCheck(
+                "API key", "OK", f"set ({ENV_VAR_NAME} environment variable)"
+            )
+        ]
+    if source == SOURCE_FLAG or api_key_present:
+        return [HealthCheck("API key", "OK", "passed to this session")]
+    return [
+        HealthCheck(
+            "API key",
+            "WARN",
+            "not set",
+            f"export {ENV_VAR_NAME} or run 'nexus-dl handler set-api-key'",
+        )
+    ]
+
+
+def _health_handler(probes: HealthProbes) -> list[HealthCheck]:
+    """nxm handler install state and the xdg-mime default (read-only)."""
+    info = probes.handler_status()
+    if not info.get("entry_installed"):
+        return [
+            HealthCheck(
+                "nxm handler",
+                "WARN",
+                "not installed",
+                "Install with 'nexus-dl handler install' to handle "
+                "nxm:// clicks.",
+            )
+        ]
+    if info.get("is_default"):
+        return [
+            HealthCheck(
+                "nxm handler",
+                "OK",
+                "installed and the default nxm:// handler",
+            )
+        ]
+    current = info.get("current_default")
+    if current:
+        return [
+            HealthCheck(
+                "nxm handler",
+                "WARN",
+                f"installed but not the default (current default: {current})",
+                "Re-run 'nexus-dl handler install' to take back the "
+                "nxm:// default.",
+            )
+        ]
+    if info.get("xdg_mime_available"):
+        return [
+            HealthCheck(
+                "nxm handler",
+                "WARN",
+                "installed but no default nxm:// handler is registered",
+                "Re-run 'nexus-dl handler install'.",
+            )
+        ]
+    return [
+        HealthCheck(
+            "nxm handler",
+            "OK",
+            "installed (default handler unknown: xdg-mime not available)",
+        )
+    ]
+
+
+def _health_notifications(probes: HealthProbes) -> list[HealthCheck]:
+    """Desktop notification-display switch; silent when unknowable.
+
+    Reuses handler's batch-E probe helpers: an unknown desktop, missing
+    gsettings, or an unreadable switch is not a finding at all (no line
+    is rendered), exactly like the install-time behavior. A switch
+    known to be off gets a WARN with the exact fix command.
+    """
+    spec = probes.notification_setting()
+    if spec is None:
+        return []
+    enabled = probes.notifications_enabled()
+    if enabled is None:
+        return []
+    schema, key, fix = spec
+    if enabled:
+        return [
+            HealthCheck(
+                "Notifications", "OK", "enabled in this desktop's settings"
+            )
+        ]
+    return [
+        HealthCheck(
+            "Notifications",
+            "WARN",
+            f"disabled in this desktop's settings ({schema} {key} is false)",
+            fix,
+        )
+    ]
+
+
+def _health_capabilities(probes: HealthProbes) -> list[HealthCheck]:
+    """xdg-mime / notify-send findings from handler.capability_warnings."""
+    spec = probes.notification_setting()
+    fix = spec[2] if spec is not None else None
+    warnings = list(probes.capability_warnings())
+    if fix:
+        # The notification-switch warning is the Notifications check's
+        # finding (same fix string from the same settings table); drop
+        # it here so one problem renders exactly once.
+        warnings = [w for w in warnings if fix not in w]
+    if not warnings:
+        return [
+            HealthCheck(
+                "Desktop tools",
+                "OK",
+                "xdg-mime and notify-send are present and working",
+            )
+        ]
+    return [HealthCheck("Desktop tools", "WARN", w) for w in warnings]
+
+
+def _health_state_files(scan: CollectionScan) -> list[HealthCheck]:
+    """Broken state files the collection listings skip silently."""
+    if not scan.skipped:
+        count = len(scan.collections)
+        detail = (
+            f"{count} collection state file(s) readable"
+            if count
+            else "no collection state files found"
+        )
+        return [HealthCheck("State files", "OK", detail)]
+    names = ", ".join(f"{s.name} [{s.reason}]" for s in scan.skipped)
+    return [
+        HealthCheck(
+            "State files",
+            "WARN",
+            f"{len(scan.skipped)} unreadable state file(s) that the "
+            f"listings skip: {names}",
+            "Fix or remove those .nexus-state.json files (or re-sync "
+            "the collections).",
+        )
+    ]
+
+
+def _health_locks(
+    probes: HealthProbes, scan: CollectionScan
+) -> list[HealthCheck]:
+    """Report in-use state locks; stale locks cannot exist here.
+
+    The writer lock is a kernel flock, released automatically when the
+    holding process exits, and the lock file is never removed and
+    carries no state: a leftover .nexus-state.lock is normal and is
+    never reported. The read-only probe only separates "in use by a
+    running operation" from "free"; a lock in use is not stale.
+    """
+    dirs = [c.path for c in scan.collections] + [
+        s.path for s in scan.skipped
+    ]
+    if not dirs:
+        return [HealthCheck("State locks", "OK", "no collections to check")]
+    states = [probes.lock_state(d) for d in dirs]
+    if all(s == "unknown" for s in states):
+        return [
+            HealthCheck(
+                "State locks",
+                "OK",
+                "skipped: lock state could not be read on this platform "
+                "(flock locks are released on exit in any case, so stale "
+                "lock files cannot exist)",
+            )
+        ]
+    held = sum(1 for s in states if s == "held")
+    unknown = sum(1 for s in states if s == "unknown")
+    if held:
+        detail = (
+            f"{held} of {len(dirs)} collection state lock(s) in use by "
+            "running operations (not stale)"
+        )
+    else:
+        detail = "no collection state lock is in use"
+    detail += (
+        "; flock locks are released on exit, so stale lock files "
+        "cannot exist"
+    )
+    if unknown:
+        detail += f" ({unknown} not checked)"
+    return [HealthCheck("State locks", "OK", detail)]
+
+
+def collect_health(
+    root: Path,
+    *,
+    scan: CollectionScan | None = None,
+    api_key_present: bool = False,
+    probes: HealthProbes | None = None,
+) -> list[HealthCheck]:
+    """Build the tool-wide health report. Read-only, never networked.
+
+    One entry per check (the desktop-tools check can produce one entry
+    per finding). Every check is individually guarded: an unexpected
+    failure renders as an ERROR line naming the exception type, and the
+    remaining checks still run. No output carries a secret: the API-key
+    check reports the source label only, and its probe discards the key
+    value by construction.
+    """
+    probes = probes or default_health_probes()
+    if scan is None:
+        scan = scan_collections(root)
+
+    def guarded(label, fn) -> list[HealthCheck]:
+        try:
+            return fn()
+        except Exception as e:
+            reason = (str(e) or "").strip().splitlines()
+            detail = f"check failed ({type(e).__name__})"
+            if reason:
+                detail = f"check failed ({type(e).__name__}: {reason[0][:60]})"
+            return [HealthCheck(label, "ERROR", detail)]
+
+    checks: list[HealthCheck] = []
+    for label, fn in (
+        ("API key", lambda: _health_api_key(probes, api_key_present)),
+        ("nxm handler", lambda: _health_handler(probes)),
+        ("Notifications", lambda: _health_notifications(probes)),
+        ("Desktop tools", lambda: _health_capabilities(probes)),
+        ("State files", lambda: _health_state_files(scan)),
+        ("State locks", lambda: _health_locks(probes, scan)),
+    ):
+        checks.extend(guarded(label, fn))
+    return checks

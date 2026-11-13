@@ -30,10 +30,25 @@ Design notes:
   collection. The last two sync the collection_url the state recorded
   at its last sync (service.get_collection_url) and fail with a
   pointer to the URL form when the state records none.
+* Every command accepts ``--help`` as its sole argument (e.g.
+  ``/add --help``) and ``/help <command>`` shows the same compact
+  usage (form, one-line summary, a few usage lines with one realistic
+  example) instead of executing. Help triggers only when ``--help`` is
+  the entire argument, so it can never swallow a URL or name that
+  merely contains that text; a collection literally named "--help" is
+  still reachable by index. A bare ``--help`` line shows the command
+  list.
+* /status has two forms. Bare /status is a tool-wide LOCAL report
+  (games/collections overview, removal tombstones, health checks) that
+  never touches the network and works with no collection selected, and
+  stays tool-wide even when a collection is selected. /status
+  <index|name> keeps the original per-collection revision comparison
+  (svc.get_status, network) and adds the collection's local details.
 * No new dependencies: stdlib input() plus the rich console the CLI
   already uses. No completion, no history.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
@@ -56,12 +71,16 @@ from .redaction import (
 from .service import (
     AddResult,
     CollectionSummary,
+    HealthCheck,
     ModManagerService,
     NxmResult,
     SyncResult,
+    collect_health,
+    collection_local_details,
     get_collection_url,
     list_collections,
     list_mods,
+    scan_collections,
 )
 from .state import StateBusyError, StateError
 
@@ -82,21 +101,102 @@ _DOMAIN_ERRORS = (
     HandlerError,
 )
 
-_HELP_LINES = (
-    ("/help", "show this command list"),
-    ("/collections", "list collections under the root"),
-    ("/games", "list games with collection and mod counts"),
-    ("/use <index|name>", "select the collection other commands work on"),
-    ("/mods [collection]", "list tracked mods (default: current collection)"),
-    ("/add <url>", "add one mod (https:// mod page or nxm:// link)"),
-    (
+@dataclass(frozen=True)
+class _CommandHelp:
+    """Help text for one command.
+
+    The /help table shows ``form`` and ``summary``; ``/help <command>``
+    and ``<command> --help`` add the compact ``usage`` block. ``form``
+    is the single source of the argument syntax, so the table and the
+    per-command help can never drift apart.
+    """
+
+    form: str
+    summary: str
+    usage: tuple[str, ...] = ()
+    # /exit is an alias row, documented under /quit and hidden from the
+    # table (its --help still works).
+    in_table: bool = True
+
+    @property
+    def name(self) -> str:
+        """Command word without arguments or leading slash (e.g. 'add')."""
+        return self.form.split()[0].lstrip("/").lower()
+
+
+_COMMAND_HELP = (
+    _CommandHelp("/help", "show this command list", (
+        "/help",
+        "/help sync",
+    )),
+    _CommandHelp("/collections", "list collections under the root", (
+        "/collections",
+    )),
+    _CommandHelp("/games", "list games with collection and mod counts", (
+        "/games",
+    )),
+    _CommandHelp(
+        "/use <index|name>",
+        "select the collection other commands work on",
+        (
+            "/use 2",
+            "/use Clean Visuals",
+        ),
+    ),
+    _CommandHelp(
+        "/mods [collection]",
+        "list tracked mods (default: current collection)",
+        (
+            "/mods",
+            "/mods 2",
+        ),
+    ),
+    _CommandHelp(
+        "/add <url>",
+        "add one mod (https:// mod page or nxm:// link)",
+        (
+            "/add https://www.nexusmods.com/skyrimspecialedition/mods/12345",
+            "/add nxm://skyrimspecialedition/mods/12345/files/67890",
+        ),
+    ),
+    _CommandHelp(
         "/sync [<index|name|url>]",
         "sync a collection (default: the current collection)",
+        (
+            "/sync https://next.nexusmods.com/skyrimspecialedition/"
+            "collections/abc123",
+            "/sync 2",
+            "/sync",
+        ),
     ),
-    ("/remove <file_id|mod:id>", "remove a mod from the current collection"),
-    ("/status", "show collection status vs the latest revision"),
-    ("/quit", "leave the shell (also /exit, or Ctrl-D)"),
+    _CommandHelp(
+        "/remove <file_id|mod:id>",
+        "remove a mod from the current collection",
+        (
+            "/remove 456",
+            "/remove mod:123",
+        ),
+    ),
+    _CommandHelp(
+        "/status [<index|name>]",
+        "tool-wide overview and health report, or one collection vs the "
+        "latest revision",
+        (
+            "/status     tool-wide overview and health, no network "
+            "(tool-wide even with a collection selected)",
+            "/status 2   one collection vs the latest revision "
+            "(needs network)",
+        ),
+    ),
+    _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
+    _CommandHelp(
+        "/exit", "leave the shell (alias of /quit)", ("/exit",), in_table=False
+    ),
 )
+
+# Command word (no slash) -> help spec. Every key of _COMMANDS has one:
+# tests/test_shell.py asserts the two stay in sync.
+_HELP_BY_NAME = {spec.name: spec for spec in _COMMAND_HELP}
 
 # The only input that confirms a /remove. Anything else, including "no"
 # and Ctrl-C, aborts with no change.
@@ -295,10 +395,28 @@ class _ShellSession:
                     "For the command list, try /help."
                 )
                 return
-            handler(self, rest.strip())
+            rest = rest.strip()
+            # Per-command help: --help as the ENTIRE argument shows the
+            # command's usage instead of executing. A narrower trigger
+            # could swallow a URL or name that merely contains the text.
+            if rest.lower() == "--help":
+                spec = _HELP_BY_NAME.get(command.lower().lstrip("/"))
+                if spec is not None:
+                    self._show_command_help(spec)
+                    return
+                # No help entry (impossible: every command has one);
+                # fall through and let the command answer for itself.
+            handler(self, rest)
             return
 
         low = stripped.lower()
+        if low == "--help":
+            # Design call: a bare --help line shows the command list
+            # (it can never be a collection selector here: non-slash
+            # lines are only ever links; a collection named "--help" is
+            # still reachable by index through /use).
+            self._cmd_help("")
+            return
         if low.startswith("nxm://") or low.startswith(("http://", "https://")):
             # A bare link on a line is the same thing as /add <link>.
             self._cmd_add(stripped)
@@ -385,17 +503,47 @@ class _ShellSession:
     # commands
     # ------------------------------------------------------------------
 
+    def _show_command_help(self, spec: "_CommandHelp") -> None:
+        """Compact per-command help: form, one-line summary, usage block.
+
+        Renders instead of executing; touches no state and no service.
+        """
+        self._emit(f"{spec.form}  {spec.summary}")
+        if spec.usage:
+            self._emit("usage:")
+            for line in spec.usage:
+                self._emit(f"  {line}")
+
     def _cmd_help(self, rest: str) -> None:
+        if rest:
+            # /help <command> is an alias for <command> --help. The
+            # command word is matched with or without its leading slash.
+            token = rest.split()[0]
+            spec = _HELP_BY_NAME.get(token.lstrip("/").lower())
+            if spec is None:
+                self._emit_failure(
+                    f"Unknown command '{token}'. "
+                    "For the command list, try /help."
+                )
+                return
+            self._show_command_help(spec)
+            return
         table = Table(title="Shell commands")
         table.add_column("Command", style="cyan", no_wrap=True)
         table.add_column("Description")
-        for command, description in _HELP_LINES:
+        for spec in _COMMAND_HELP:
+            if not spec.in_table:
+                continue
             # Escape both cells: rich markup must not swallow bracketed
             # arguments like /mods [collection].
-            table.add_row(escape(command), escape(description))
+            table.add_row(escape(spec.form), escape(spec.summary))
         self.console.print(table)
         self._emit(
             "Bare nxm:// or https:// links on a line are handled as /add."
+        )
+        self._emit(
+            "Every command takes a bare --help (its only argument) or "
+            "/help <command> for its usage."
         )
 
     def _cmd_quit(self, rest: str) -> None:
@@ -686,11 +834,120 @@ class _ShellSession:
             return "no"
 
     def _cmd_status(self, rest: str) -> None:
+        """Tool-wide local report, or one collection vs the latest revision.
+
+        Bare /status is always tool-wide (even with a collection
+        selected) and never touches the network. /status <index|name>
+        keeps the original per-collection revision comparison
+        (svc.get_status, network) and adds the collection's local
+        details.
+        """
         if rest:
-            raise ValueError("usage: /status")
-        current = self._require_current()
-        result = self.svc.get_status(current.path)
+            self._status_collection(self._resolve_collection(rest))
+        else:
+            self._status_overview()
+
+    def _status_overview(self) -> None:
+        """(a) games/collections overview, (b) removals, (c) health.
+
+        Local only: nothing here reads the network, and no collection
+        needs to be selected. Every section renders independently so a
+        failing section cannot hide the rest (health checks guard
+        themselves and render ERROR lines instead of raising).
+        """
+        scan = scan_collections(self.root)
+
+        # (a) per-game rollup (parallels /games) plus totals.
+        if scan.collections:
+            totals: dict[str, list[int]] = {}
+            for c in scan.collections:
+                row = totals.setdefault(c.game_domain or "-", [0, 0, 0])
+                row[0] += 1
+                row[1] += c.mod_count
+                row[2] += c.pending_count
+            table = Table(title="Games and collections")
+            table.add_column("Game", style="green")
+            table.add_column("Collections", justify="right")
+            table.add_column("Total mods", justify="right")
+            table.add_column("Pending", justify="right")
+            for game in sorted(totals):
+                collections, mods, pending = totals[game]
+                table.add_row(
+                    escape(self._scrub(game)),
+                    str(collections),
+                    str(mods),
+                    str(pending),
+                )
+            self.console.print(table)
+            self._emit(
+                f"Total: {len(totals)} game(s), {len(scan.collections)} "
+                f"collection(s), "
+                f"{sum(c.mod_count for c in scan.collections)} mod(s), "
+                f"{sum(c.pending_count for c in scan.collections)} pending."
+            )
+        else:
+            self._emit(f"No collections found under {self.root}.")
+
+        # (b) removal tombstones per collection (state.removed_mods).
+        if scan.collections:
+            table = Table(title="Removals")
+            table.add_column("Collection", style="cyan")
+            table.add_column("Tombstoned mods", justify="right")
+            tombstoned = 0
+            for c in scan.collections:
+                try:
+                    count = collection_local_details(c.path).tombstone_count
+                except Exception as e:
+                    self._emit_warning(
+                        f"could not read removal state for '{c.name}': "
+                        f"{type(e).__name__}"
+                    )
+                    table.add_row(escape(self._scrub(c.name)), "?")
+                    continue
+                tombstoned += count
+                table.add_row(escape(self._scrub(c.name)), str(count))
+            self.console.print(table)
+            if tombstoned:
+                self._emit(
+                    f"Total removed (tombstoned): {tombstoned} mod(s). They "
+                    "stay removed through sync/update; re-adding a mod "
+                    "clears its tombstone."
+                )
+
+        # (c) health report: one guarded line per check.
+        self._emit("Health")
+        for check in collect_health(
+            self.root,
+            scan=scan,
+            api_key_present=bool(getattr(self.svc, "_api_key", None)),
+        ):
+            self._render_health_check(check)
+
+    def _render_health_check(self, check: HealthCheck) -> None:
+        """One health line; a WARN/ERROR never carries a traceback."""
+        color = {"OK": "green", "WARN": "yellow", "ERROR": "red"}.get(
+            check.status, "yellow"
+        )
+        self.console.print(
+            f"[{color}]{escape(check.status)}[/{color}] "
+            + escape(self._scrub(f"{check.label}: {check.detail}"))
+        )
+        if check.remedy:
+            self.console.print(
+                f"      fix: {escape(self._scrub(check.remedy))}"
+            )
+
+    def _status_collection(self, target: CollectionSummary) -> None:
+        """Existing revision comparison plus the collection's local details."""
+        local = collection_local_details(target.path)
+        result = self.svc.get_status(target.path)
         self._emit(f"Collection: {result.collection_name}")
+        self._emit(f"State path: {local.state_path}")
+        self._emit(f"Collection URL: {_display_url(local.collection_url) or '-'}")
+        self._emit(
+            f"Local: {local.mod_count} mod(s), {local.pending_count} "
+            f"pending, {local.tombstone_count} removed (tombstoned)"
+        )
         self._emit(f"Installed revision: {result.installed_revision}")
         if result.latest_revision is not None:
             note = (
@@ -733,6 +990,16 @@ def _parse_int(text: str, what: str) -> int:
         raise ValueError(
             f"{what} must be a whole number, got {text!r}"
         ) from None
+
+
+def _display_url(url: str) -> str:
+    """URL with query and fragment stripped, for display only.
+
+    A recorded collection URL can carry link credentials in its query
+    (key/expires), so the shell never displays query strings; what is
+    left is scrubbed again at render time.
+    """
+    return url.split("#", 1)[0].split("?", 1)[0]
 
 
 def run_shell(
