@@ -11,7 +11,11 @@ from .extractor import extract_archive
 
 
 class ManifestError(Exception):
-    """Raised when manifest parsing fails."""
+    """Raised when manifest download or parsing fails.
+
+    Download failures carry categorical reason text only: request URLs
+    (which can hold signing query parameters) never surface.
+    """
     pass
 
 
@@ -65,6 +69,23 @@ class CollectionManifest:
 NEXUS_API_BASE = "https://api.nexusmods.com"
 
 
+def _transport_reason(exc: requests.RequestException) -> str:
+    """Short reason class for a manifest fetch failure, never a URL.
+
+    requests exception text embeds the full request URL, and a bundle
+    URL is signed (md5/expires/token query parameters), so failures are
+    classified instead of quoted: these few reason words are the only
+    vocabulary that can reach a caller.
+    """
+    if isinstance(exc, requests.Timeout):
+        return "timed out"
+    if isinstance(exc, requests.ConnectionError):
+        return "connection error"
+    if isinstance(exc, requests.HTTPError):
+        return "server error"
+    return "request error"
+
+
 def download_and_parse_manifest(
     download_url: str,
     session: requests.Session | None = None,
@@ -91,14 +112,26 @@ def download_and_parse_manifest(
         # The download_link endpoint returns JSON with CDN URLs, not the file itself
         cdn_url = _resolve_download_url(download_url, http)
 
-        # Download the actual bundle from CDN
+        # Download the actual bundle from CDN. A transport failure at
+        # any point (connect, status check, mid-stream) is wrapped
+        # categorically: requests exception text embeds the request
+        # URL, and a bundle URL is signed (md5/expires/token query
+        # parameters), the credential class the downloader and api
+        # modules wrap. "from None" is deliberate: the cause's own
+        # message is where the URL lives, so a suppressed context keeps
+        # it out of any traceback that prints the chain.
         bundle_path = tmp_path / "bundle.7z"
-        response = requests.get(cdn_url, stream=True)
-        response.raise_for_status()
-        with open(bundle_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        try:
+            response = requests.get(cdn_url, stream=True)
+            response.raise_for_status()
+            with open(bundle_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        except requests.RequestException as e:
+            raise ManifestError(
+                f"manifest download failed: {_transport_reason(e)}"
+            ) from None
 
         # Extract the bundle
         extract_dir = tmp_path / "extracted"
@@ -126,16 +159,48 @@ def download_and_parse_manifest(
 
 
 def _resolve_download_url(api_url: str, session: requests.Session) -> str:
-    """Resolve a Nexus download_link endpoint to a CDN URL."""
-    response = session.get(api_url)
-    response.raise_for_status()
-    data = response.json()
+    """Resolve a Nexus download_link endpoint to a CDN URL.
 
-    links = data.get("download_links", [])
-    if not links:
-        raise ManifestError(f"No download links returned from {api_url}")
+    Every failure is categorical: transport errors and malformed
+    response bodies surface as ManifestError text that never carries
+    the request URL (which can hold signing parameters) or the api
+    path the caller passed in.
+    """
+    # Same categorical wrap as the bundle fetch: a transport failure's
+    # text embeds the request URL and must never surface.
+    try:
+        response = session.get(api_url)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        raise ManifestError(
+            f"manifest download failed: {_transport_reason(e)}"
+        ) from None
 
-    return links[0]["URI"]
+    # The body-parse and link-extraction region gets the same wrap: a
+    # non-JSON body raises requests.JSONDecodeError (itself a
+    # RequestException) and a differently shaped body raises
+    # AttributeError/KeyError/TypeError. None of these may reach the
+    # ManifestError-only service callers as a raw traceback. The empty
+    # links case raises ManifestError inside the try on purpose; it is
+    # not in the except tuple, so it propagates untouched. "from None"
+    # everywhere: a cause message is a foreign body snippet or decoder
+    # line, never useful here, and must not ride along in a traceback.
+    try:
+        data = response.json()
+        links = data.get("download_links", [])
+        if not links:
+            raise ManifestError(
+                "manifest download failed: no download links returned"
+            )
+        link = links[0]["URI"]
+    except (requests.RequestException, ValueError, AttributeError,
+            IndexError, KeyError, TypeError):
+        raise ManifestError(
+            "manifest download failed: malformed response"
+        ) from None
+    if not isinstance(link, str) or not link:
+        raise ManifestError("manifest download failed: malformed response")
+    return link
 
 
 def _find_collection_json(extract_dir: Path) -> Path | None:
