@@ -285,13 +285,19 @@ class _ShellSession:
     def _scrub(self, text: str) -> str:
         """Redact scoped secrets from routine output.
 
-        Applied to every line the shell prints, success text included,
-        so a query credential can never surface anywhere. Literal
-        values are redacted with no length floor: values in scope are
-        opaque credentials, so over-redacting is the safe direction.
+        Applied to every line the shell prints, success text included.
+        Tiered like the typed-error branch: long secrets are redacted
+        everywhere, while a short absorbed value (a one-character
+        key= from a typed link, say) keeps the MIN_REDACT_SECRET_LEN
+        floor for bare prose so it cannot garble ordinary output like
+        "Synced 1 mods"; short secrets are still redacted inside URI
+        query strings and percent-encoded runs.
         """
         return boundary_redact(
-            text, self._secrets, strip_uris=False, min_secret_len=0
+            text,
+            self._secrets,
+            strip_uris=False,
+            min_secret_len=MIN_REDACT_SECRET_LEN,
         )
 
     def _scrub_error(self, text: str) -> str:
@@ -448,10 +454,11 @@ class _ShellSession:
                 return 0
             except KeyboardInterrupt:
                 # Interrupted during a service call: never claim
-                # success, never mark anything done.
+                # success. Services save incrementally, so the honest
+                # report is "maybe partial", not "nothing done".
                 self._emit_failure(
-                    "interrupted; the operation did not complete and "
-                    "nothing was marked done"
+                    "interrupted; the operation may have partially "
+                    "completed; check /status"
                 )
             except _DOMAIN_ERRORS as e:
                 self._emit_error(str(e) or type(e).__name__)
@@ -525,7 +532,7 @@ class _ShellSession:
         if not colls:
             return f"  (no collections under {self.root})"
         return "\n".join(
-            f"  {i}: {c.name} [{c.game_domain or '-'}]"
+            f"  {i}: {_safe_text(c.name)} [{_safe_text(c.game_domain) or '-'}]"
             for i, c in enumerate(colls, 1)
         )
 
@@ -543,6 +550,9 @@ class _ShellSession:
         selector = selector.strip()
         if not selector:
             raise ValueError("usage: /use <index|name>")
+        # Display copy of the selector: echoed back in error messages,
+        # so control characters collapse before they reach the terminal.
+        shown = _safe_text(selector)
         colls = self._collection_listing()
         if not colls:
             raise ValueError(f"no collections found under {self.root}")
@@ -552,7 +562,7 @@ class _ShellSession:
             return exact[0]
         if len(exact) > 1:
             raise ValueError(
-                f"'{selector}' matches {len(exact)} collections; "
+                f"'{shown}' matches {len(exact)} collections; "
                 "pick one by index:\n" + self._format_listing(colls)
             )
 
@@ -561,7 +571,7 @@ class _ShellSession:
             if 1 <= index <= len(colls):
                 return colls[index - 1]
             raise ValueError(
-                f"no collection with index {selector}\n"
+                f"no collection with index {shown}\n"
                 + self._format_listing(colls)
             )
 
@@ -570,12 +580,12 @@ class _ShellSession:
             return folded[0]
         if len(folded) > 1:
             raise ValueError(
-                f"'{selector}' matches {len(folded)} collections "
+                f"'{shown}' matches {len(folded)} collections "
                 "(names differ only by case); pick one by index:\n"
                 + self._format_listing(colls)
             )
         raise ValueError(
-            f"no collection named '{selector}'\n"
+            f"no collection named '{shown}'\n"
             + self._format_listing(colls)
         )
 
@@ -702,7 +712,9 @@ class _ShellSession:
             self._print_collections()
             return
         self.current = self._resolve_collection(rest)
-        self._emit(f"Using '{self.current.name}' ({self.current.path}).")
+        self._emit(
+            f"Using '{_safe_text(self.current.name)}' ({self.current.path})."
+        )
         # Remembered only on explicit selection: startup auto-select and
         # restore never write the memory file.
         if not _save_remembered_name(self.root, self.current.path.name):
@@ -720,7 +732,7 @@ class _ShellSession:
         if not mods:
             self._emit(f"No mods tracked in '{target.name}'.")
             return
-        table = Table(title=f"Mods in {escape(self._scrub(target.name))}")
+        table = Table(title=f"Mods in {escape(self._scrub(_safe_text(target.name)))}")
         table.add_column("file_id", justify="right")
         table.add_column("Name", style="cyan")
         table.add_column("Version", style="green")
@@ -728,9 +740,9 @@ class _ShellSession:
         for m in mods:
             table.add_row(
                 str(m.file_id),
-                escape(self._scrub(m.name)),
-                escape(self._scrub(m.version or "-")),
-                escape(self._scrub(m.download_status)),
+                escape(self._scrub(_safe_text(m.name))),
+                escape(self._scrub(_safe_text(m.version) or "-")),
+                escape(self._scrub(_safe_text(m.download_status))),
             )
         self.console.print(table)
 
@@ -759,26 +771,36 @@ class _ShellSession:
         if not result.success:
             self._emit_failure(result.error or "the mod could not be added.")
             return
+        member = self._is_collection_member(result.mod_id)
         if result.pending_download:
             p = result.pending_download
-            self._emit(f"Free account - download manually: {p.mod_name}")
+            if member:
+                self._emit(self._re_add_line(result.mod_name))
+            self._emit(f"Free account - download manually: {_safe_text(p.mod_name)}")
             self._emit(f"  {p.browser_url}")
             self._emit(
                 f"Save the file to {self.current.path}, then run "
                 "'nexus-dl import' on that directory."
             )
             return
-        if self._is_collection_member(result.mod_id):
+        if member:
             # Re-adding a mod the collection already manages: "manual"
             # would misreport it (the next sync folds it back into the
             # collection-managed set).
-            self._emit(
-                f"Re-added '{result.mod_name}' to "
-                f"'{_safe_text(self.current.name)}'; it is a collection "
-                "member, not a manual mod."
-            )
+            self._emit(self._re_add_line(result.mod_name))
             return
-        self._emit(f"Added '{result.mod_name}' as manual mod (phase 999).")
+        self._emit(
+            f"Added '{_safe_text(result.mod_name)}' as manual mod (phase 999)."
+        )
+
+    def _re_add_line(self, mod_name) -> str:
+        """The collection-member re-add wording, one shared phrasing."""
+        current = self._require_current()
+        return (
+            f"Re-added '{_safe_text(mod_name)}' to "
+            f"'{_safe_text(current.name)}'; it is a collection "
+            "member, not a manual mod."
+        )
 
     def _is_collection_member(self, mod_id: int) -> bool:
         """Is mod_id part of the current collection's cached manifest?
@@ -807,23 +829,30 @@ class _ShellSession:
             return
         if result.status == "already_downloaded":
             self._emit(
-                f"'{result.mod_name}' (file {result.file_id}) is already "
-                "downloaded in this collection."
+                f"'{_safe_text(result.mod_name)}' (file {result.file_id}) is "
+                "already downloaded in this collection."
             )
         elif result.status == "extracted_from_archive":
+            if self._is_collection_member(result.mod_id):
+                self._emit(self._re_add_line(result.mod_name))
             self._emit(
-                f"Finished '{result.mod_name}' (file {result.file_id}) by "
+                f"Finished '{_safe_text(result.mod_name)}' "
+                f"(file {result.file_id}) by "
                 "extracting the retained archive; no download was needed."
             )
         elif result.status == "saved_to_output":
-            self._emit(f"Saved {result.output_path}.")
+            self._emit(f"Saved {_safe_text(result.output_path)}.")
         else:
+            if self._is_collection_member(result.mod_id):
+                self._emit(self._re_add_line(result.mod_name))
             where = (
-                f" into {result.collection_dir}"
+                f" into {_safe_text(result.collection_dir)}"
                 if result.collection_dir
                 else ""
             )
-            self._emit(f"Downloaded '{result.mod_name}'{where}.")
+            self._emit(
+                f"Downloaded '{_safe_text(result.mod_name)}'{where}."
+            )
             if result.extracted:
                 self._emit(
                     "Archive extracted. Run 'nexus-dl deploy' when ready; "
@@ -882,7 +911,9 @@ class _ShellSession:
                 "download:"
             )
             for p in result.pending_downloads:
-                self._emit(f"  {p.mod_name}: {p.filename}")
+                self._emit(
+                    f"  {_safe_text(p.mod_name)}: {_safe_text(p.filename)}"
+                )
         summary = (
             f"Synced {result.mods_downloaded} mods "
             f"({result.mods_extracted} extracted)"
@@ -892,6 +923,27 @@ class _ShellSession:
         if result.removed_skipped:
             summary += f"; {result.removed_skipped} removed mod(s) skipped"
         self._emit(summary + ".")
+        if result.tracked or result.untracked:
+            self._emit(
+                f"Tracked {result.tracked}, untracked {result.untracked} "
+                "on Nexus."
+            )
+        if result.conflicts:
+            # Rendered like the CLI sync command: the count plus the
+            # first 20 (file: winner overwrote loser), never silently.
+            self._emit_warning(
+                f"{len(result.conflicts)} file conflict(s) "
+                "(last mod wins):"
+            )
+            for c in result.conflicts[:20]:
+                self._emit(
+                    f"  {_safe_text(c.file_path)}: {_safe_text(c.winner)} "
+                    f"overwrote {_safe_text(c.loser)}"
+                )
+            if len(result.conflicts) > 20:
+                self._emit(
+                    f"  ... and {len(result.conflicts) - 20} more"
+                )
         if result.collection_dir:
             self._emit(f"Collection directory: {result.collection_dir}")
         for f in result.load_order_files:
@@ -917,8 +969,9 @@ class _ShellSession:
                 break
 
         if summary is not None:
+            shown = _safe_text(summary.name)
             self._emit(
-                f"Remove '{summary.name}' "
+                f"Remove '{shown}' "
                 f"(file_id {summary.file_id}, mod_id {summary.mod_id}) "
                 "and all its files?"
             )
@@ -927,7 +980,9 @@ class _ShellSession:
                 "removed through sync/update; files on disk are kept; "
                 "re-add restores it"
             )
-            answer = self._confirm(f"Remove '{summary.name}'? [yes/no]: ")
+            answer = self._confirm(
+                f"Remove '{_prompt_name(summary.name)}'? [yes/no]: "
+            )
             if answer != _CONFIRM_YES:
                 self._emit("Cancelled; nothing was removed.")
                 return
@@ -937,7 +992,11 @@ class _ShellSession:
         # StateError, so the service's own error is surfaced directly
         # instead of prompting for a removal that cannot happen.
         result = self.svc.remove_mod(current.path, file_id=file_id, mod_id=mod_id)
-        name = summary.name if summary is not None else f"mod {mod_id or file_id}"
+        name = (
+            _safe_text(summary.name)
+            if summary is not None
+            else f"mod {mod_id or file_id}"
+        )
         # Render the summary from the result defensively: join the id
         # lists instead of indexing, so an empty-ids result (which the
         # real service never returns) still renders after the removal
@@ -1083,13 +1142,18 @@ class _ShellSession:
         """Existing revision comparison plus the collection's local details."""
         local = collection_local_details(target.path)
         result = self.svc.get_status(target.path)
-        self._emit(f"Collection: {result.collection_name}")
+        self._emit(f"Collection: {_safe_text(result.collection_name)}")
         self._emit(f"State path: {local.state_path}")
         self._emit(f"Collection URL: {_display_url(local.collection_url) or '-'}")
         self._emit(
             f"Local: {local.mod_count} mod(s), {local.pending_count} "
             f"pending, {local.tombstone_count} removed (tombstoned)"
         )
+        if result.removed_skipped:
+            self._emit(
+                f"Removed mods skipped: {result.removed_skipped} "
+                "(tombstoned)."
+            )
         self._emit(f"Installed revision: {result.installed_revision}")
         if result.latest_revision is not None:
             note = (
@@ -1104,9 +1168,9 @@ class _ShellSession:
         table.add_column("Status")
         for m in result.mods:
             table.add_row(
-                escape(self._scrub(m.name)),
-                escape(self._scrub(m.version or "-")),
-                escape(self._scrub(m.status)),
+                escape(self._scrub(_safe_text(m.name))),
+                escape(self._scrub(_safe_text(m.version) or "-")),
+                escape(self._scrub(_safe_text(m.status))),
             )
         self.console.print(table)
 
@@ -1145,30 +1209,30 @@ def _display_url(url: str) -> str:
 
 
 def _safe_text(value, fallback: str = "-") -> str:
-    """Stringify a state value for display; never raises.
+    """Stringify a state or user value for display; never raises.
 
     Hand-edited state can hold non-string scalars where text is
-    expected (a numeric game_domain, say). Display code coerces them
-    to a plain label so one bad value cannot abort a whole section.
+    expected (a numeric game_domain, say), and hostile or garbled text
+    can carry terminal control characters. Values are coerced to plain
+    text and control characters (ESC, newline, BEL) collapse to
+    spaces, so echoed text can never move the cursor or clear the
+    screen.
     """
     if isinstance(value, str):
-        return value
-    if value is None:
+        text = value
+    elif value is None:
         return fallback
-    try:
-        return str(value)
-    except Exception:
-        return fallback
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return fallback
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", text)
 
 
 def _prompt_name(name) -> str:
-    """Collection name rendered safely for the input() prompt.
-
-    The prompt is plain text, but control characters (newlines in a
-    hand-edited collection name) would garble it, so they collapse to
-    spaces.
-    """
-    return re.sub(r"[\x00-\x1f\x7f]+", " ", _safe_text(name)).strip()
+    """Collection name rendered safely for the input() prompt."""
+    return _safe_text(name).strip()
 
 
 # Root-scoped shell memory: {"current": "<collection dir name>"}.

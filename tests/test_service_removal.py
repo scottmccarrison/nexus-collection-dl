@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from nexus_collection_dl import service as service_module
 from nexus_collection_dl import state as state_module
 from nexus_collection_dl.manifest import CollectionManifest
 from nexus_collection_dl.service import (
@@ -460,3 +461,46 @@ def test_save_failure_raises_state_error_prior_state_standing(
     state = CollectionState(cdir)
     state.load()
     assert 555 in state.mods
+
+
+# ---------------------------------------------------------------------------
+# Round B: every regen failure surfaces as LoadOrderRegenError
+# ---------------------------------------------------------------------------
+
+def test_regen_wraps_manifest_parse_failures(svc, tmp_path):
+    # CollectionManifest.from_dict raising ValueError used to escape
+    # raw, after the caller's state change had already committed.
+    cdir = write_state(tmp_path / "col", mods=[mod_entry(555, 100, "Alpha Mod")])
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = {"mod_rules": [], "mod_phases": {"not-a-number": 1}}
+    state.save()
+
+    with pytest.raises(LoadOrderRegenError):
+        svc._regen_load_order_from_state(cdir, state)
+
+
+def test_regen_wraps_loot_write_failures(svc, tmp_path, monkeypatch):
+    # write_loot_plugins_txt raising OSError on the loot path used to
+    # escape raw too; the wrapper catches every failure class.
+    cdir = write_state(tmp_path / "col", mods=[mod_entry(555, 100, "Alpha Mod")])
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = cached_manifest()
+    state.save()
+    monkeypatch.setattr(service_module, "is_bethesda_game", lambda g: True)
+    monkeypatch.setattr(service_module, "is_loot_available", lambda: True)
+    monkeypatch.setattr(
+        service_module, "sort_plugins_with_loot", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        service_module, "merge_plugin_orders", lambda *a, **k: []
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service_module, "write_loot_plugins_txt", boom)
+
+    with pytest.raises(LoadOrderRegenError):
+        svc._regen_load_order_from_state(cdir, state)

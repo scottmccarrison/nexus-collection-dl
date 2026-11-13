@@ -215,15 +215,26 @@ class CollectionState:
         self.track_sync_enabled = data.get("track_sync_enabled", False)
 
         self.mods = {}
-        for file_id_str, mod_data in data.get("mods", {}).items():
+        raw_mods = data.get("mods", {})
+        # A bad shape raises instead of silently losing mod entries:
+        # same strictness as the removed_mods check below.
+        if not isinstance(raw_mods, dict):
+            raise StateError("Invalid state file: mods must be a JSON object")
+        for file_id_str, mod_data in raw_mods.items():
             file_id = int(file_id_str)
             self.mods[file_id] = ModState.from_dict(file_id, mod_data)
 
         # Tombstones restore with int keys exactly like the mods dict above.
         # The key is missing from older states: they load unchanged with no
-        # tombstones.
+        # tombstones. A present-but-wrong shape raises instead of being
+        # silently dropped: dropping it would resurrect removed mods on
+        # the next save.
         self.removed_mods = {}
         raw_removed = data.get("removed_mods")
+        if raw_removed is not None and not isinstance(raw_removed, dict):
+            raise StateError(
+                "Invalid state file: removed_mods must be a JSON object"
+            )
         if isinstance(raw_removed, dict):
             for mod_id_str, removed_data in raw_removed.items():
                 self.removed_mods[int(mod_id_str)] = removed_data

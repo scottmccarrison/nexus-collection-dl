@@ -572,8 +572,8 @@ def test_keyboard_interrupt_during_service_call_reports_interruption(
     assert result.exit_code == 0
     out = result.output
     assert (
-        "interrupted; the operation did not complete and "
-        "nothing was marked done"
+        "interrupted; the operation may have partially completed; "
+        "check /status"
     ) in out
     # Never claim success.
     assert "Collection:" not in out
@@ -1794,3 +1794,202 @@ def test_status_renders_every_section_with_a_non_string_game_domain(
     assert "Games and collections" in out
     assert "Tombstoned mods" in out
     assert "API key: stored (keystore)" in out
+
+
+# ---------------------------------------------------------------------------
+# Round B hardening: bad state shapes, membership wording, control chars,
+# short-secret tiering, sync reporting
+# ---------------------------------------------------------------------------
+
+def test_non_string_collection_names_never_break_the_listing(
+    shell_env, tmp_path
+):
+    root = tmp_path / "root"
+    write_collection(root / "numeric", name=42)
+    write_collection(root / "other", name="Other")
+
+    result = run_cli(root, "/collections\n/use 1\n/status\n/quit\n")
+    assert result.exit_code == 0
+    out = result.output
+    # The coerced name renders and every /status section completes.
+    assert "42" in out
+    assert "Games and collections" in out
+    assert "Tombstoned mods" in out
+    assert "API key" in out
+
+
+def test_re_adding_a_member_on_a_free_account_reports_re_added(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    state = reload_state(root / "Test Collection")
+    state.manifest_data = {
+        "mod_rules": [{"source": {"modId": 123, "fileID": 456}}],
+    }
+    state.save()
+    FakeShellService.add_result = AddResult(
+        mod_name="Test Mod", mod_id=123, file_name="TestMod-456.zip",
+        success=True,
+        pending_download=PendingDownload(
+            mod_id=123, mod_name="Test Mod", file_id=456,
+            filename="TestMod-456.zip", size_bytes=10,
+            browser_url="https://www.nexusmods.com/starfield/mods/123",
+        ),
+    )
+
+    result = run_cli(
+        root,
+        "/use 1\n/add https://www.nexusmods.com/starfield/mods/123\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    # Membership wording shows on the pending path too, and the manual
+    # download instructions still follow.
+    assert "Re-added 'Test Mod' to 'Test Collection'" in out
+    assert "not a manual mod" in out
+    assert "download manually" in out
+
+
+def test_nxm_add_of_a_member_reports_re_added(shell_env, tmp_path, monkeypatch):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    state = reload_state(root / "Test Collection")
+    state.manifest_data = {
+        "mod_rules": [{"source": {"modId": 123, "fileID": 456}}],
+    }
+    state.save()
+    FakeShellService.nxm_result = NxmResult(
+        success=True, status="downloaded", game_domain=GAME,
+        mod_id=123, file_id=2, mod_name="Test Mod",
+        collection_dir=root / "Test Collection",
+    )
+
+    result = run_cli(
+        root,
+        "/use 1\nnxm://skyrimspecialedition/mods/123/files/2/extra\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Re-added 'Test Mod' to 'Test Collection'" in out
+    assert "Downloaded 'Test Mod'" in out
+
+
+def test_control_characters_never_reach_the_terminal(shell_env, tmp_path):
+    evil = "Evil\x1b[2JName\nX\x07Y"
+    root = tmp_path / "root"
+    write_collection(
+        root / "weird", name=evil, mods=[mod_entry(name="M\x07od\nX")]
+    )
+    code, out, prompts = run_capture_prompts(
+        FakeShellService(), root, ["/use", "/use 1", "/remove 456", "no", "/quit"]
+    )
+    assert code == 0
+    # Raw control bytes never reach the terminal: not in output, not in
+    # any prompt (including the /remove confirm prompt).
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    for p in prompts:
+        assert "\x1b" not in p
+        assert "\x07" not in p
+        assert "\n" not in p
+    # The name renders collapsed to one plain line everywhere.
+    assert "Evil [2JName X Y" in out
+    # The confirm prompt (an input() string, recorded by input_fn)
+    # shows the collapsed mod name too.
+    assert "Remove 'M od X'? [yes/no]: " in prompts
+
+
+def test_short_absorbed_secret_does_not_garble_prose(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(
+        root,
+        "https://example.com/?key=ZQXJ&expires=1\n"
+        f"/sync {COLLECTION_URL}\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    # The one-character value absorbed from the link keeps the length
+    # floor in bare prose: routine output is not garbled.
+    assert "Synced 1 mods (1 extracted)." in out
+
+
+def test_short_absorbed_secret_still_scrubs_urls(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    FakeShellService.add_result = AddResult(
+        mod_name="M", mod_id=1, file_name="f.zip", success=True,
+        pending_download=PendingDownload(
+            mod_id=1, mod_name="M", file_id=2, filename="f.zip",
+            size_bytes=1,
+            browser_url="https://example.com/dl?key=ZQXJ&expires=9W8V",
+        ),
+    )
+    result = run_cli(
+        root, "https://example.com/?key=ZQXJ&expires=9W8V\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    # Short secrets keep the floor only for bare prose: inside a URL
+    # query they are still redacted.
+    assert "ZQXJ" not in out
+    assert "9W8V" not in out
+    assert "https://example.com/dl?" in out
+
+
+def test_sync_renders_conflicts_and_tracked_counts(
+    shell_env, tmp_path, monkeypatch
+):
+    from nexus_collection_dl.service import FileConflict
+
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    FakeShellService.sync_result = SyncResult(
+        mods_downloaded=1, mods_extracted=1, errors=[], load_order_files=[],
+        tracked=2, untracked=1,
+        conflicts=[
+            FileConflict(
+                file_path="meshes/a.nif", winner="New Mod", loser="Old Mod"
+            ),
+        ],
+    )
+    result = run_cli(
+        root, f"/sync {COLLECTION_URL}\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Tracked 2, untracked 1 on Nexus." in out
+    assert "1 file conflict(s) (last mod wins):" in out
+    assert "meshes/a.nif: New Mod overwrote Old Mod" in out
+
+
+def test_status_target_surfaces_removed_skipped(
+    shell_env, tmp_path, monkeypatch
+):
+    from nexus_collection_dl.service import ModStatus, StatusResult
+
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    FakeShellService.status_result = StatusResult(
+        collection_name="Test Collection",
+        collection_url=COLLECTION_URL,
+        game_domain=GAME,
+        installed_revision=1,
+        latest_revision=1,
+        mods=[],
+        deployed_at=None,
+        deployed_file_count=0,
+        game_dir="",
+        track_sync_enabled=False,
+        removed_skipped=2,
+    )
+    result = run_cli(
+        root, "/status 1\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert "Removed mods skipped: 2 (tombstoned)." in result.output

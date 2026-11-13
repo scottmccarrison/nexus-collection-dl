@@ -6,6 +6,7 @@ flock and reads /proc/locks (a file read, no subprocess). Every fixture
 secret is fake and asserted absent from outputs.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -546,3 +547,55 @@ def test_collection_manifest_mod_ids_raises_on_unreadable_state(tmp_path):
     (cdir / STATE_FILENAME).write_text("{ not json")
     with pytest.raises(StateError):
         collection_manifest_mod_ids(cdir)
+
+
+# ---------------------------------------------------------------------------
+# Round B: non-string names at the scan/list layer, bad state shapes
+# ---------------------------------------------------------------------------
+
+def test_scan_collections_coerces_non_string_names(tmp_path):
+    write_state(tmp_path / "Numeric", name=42)
+    write_state(tmp_path / "Blank", name=[])
+
+    scan = scan_collections(tmp_path)
+    # A truthy non-string name is coerced (no AttributeError in the
+    # sort); a falsy one falls back to the directory name as before.
+    assert {c.name for c in scan.collections} == {"42", "Blank"}
+    # The silent delegate works the same.
+    assert {c.name for c in list_collections(tmp_path)} == {"42", "Blank"}
+
+
+@pytest.mark.parametrize("bad_shape", [[], "nope", 42])
+def test_removed_mods_bad_shape_raises_state_error(tmp_path, bad_shape):
+    """A present-but-wrong removed_mods shape must raise, never be
+    silently dropped: dropping it would resurrect removed mods on the
+    next save."""
+    cdir = write_state(tmp_path / "Pack")
+    path = cdir / STATE_FILENAME
+    data = json.loads(path.read_text())
+    data["removed_mods"] = bad_shape
+    path.write_text(json.dumps(data))
+    with pytest.raises(StateError):
+        CollectionState(cdir).load()
+
+
+def test_removed_mods_absent_still_loads(tmp_path):
+    """States written before tombstones existed load unchanged."""
+    cdir = write_state(tmp_path / "Pack")
+    path = cdir / STATE_FILENAME
+    data = json.loads(path.read_text())
+    del data["removed_mods"]
+    path.write_text(json.dumps(data))
+    state = CollectionState(cdir)
+    state.load()
+    assert state.removed_mods == {}
+
+
+def test_mods_bad_shape_raises_state_error(tmp_path):
+    cdir = write_state(tmp_path / "Pack")
+    path = cdir / STATE_FILENAME
+    data = json.loads(path.read_text())
+    data["mods"] = []
+    path.write_text(json.dumps(data))
+    with pytest.raises(StateError):
+        CollectionState(cdir).load()

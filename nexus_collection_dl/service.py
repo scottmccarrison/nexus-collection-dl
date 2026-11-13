@@ -81,6 +81,25 @@ def _sanitize_dirname(name: str) -> str:
     return name or "collection"
 
 
+def _state_text(value: Any, fallback: str = "") -> str:
+    """Coerce a state-derived value to plain text; never raises.
+
+    Hand-edited state can hold non-string scalars where text is
+    expected (a numeric collection_name, say). Scan/list output is
+    normalized here so sorting and name matching work on real strings;
+    display code keeps its own safe-stringify as a second line of
+    defense.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return fallback
+    try:
+        return str(value)
+    except Exception:
+        return fallback
+
+
 @dataclass
 class ModStatus:
     mod_id: int
@@ -105,6 +124,10 @@ class StatusResult:
     deployed_file_count: int
     game_dir: str
     track_sync_enabled: bool
+    # Distinct mod_ids skipped because they are tombstoned as removed
+    # (see SyncResult.removed_skipped). 0 when the comparison could not
+    # reach the API (the offline fallback lists installed mods only).
+    removed_skipped: int = 0
 
 
 @dataclass
@@ -737,8 +760,13 @@ def scan_collections(root: Path) -> CollectionScan:
             continue
         summaries.append(
             CollectionSummary(
-                name=state.collection_name or cdir.name,
-                game_domain=state.game_domain,
+                # Names are coerced to text here: the sort below and
+                # every name comparison downstream need real strings,
+                # and a non-string name in hand-edited state must not
+                # abort the scan. Truthiness keeps the dir-name
+                # fallback exactly as before (empty/absent -> dir name).
+                name=_state_text(state.collection_name or cdir.name),
+                game_domain=_state_text(state.game_domain),
                 mod_count=len(state.mods),
                 pending_count=len(state.get_pending_mods()),
                 path=cdir,
@@ -774,7 +802,9 @@ def list_mods(mods_dir: Path) -> list[ModSummary]:
         ModSummary(
             file_id=ms.file_id,
             mod_id=ms.mod_id,
-            name=ms.name,
+            # Coerced to text here: the name sort below needs real
+            # strings even when hand-edited state holds other types.
+            name=_state_text(ms.name),
             version=ms.version,
             filename=ms.filename,
             download_status=ms.download_status,
@@ -903,6 +933,7 @@ class ModManagerService:
 
         mod_statuses: list[ModStatus] = []
         latest_revision = None
+        removed_skipped = 0
 
         # Try to fetch latest from API
         try:
@@ -911,6 +942,15 @@ class ModManagerService:
                 collection_info.game_domain, collection_info.slug
             )
             latest_revision = collection_data["revision"]
+
+            # The one service-level tombstone filter, exactly like
+            # sync/update: a removed mod page must never show up here as
+            # installable. This also feeds `update --dry-run`, which
+            # reports through this path.
+            manifest_mods, removed_skipped = _filter_removed_mods(
+                collection_data["mods"], state
+            )
+            collection_data = {**collection_data, "mods": manifest_mods}
 
             to_install, to_update, up_to_date, to_remove = state.compare_with_collection(
                 collection_data["mods"]
@@ -1013,6 +1053,7 @@ class ModManagerService:
             deployed_file_count=len(state.deployed_files),
             game_dir=state.game_dir,
             track_sync_enabled=state.track_sync_enabled,
+            removed_skipped=removed_skipped,
         )
 
     def sync(
@@ -3160,12 +3201,25 @@ class ModManagerService:
     def _regen_load_order_from_state(self, mods_dir: Path, state: CollectionState) -> list[str]:
         """Regenerate load order from cached manifest + current state mods.
 
-        Raises LoadOrderRegenError when generation or writing the output
-        files fails: the caller's state change is already persisted at
-        that point, and callers surface the failure as a warning or error
-        on their result (or, for the explicit load-order command, as a
-        clean StateError). Failures are never silently swallowed here.
+        Raises LoadOrderRegenError when ANY part of the regeneration
+        fails (manifest parsing, generation, or writing the output
+        files): the caller's state change is already persisted at that
+        point, and callers surface the failure as a warning or error on
+        their result (or, for the explicit load-order command, as a
+        clean StateError). Failures are never silently swallowed here
+        and never escape as raw exceptions.
         """
+        try:
+            return self._regen_load_order_unwrapped(mods_dir, state)
+        except LoadOrderRegenError:
+            raise
+        except Exception as e:
+            raise LoadOrderRegenError(
+                f"Load order regeneration failed: {e}"
+            ) from e
+
+    def _regen_load_order_unwrapped(self, mods_dir: Path, state: CollectionState) -> list[str]:
+        """Body of _regen_load_order_from_state; its exceptions are wrapped."""
         if not state.manifest_data:
             return []
 
