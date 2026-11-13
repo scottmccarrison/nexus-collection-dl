@@ -9,6 +9,7 @@ is fake and asserted absent from all output.
 """
 
 import io
+import json
 import re
 from pathlib import Path
 
@@ -101,7 +102,8 @@ class FakeShellService:
     def sync(self, collection_url, mods_dir, **kwargs):
         FakeShellService.calls.append(
             {"method": "sync", "collection_url": collection_url,
-             "mods_dir": mods_dir}
+             "mods_dir": mods_dir,
+             "target_dir": kwargs.get("target_dir")}
         )
         if FakeShellService.sync_error is not None:
             raise FakeShellService.sync_error
@@ -597,7 +599,13 @@ def test_shell_skips_banner_and_update_prompt(shell_env, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_add_without_use_errors_clearly(shell_env, tmp_path, monkeypatch):
-    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    # Two collections: startup stays unselected (auto-select fires
+    # only when the root holds exactly one).
+    root = make_root(
+        tmp_path,
+        ("Another Collection", []),
+        ("Test Collection", [mod_entry()]),
+    )
 
     result = run_cli(
         root,
@@ -751,9 +759,11 @@ def test_sync_lists_per_mod_errors_before_success_text(
     assert "Synced 3 mods" in out
     # Errors render before any success text.
     assert out.index("mod 5 failed") < out.index("Synced 3 mods")
-    # The URL form still syncs exactly the URL given.
+    # The URL form still syncs exactly the URL given, into a new
+    # directory under the root (no pinned destination).
     assert FakeShellService.calls == [
-        {"method": "sync", "collection_url": url, "mods_dir": root}
+        {"method": "sync", "collection_url": url, "mods_dir": root,
+         "target_dir": None}
     ]
 
 
@@ -773,9 +783,11 @@ def test_sync_without_target_resyncs_current_from_stored_url(
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
-    # The service received the stored URL, not some re-found one.
+    # The service received the stored URL, not some re-found one, and
+    # the destination is pinned to the collection's own directory.
     assert FakeShellService.calls == [
-        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root,
+         "target_dir": root / "Test Collection"}
     ]
     assert "Synced 1 mods" in result.output
 
@@ -783,7 +795,13 @@ def test_sync_without_target_resyncs_current_from_stored_url(
 def test_sync_without_target_and_no_current_is_a_clear_error(
     shell_env, tmp_path, monkeypatch
 ):
-    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    # Two collections: startup stays unselected (auto-select fires
+    # only when the root holds exactly one).
+    root = make_root(
+        tmp_path,
+        ("Another Collection", []),
+        ("Test Collection", [mod_entry()]),
+    )
 
     result = run_cli(
         root, "/sync\n/quit\n",
@@ -800,11 +818,14 @@ def test_sync_without_target_and_no_current_is_a_clear_error(
 def test_sync_by_index_and_by_name_uses_stored_url(
     shell_env, tmp_path, monkeypatch
 ):
-    root = make_root(
-        tmp_path,
-        ("clean-visuals", "Clean Visuals", []),
-        ("test-collection", "Test Collection", [mod_entry()]),
-    )
+    # Each collection records its OWN URL: a shared default URL would
+    # let wrong-collection resolution pass unnoticed.
+    url_clean = f"https://next.nexusmods.com/{GAME}/collections/clean-vis"
+    url_test = f"https://next.nexusmods.com/{GAME}/collections/test-col"
+    root = tmp_path / "root"
+    write_collection(root / "clean-visuals", name="Clean Visuals", url=url_clean)
+    write_collection(root / "test-collection", name="Test Collection",
+                     mods=[mod_entry()], url=url_test)
 
     # By index (indexes follow the /collections listing order).
     result = run_cli(
@@ -813,7 +834,8 @@ def test_sync_by_index_and_by_name_uses_stored_url(
     )
     assert result.exit_code == 0
     assert FakeShellService.calls == [
-        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+        {"method": "sync", "collection_url": url_test, "mods_dir": root,
+         "target_dir": root / "test-collection"}
     ]
 
     # By name: unique case-insensitive match, exactly like /use.
@@ -824,7 +846,29 @@ def test_sync_by_index_and_by_name_uses_stored_url(
     )
     assert result.exit_code == 0
     assert FakeShellService.calls == [
-        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+        {"method": "sync", "collection_url": url_test, "mods_dir": root,
+         "target_dir": root / "test-collection"}
+    ]
+
+
+def test_sync_to_a_renamed_collection_updates_its_own_directory(
+    shell_env, tmp_path, monkeypatch
+):
+    """The resolved collection's OWN directory is the destination even
+    when its directory name differs from the API's sanitized name."""
+    url = f"https://next.nexusmods.com/{GAME}/collections/renamed-col"
+    root = tmp_path / "root"
+    write_collection(root / "renamed-v1", name="Test Collection",
+                     mods=[mod_entry()], url=url)
+
+    result = run_cli(
+        root, "/sync 1\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": url, "mods_dir": root,
+         "target_dir": root / "renamed-v1"}
     ]
 
 
@@ -1260,7 +1304,8 @@ def test_help_flag_only_triggers_as_the_sole_argument(
     assert result.exit_code == 0
     # The URL synced as data; it was not answered with help text.
     assert FakeShellService.calls == [
-        {"method": "sync", "collection_url": url, "mods_dir": root}
+        {"method": "sync", "collection_url": url, "mods_dir": root,
+         "target_dir": None}
     ]
     assert "usage:" not in result.output
 
@@ -1510,3 +1555,242 @@ def test_status_help_documents_the_tool_wide_default(shell_env, tmp_path):
     assert "/status [<index|name>]" in out
     assert "tool-wide" in out
     assert "needs network" in out
+
+
+# ---------------------------------------------------------------------------
+# current collection: prompt, auto-select, bare /use, remembered selection
+# ---------------------------------------------------------------------------
+
+def run_capture_prompts(svc, root, script):
+    """run_shell with an input_fn that records every prompt string."""
+    prompts = []
+    buf = io.StringIO()
+    console = Console(file=buf, width=200, force_terminal=False)
+    steps = iter(script)
+
+    def input_fn(prompt):
+        prompts.append(prompt)
+        try:
+            return next(steps)
+        except StopIteration:
+            raise EOFError from None
+
+    code = run_shell(svc, root, input_fn=input_fn, console=console)
+    return code, buf.getvalue(), prompts
+
+
+def test_prompt_shows_the_current_collection_and_auto_selects_one(
+    shell_env, tmp_path
+):
+    root = make_root(tmp_path, ("Solo Pack", [mod_entry()]))
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    # Exactly one collection: selected at startup with a note.
+    assert "Using 'Solo Pack' (only collection here)." in out
+    assert prompts[0] == "nexus-dl [Solo Pack]> "
+
+
+def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    code, out, prompts = run_capture_prompts(
+        FakeShellService(), root, ["/use Beta", "/quit"]
+    )
+    assert code == 0
+    # Two collections: no auto-select, plain prompt until /use.
+    assert prompts[0] == "nexus-dl> "
+    assert prompts[1] == "nexus-dl [Beta]> "
+
+
+def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
+    root = tmp_path / "root"
+    write_collection(root / "weird", name="Weird\nName] [x")
+    code, out, prompts = run_capture_prompts(
+        FakeShellService(), root, ["/quit"]
+    )
+    assert code == 0
+    # Control characters collapse to spaces; brackets are plain text.
+    assert "\n" not in prompts[0]
+    assert prompts[0] == "nexus-dl [Weird Name] [x]> "
+
+
+def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", [mod_entry()]), ("Beta", []))
+    code, out, prompts = run_capture_prompts(
+        FakeShellService(), root, ["/use", "/use Beta", "/use", "/quit"]
+    )
+    assert code == 0
+    assert "Current collection: none selected." in out
+    assert "Current collection: 'Beta'" in out
+    # The same collection table as /collections renders alongside.
+    assert "Collections under" in out
+    assert "Alpha" in out and "Beta" in out
+    # Bare /use changed nothing: prompts before and after match.
+    assert prompts[0] == prompts[1] == "nexus-dl> "
+    assert prompts[2] == prompts[3] == "nexus-dl [Beta]> "
+
+
+def test_explicit_use_remembers_the_selection(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    memory = root / ".nexus-shell.json"
+    code, out, _ = run_capture_prompts(
+        FakeShellService(), root, ["/use Beta", "/quit"]
+    )
+    assert code == 0
+    assert json.loads(memory.read_text()) == {"current": "Beta"}
+
+
+def test_auto_select_never_writes_the_memory(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Solo Pack", []))
+    code, out, _ = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert "only collection here" in out
+    assert not (root / ".nexus-shell.json").exists()
+
+
+def test_startup_restores_the_remembered_selection(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    memory = root / ".nexus-shell.json"
+    memory.write_text(json.dumps({"current": "Beta"}))
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert prompts[0] == "nexus-dl [Beta]> "
+    assert "Using 'Beta'" in out
+    # Restore never rewrites the memory file.
+    assert json.loads(memory.read_text()) == {"current": "Beta"}
+
+
+def test_startup_restores_a_root_level_collection(shell_env, tmp_path):
+    root = tmp_path / "root"
+    write_collection(root, name="Root Collection")
+    memory = root / ".nexus-shell.json"
+    memory.write_text(json.dumps({"current": "root"}))
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert prompts[0] == "nexus-dl [Root Collection]> "
+
+
+def test_stale_remembered_selection_is_ignored_silently(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    (root / ".nexus-shell.json").write_text(json.dumps({"current": "gone"}))
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert prompts[0] == "nexus-dl> "
+    assert "Error:" not in out and "Warning:" not in out
+
+
+def test_corrupt_remembered_selection_is_ignored_silently(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    (root / ".nexus-shell.json").write_text("{ not json")
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert prompts[0] == "nexus-dl> "
+    assert "Error:" not in out and "Warning:" not in out
+
+
+# ---------------------------------------------------------------------------
+# selector precedence: exact name first, then ASCII-digit index
+# ---------------------------------------------------------------------------
+
+def test_digit_named_collection_wins_over_index(shell_env, tmp_path):
+    root = tmp_path / "root"
+    write_collection(root / "a", name="2024")
+    write_collection(root / "b", name="Alpha")
+
+    # Exact case-sensitive name match beats index interpretation.
+    result = run_cli(root, "/use 2024\n/quit\n")
+    assert result.exit_code == 0
+    assert "Using '2024'" in result.output
+
+    # Index interpretation still applies when no name matches.
+    result = run_cli(root, "/use 2\n/quit\n")
+    assert result.exit_code == 0
+    assert "Using 'Alpha'" in result.output
+
+
+def test_unicode_digits_are_never_an_index(shell_env, tmp_path):
+    root = tmp_path / "root"
+    write_collection(root / "a", name="2024")
+    write_collection(root / "b", name="Alpha")
+
+    # "\u0662" (Arabic-Indic two) is decimal but not ASCII: never an
+    # index, so it falls through to name matching and fails cleanly.
+    result = run_cli(root, "/use \u0662\n/quit\n")
+    assert result.exit_code == 0
+    assert "no collection named" in result.output
+
+
+# ---------------------------------------------------------------------------
+# re-add of a collection member vs a genuinely manual mod
+# ---------------------------------------------------------------------------
+
+def test_re_adding_a_collection_member_reports_re_added(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    # The cached manifest knows mod 123 as a collection member.
+    state = reload_state(root / "Test Collection")
+    state.manifest_data = {
+        "mod_rules": [{"source": {"modId": 123, "fileID": 456}}],
+    }
+    state.save()
+    FakeShellService.add_result = AddResult(
+        mod_name="Test Mod", mod_id=123, file_name="TestMod-456.zip",
+        success=True,
+    )
+
+    result = run_cli(
+        root,
+        "/use 1\n/add https://www.nexusmods.com/starfield/mods/123\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Re-added 'Test Mod' to 'Test Collection'" in out
+    assert "not a manual mod" in out
+    assert "as manual mod" not in out
+
+
+def test_adding_an_unlisted_mod_keeps_the_manual_wording(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    # No cached manifest: membership cannot include the new mod.
+    FakeShellService.add_result = AddResult(
+        mod_name="Fresh Mod", mod_id=999, file_name="Fresh.zip",
+        success=True,
+    )
+
+    result = run_cli(
+        root,
+        "/use 1\n/add https://www.nexusmods.com/starfield/mods/999\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "Added 'Fresh Mod' as manual mod (phase 999)." in out
+    assert "Re-added" not in out
+
+
+# ---------------------------------------------------------------------------
+# /status sections render independently even with bad state values
+# ---------------------------------------------------------------------------
+
+def test_status_renders_every_section_with_a_non_string_game_domain(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    state = reload_state(root / "Test Collection")
+    state.game_domain = 42
+    state.save()
+    use_fake_probes(monkeypatch)
+
+    result = run_cli(
+        root, "/status\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    # Every section rendered despite the non-string game domain.
+    assert "Games and collections" in out
+    assert "Tombstoned mods" in out
+    assert "API key: stored (keystore)" in out

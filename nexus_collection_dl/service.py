@@ -720,12 +720,18 @@ def scan_collections(root: Path) -> CollectionScan:
             # Unreadable, malformed, or partially hand-edited state:
             # record it and keep scanning. (load() can surface
             # StateError, OSError, or int()/type errors on bad keys.)
-            reason = (str(e) or type(e).__name__).strip().splitlines()[0]
+            # The safe stringify pattern keeps a whitespace-only
+            # message from raising here and hiding every collection.
+            lines = (str(e) or "").strip().splitlines()
+            summary = f"{lines[0][:60]}" if lines else ""
+            reason = (
+                f"{type(e).__name__}: {summary}" if summary else type(e).__name__
+            )
             skipped.append(
                 SkippedCollection(
                     name=cdir.name,
                     path=cdir,
-                    reason=f"{type(e).__name__}: {reason[:60]}",
+                    reason=reason,
                 )
             )
             continue
@@ -826,6 +832,44 @@ def collection_local_details(mods_dir: Path) -> CollectionLocalDetails:
         collection_url=state.collection_url,
         state_path=mods_dir / STATE_FILENAME,
     )
+
+
+def collection_manifest_mod_ids(mods_dir: Path) -> set[int]:
+    """mod_ids that belong to this collection's cached manifest (local).
+
+    Used by the shell to tell a re-added collection member from a
+    genuinely new manual mod. Reads only the manifest cached in state
+    (state.manifest_data); no network. Returns an empty set when no
+    manifest is cached or it carries no recognizable mod ids. Raises
+    StateError exactly like list_mods when the state cannot be read.
+    """
+    state = CollectionState(mods_dir)
+    state.load()
+    data = state.manifest_data
+    ids: set[int] = set()
+    if not isinstance(data, dict):
+        return ids
+    rules = data.get("mod_rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            for side in ("source", "reference"):
+                entry = rule.get(side)
+                if not isinstance(entry, dict):
+                    continue
+                mod_id = _as_int(entry.get("modId")) or _as_int(
+                    entry.get("modID")
+                )
+                if mod_id:
+                    ids.add(mod_id)
+    phases = data.get("mod_phases")
+    if isinstance(phases, dict):
+        for key in phases:
+            mod_id = _as_int(key)
+            if mod_id:
+                ids.add(mod_id)
+    return ids
 
 
 class ModManagerService:
@@ -979,8 +1023,18 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        target_dir: Path | None = None,
     ) -> SyncResult:
-        """Download an entire collection."""
+        """Download an entire collection.
+
+        ``mods_dir`` is the collections root: by default the collection
+        lands in a subdirectory named from the API's collection name.
+        ``target_dir`` overrides that destination with an exact
+        directory (used by the shell for an already-resolved collection,
+        so a renamed directory or a root-as-collection layout updates
+        the selected directory instead of a name-derived one). Callers
+        that pass only ``mods_dir`` see the original behavior.
+        """
         progress = on_progress or _noop_progress
         errors: list[str] = []
         load_order_files: list[str] = []
@@ -999,9 +1053,13 @@ class ModManagerService:
             collection_info.game_domain, collection_info.slug
         )
 
-        # Resolve mods_dir to a per-collection subdirectory
-        dir_name = _sanitize_dirname(collection_data["name"])
-        mods_dir = mods_dir / dir_name
+        # Destination: the caller's exact directory when given, else a
+        # per-collection subdirectory named from the API.
+        if target_dir is not None:
+            mods_dir = Path(target_dir)
+        else:
+            dir_name = _sanitize_dirname(collection_data["name"])
+            mods_dir = mods_dir / dir_name
         mods_dir.mkdir(parents=True, exist_ok=True)
         with CollectionLock(mods_dir):
             # Initialize state first: the tombstone filter below reads it.

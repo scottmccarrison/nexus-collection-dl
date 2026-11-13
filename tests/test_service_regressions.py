@@ -207,6 +207,30 @@ def test_sync_all_optional_skipped_persists_state(svc, tmp_path):
     assert state.game_domain == DOMAIN
 
 
+def test_sync_target_dir_updates_the_resolved_directory(svc, tmp_path):
+    """Regression: sync with an explicit target_dir must update exactly
+    that directory (the shell's resolved collection), never a directory
+    derived from the API's collection name. A renamed directory or a
+    root-as-collection layout used to silently sync elsewhere."""
+    renamed = tmp_path / "Renamed Dir"  # deliberately not the API name
+    renamed.mkdir()
+    mods = [{"mod_id": 1, "file_id": 2, "mod_name": "M",
+             "version": "1.0", "filename": "m.zip", "optional": False}]
+    svc._api = FakeNexusAPI(is_premium=False, collection=_collection_data(mods))
+
+    result = svc.sync(
+        COLLECTION_URL, tmp_path, no_load_order=True, target_dir=renamed
+    )
+
+    assert result.collection_dir == renamed
+    state = CollectionState(renamed)
+    assert state.exists()
+    state.load()
+    assert 2 in state.mods  # the mod landed in the resolved directory
+    # The name-derived directory was never created.
+    assert not (tmp_path / "Test Collection").exists()
+
+
 def test_sync_first_run_prefetches_manifest_for_md5(svc, tmp_path, monkeypatch):
     """First sync fetches the manifest once before downloading so integrity
     checks have MD5s from the very first file, and caches it in state."""

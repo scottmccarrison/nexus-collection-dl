@@ -19,6 +19,7 @@ from nexus_collection_dl.service import (
     SkippedCollection,
     collect_health,
     collection_local_details,
+    collection_manifest_mod_ids,
     list_collections,
     scan_collections,
 )
@@ -26,6 +27,7 @@ from nexus_collection_dl.state import (
     LOCK_FILENAME,
     STATE_FILENAME,
     CollectionState,
+    StateError,
 )
 
 GAME = "skyrimspecialedition"
@@ -485,3 +487,62 @@ def test_lock_state_sees_a_held_flock_in_process(tmp_path):
         os.close(fd)
     # No lock file at all: free, and a missing dir is not an error.
     assert service_module._lock_state(tmp_path / "nope") == "free"
+
+
+# ---------------------------------------------------------------------------
+# scan reason safety and manifest membership
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("message", [" ", "", "\n\t "])
+def test_scan_collections_survives_blank_exception_text(
+    tmp_path, monkeypatch, message
+):
+    """A whitespace-only exception message must never turn the skip
+    handler into an IndexError (it would hide every collection for
+    list_collections' callers too, since list_collections delegates)."""
+    write_state(tmp_path / "Good", name="Good")
+
+    class BrokenState:
+        def __init__(self, cdir):
+            pass
+
+        def load(self):
+            raise ValueError(message)
+
+    monkeypatch.setattr(service_module, "CollectionState", BrokenState)
+    scan = scan_collections(tmp_path)
+    assert scan.collections == []
+    assert [s.name for s in scan.skipped] == ["Good"]
+    assert scan.skipped[0].reason == "ValueError"
+    assert list_collections(tmp_path) == []
+
+
+def test_collection_manifest_mod_ids_reports_membership(tmp_path):
+    cdir = write_state(tmp_path / "Pack", mods=[mod_entry()])
+    state = CollectionState(cdir)
+    state.load()
+    state.manifest_data = {
+        "mod_rules": [
+            {"source": {"modId": 123, "fileID": 456}},
+            {"reference": {"modID": 777, "fileID": 888}},
+            "junk",
+            {"source": {"modId": "not-a-number"}},
+        ],
+        "mod_phases": {"123": 2, "999": 0},
+    }
+    state.save()
+    # Union of the mod_rules sides and the phase keys; junk is skipped.
+    assert collection_manifest_mod_ids(cdir) == {123, 777, 999}
+
+
+def test_collection_manifest_mod_ids_without_a_manifest(tmp_path):
+    cdir = write_state(tmp_path / "Pack", mods=[mod_entry()])
+    assert collection_manifest_mod_ids(cdir) == set()
+
+
+def test_collection_manifest_mod_ids_raises_on_unreadable_state(tmp_path):
+    cdir = tmp_path / "Broken"
+    cdir.mkdir()
+    (cdir / STATE_FILENAME).write_text("{ not json")
+    with pytest.raises(StateError):
+        collection_manifest_mod_ids(cdir)

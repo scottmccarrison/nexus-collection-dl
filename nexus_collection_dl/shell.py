@@ -44,10 +44,31 @@ Design notes:
   stays tool-wide even when a collection is selected. /status
   <index|name> keeps the original per-collection revision comparison
   (svc.get_status, network) and adds the collection's local details.
+* The prompt shows the current collection ("nexus-dl [Name]> ") and
+  plain "nexus-dl>" when none is selected. A root holding exactly one
+  collection is selected at startup with a note; larger or empty roots
+  start unselected. An explicit /use remembers the selection in
+  <ROOT>/.nexus-shell.json (one non-secret value: the collection's
+  directory name) and startup restores it when that directory still
+  holds .nexus-state.json; anything missing, stale, or corrupt is
+  ignored silently. The file is written only on explicit /use, never on
+  auto-select or restore.
+* /use with no argument reports the current selection (or "none
+  selected") plus the collection list and changes nothing.
+* Collection selectors resolve EXACT case-sensitive names first (so a
+  collection named "2024" is reachable by name), then ASCII-digit
+  indexes, then unique case-insensitive names.
+* /sync to an already-resolved collection (bare or index/name) updates
+  that collection's OWN directory even when its directory name differs
+  from the API's name (service.sync's target_dir). URL-form /sync keeps
+  the default: a new collection directory under the root.
 * No new dependencies: stdlib input() plus the rich console the CLI
   already uses. No completion, no history.
 """
 
+import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +98,7 @@ from .service import (
     SyncResult,
     collect_health,
     collection_local_details,
+    collection_manifest_mod_ids,
     get_collection_url,
     list_collections,
     list_mods,
@@ -136,11 +158,14 @@ _COMMAND_HELP = (
         "/games",
     )),
     _CommandHelp(
-        "/use <index|name>",
-        "select the collection other commands work on",
+        "/use [<index|name>]",
+        "select the collection other commands work on, or show the "
+        "current one",
         (
             "/use 2",
             "/use Clean Visuals",
+            "/use             show the current selection and the "
+            "collection list",
         ),
     ),
     _CommandHelp(
@@ -319,6 +344,66 @@ class _ShellSession:
         )
 
     # ------------------------------------------------------------------
+    # current collection: prompt, startup selection, persistence
+    # ------------------------------------------------------------------
+
+    def _prompt(self) -> str:
+        """Prompt text: the current collection when one is selected.
+
+        Plain input() text; the name is sanitized so control characters
+        in a hand-edited collection name cannot garble the prompt.
+        """
+        if self.current is None:
+            return "nexus-dl> "
+        return f"nexus-dl [{_prompt_name(self.current.name)}]> "
+
+    def _startup_selection(self) -> None:
+        """Best-effort initial selection; never fails the session.
+
+        The remembered selection (written by an earlier explicit /use)
+        wins when its directory still holds a readable collection;
+        otherwise a root with exactly one collection selects it with a
+        note. Nothing here writes the memory file: only explicit /use
+        remembers.
+        """
+        try:
+            colls = self._collection_listing()
+            remembered = _load_remembered_name(self.root)
+        except Exception:
+            return
+        if remembered is not None:
+            match = self._match_remembered(colls, remembered)
+            if match is not None:
+                self.current = match
+                self._emit(
+                    f"Using '{_safe_text(match.name)}' ({match.path})."
+                )
+                return
+        if len(colls) == 1:
+            self.current = colls[0]
+            self._emit(
+                f"Using '{_safe_text(self.current.name)}' "
+                "(only collection here)."
+            )
+
+    def _match_remembered(
+        self, colls: list[CollectionSummary], name: str
+    ) -> CollectionSummary | None:
+        """Find the collection a remembered dir name points at, or None.
+
+        The remembered value is a directory name: a child directory of
+        the root wins, then the root itself (root-as-collection).
+        """
+        target = self.root / name
+        for c in colls:
+            if c.path == target:
+                return c
+        for c in colls:
+            if c.path == self.root and c.path.name == name:
+                return c
+        return None
+
+    # ------------------------------------------------------------------
     # main loop
     # ------------------------------------------------------------------
 
@@ -327,10 +412,11 @@ class _ShellSession:
         self._emit(
             "nexus-dl shell. Type /help for commands, /quit to exit."
         )
+        self._startup_selection()
         input_failures = 0
         while True:
             try:
-                line = self.input_fn("nexus-dl> ")
+                line = self.input_fn(self._prompt())
             except EOFError:
                 # Ctrl-D: goodbye, exit 0.
                 self._emit("Goodbye.")
@@ -446,11 +532,13 @@ class _ShellSession:
     def _resolve_collection(self, selector: str) -> CollectionSummary:
         """Resolve a collection selector to exactly one collection.
 
-        The selector is the ordinal index shown by /collections (always
-        unambiguous) or the rest of the line as a name: an exact
-        case-sensitive match wins first, then a unique case-insensitive
-        match. Anything else raises ValueError listing the indexes;
-        duplicate display names are always shown with their indexes.
+        Precedence: an exact case-sensitive NAME match first (so a
+        collection named "2024" is reachable by name), then an INDEX of
+        ASCII digits only (the ordinal shown by /collections; unicode
+        digits are never interpreted as an index), then a unique
+        case-insensitive name. Anything else raises ValueError listing
+        the indexes; duplicate display names are always shown with
+        their indexes.
         """
         selector = selector.strip()
         if not selector:
@@ -459,15 +547,6 @@ class _ShellSession:
         if not colls:
             raise ValueError(f"no collections found under {self.root}")
 
-        if selector.isdigit():
-            index = int(selector)
-            if 1 <= index <= len(colls):
-                return colls[index - 1]
-            raise ValueError(
-                f"no collection with index {selector}\n"
-                + self._format_listing(colls)
-            )
-
         exact = [c for c in colls if c.name == selector]
         if len(exact) == 1:
             return exact[0]
@@ -475,6 +554,15 @@ class _ShellSession:
             raise ValueError(
                 f"'{selector}' matches {len(exact)} collections; "
                 "pick one by index:\n" + self._format_listing(colls)
+            )
+
+        if selector.isascii() and selector.isdecimal():
+            index = int(selector)
+            if 1 <= index <= len(colls):
+                return colls[index - 1]
+            raise ValueError(
+                f"no collection with index {selector}\n"
+                + self._format_listing(colls)
             )
 
         folded = [c for c in colls if c.name.lower() == selector.lower()]
@@ -552,6 +640,11 @@ class _ShellSession:
     def _cmd_collections(self, rest: str) -> None:
         if rest:
             raise ValueError("usage: /collections")
+        self._print_collections()
+
+    def _print_collections(self) -> None:
+        """The index-numbered collection table shared by /collections and
+        bare /use."""
         colls = self._collection_listing()
         if not colls:
             self._emit(f"No collections found under {self.root}.")
@@ -565,8 +658,8 @@ class _ShellSession:
         for i, c in enumerate(colls, 1):
             table.add_row(
                 str(i),
-                escape(self._scrub(c.name)),
-                escape(self._scrub(c.game_domain or "-")),
+                escape(self._scrub(_safe_text(c.name))),
+                escape(self._scrub(_safe_text(c.game_domain) or "-")),
                 str(c.mod_count),
                 str(c.pending_count),
             )
@@ -581,7 +674,7 @@ class _ShellSession:
             return
         totals: dict[str, list[int]] = {}
         for c in colls:
-            row = totals.setdefault(c.game_domain or "-", [0, 0])
+            row = totals.setdefault(_safe_text(c.game_domain) or "-", [0, 0])
             row[0] += 1
             row[1] += c.mod_count
         table = Table(title="Games")
@@ -597,9 +690,26 @@ class _ShellSession:
 
     def _cmd_use(self, rest: str) -> None:
         if not rest:
-            raise ValueError("usage: /use <index|name>")
+            # Self-report only: shows the current selection (or its
+            # absence) plus the collection list, and changes nothing.
+            if self.current is None:
+                self._emit("Current collection: none selected.")
+            else:
+                self._emit(
+                    f"Current collection: '{_safe_text(self.current.name)}' "
+                    f"({self.current.path})."
+                )
+            self._print_collections()
+            return
         self.current = self._resolve_collection(rest)
         self._emit(f"Using '{self.current.name}' ({self.current.path}).")
+        # Remembered only on explicit selection: startup auto-select and
+        # restore never write the memory file.
+        if not _save_remembered_name(self.root, self.current.path.name):
+            self._emit_warning(
+                f"could not remember this selection in "
+                f"{_SHELL_STATE_FILENAME}"
+            )
 
     def _cmd_mods(self, rest: str) -> None:
         if rest:
@@ -658,7 +768,30 @@ class _ShellSession:
                 "'nexus-dl import' on that directory."
             )
             return
+        if self._is_collection_member(result.mod_id):
+            # Re-adding a mod the collection already manages: "manual"
+            # would misreport it (the next sync folds it back into the
+            # collection-managed set).
+            self._emit(
+                f"Re-added '{result.mod_name}' to "
+                f"'{_safe_text(self.current.name)}'; it is a collection "
+                "member, not a manual mod."
+            )
+            return
         self._emit(f"Added '{result.mod_name}' as manual mod (phase 999).")
+
+    def _is_collection_member(self, mod_id: int) -> bool:
+        """Is mod_id part of the current collection's cached manifest?
+
+        Reporting-only distinction between a re-added collection member
+        and a genuinely new manual mod. Never raises: when membership
+        cannot be determined, the manual wording stands.
+        """
+        try:
+            current = self._require_current()
+            return mod_id in collection_manifest_mod_ids(current.path)
+        except Exception:
+            return False
 
     def _report_nxm(self, result: NxmResult) -> None:
         # "error" status is a failure even when the success flag claims
@@ -699,20 +832,23 @@ class _ShellSession:
         for warning in result.warnings:
             self._emit_warning(warning)
 
-    def _sync_target_url(self, rest: str) -> str:
-        """Resolve the /sync target to the collection URL to sync.
+    def _sync_target(self, rest: str) -> tuple[str, Path | None]:
+        """Resolve the /sync target to (collection URL, destination).
 
-        Three forms: an http(s) collection URL (synced as-is), an
-        index or name resolved exactly like /use, or nothing to resync
-        the current collection. The index/name and resync forms use the
+        Three forms: an http(s) collection URL (synced as-is into a new
+        directory under the root, named from the API), an index or name
+        resolved exactly like /use, or nothing to resync the current
+        collection. The index/name and resync forms use the
         collection_url the collection's state recorded at its last
-        sync, so nobody has to go re-find a collection they already
-        have on disk. A state with no recorded URL gets an honest error
-        pointing at the URL form instead of a guess.
+        sync AND pin the destination to the collection's own directory,
+        so a renamed directory or a root-as-collection layout updates
+        exactly the selected collection. A state with no recorded URL
+        gets an honest error pointing at the URL form instead of a
+        guess.
         """
         target = rest.strip()
         if target.lower().startswith(("http://", "https://")):
-            return target
+            return target, None
         if target:
             summary = self._resolve_collection(target)
         elif self.current is not None:
@@ -730,11 +866,13 @@ class _ShellSession:
                 "pass it explicitly\n"
                 "usage: /sync <collection-url>"
             )
-        return url
+        return url, summary.path
 
     def _cmd_sync(self, rest: str) -> None:
-        url = self._sync_target_url(rest)
-        result: SyncResult = self.svc.sync(url, self.root)
+        url, target_dir = self._sync_target(rest)
+        result: SyncResult = self.svc.sync(
+            url, self.root, target_dir=target_dir
+        )
         # Per-mod errors render before any success text.
         for err in result.errors:
             self._emit_error(err)
@@ -857,11 +995,15 @@ class _ShellSession:
         """
         scan = scan_collections(self.root)
 
-        # (a) per-game rollup (parallels /games) plus totals.
+        # (a) per-game rollup (parallels /games) plus totals. State
+        # values are coerced with _safe_text: one non-string value must
+        # not abort the later sections.
         if scan.collections:
             totals: dict[str, list[int]] = {}
             for c in scan.collections:
-                row = totals.setdefault(c.game_domain or "-", [0, 0, 0])
+                row = totals.setdefault(
+                    _safe_text(c.game_domain) or "-", [0, 0, 0]
+                )
                 row[0] += 1
                 row[1] += c.mod_count
                 row[2] += c.pending_count
@@ -899,13 +1041,13 @@ class _ShellSession:
                     count = collection_local_details(c.path).tombstone_count
                 except Exception as e:
                     self._emit_warning(
-                        f"could not read removal state for '{c.name}': "
-                        f"{type(e).__name__}"
+                        f"could not read removal state for "
+                        f"'{_safe_text(c.name)}': {type(e).__name__}"
                     )
-                    table.add_row(escape(self._scrub(c.name)), "?")
+                    table.add_row(escape(self._scrub(_safe_text(c.name))), "?")
                     continue
                 tombstoned += count
-                table.add_row(escape(self._scrub(c.name)), str(count))
+                table.add_row(escape(self._scrub(_safe_text(c.name))), str(count))
             self.console.print(table)
             if tombstoned:
                 self._emit(
@@ -1000,6 +1142,72 @@ def _display_url(url: str) -> str:
     left is scrubbed again at render time.
     """
     return url.split("#", 1)[0].split("?", 1)[0]
+
+
+def _safe_text(value, fallback: str = "-") -> str:
+    """Stringify a state value for display; never raises.
+
+    Hand-edited state can hold non-string scalars where text is
+    expected (a numeric game_domain, say). Display code coerces them
+    to a plain label so one bad value cannot abort a whole section.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return fallback
+    try:
+        return str(value)
+    except Exception:
+        return fallback
+
+
+def _prompt_name(name) -> str:
+    """Collection name rendered safely for the input() prompt.
+
+    The prompt is plain text, but control characters (newlines in a
+    hand-edited collection name) would garble it, so they collapse to
+    spaces.
+    """
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", _safe_text(name)).strip()
+
+
+# Root-scoped shell memory: {"current": "<collection dir name>"}.
+# One non-secret value; see _load/_save_remembered_name.
+_SHELL_STATE_FILENAME = ".nexus-shell.json"
+
+
+def _load_remembered_name(root: Path) -> str | None:
+    """The collection dir name remembered for root, or None.
+
+    Missing, unreadable, or corrupt files are ignored silently: a
+    stale memory must never break a session. The file stores exactly
+    one value, a directory name, and never a secret.
+    """
+    try:
+        data = json.loads(
+            (Path(root) / _SHELL_STATE_FILENAME).read_text()
+        )
+        name = data.get("current")
+    except Exception:
+        return None
+    return name if isinstance(name, str) and name else None
+
+
+def _save_remembered_name(root: Path, name: str) -> bool:
+    """Remember the current collection dir name for root (best effort).
+
+    Atomic replace so a crash mid-write cannot leave a corrupt file.
+    Returns False on any I/O failure; the caller treats remembrance as
+    a convenience, never a requirement.
+    """
+    path = Path(root) / _SHELL_STATE_FILENAME
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"current": name}))
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
 
 
 def run_shell(
