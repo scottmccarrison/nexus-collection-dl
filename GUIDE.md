@@ -380,7 +380,7 @@ An `nxm://` link only works with `nexus-dl nxm`. Pasting an `https://` mod-page 
 
 ### When it asks you to click again
 
-The `key` and `expires` parts of a link are temporary credentials tied to your account. If a link has expired, was copied without its credentials, or belongs to a different Nexus account than your API key, nexus-dl refuses to download and tells you to click **Mod manager download** on the website again for a fresh link. Nothing is written when that happens.
+The `key` and `expires` parts of a link are temporary credentials tied to your account. If a link has expired, lost its `key`/`expires` pair somewhere in handling, or belongs to a different Nexus account than your API key, nexus-dl refuses to download and tells you to click **Mod manager download** on the website again for a fresh link. Nothing is written when that happens.
 
 Collection links (`nxm://.../collections/...`) are not handled this way - use `nexus-dl sync` with the collection URL instead.
 
@@ -392,7 +392,7 @@ If you find yourself typing the same directory paths over and over, `nexus-dl sh
 nexus-dl shell ~/mods/starfield
 ```
 
-The directory you pass is the root (`ROOT_DIR` in the help text). Leave it out and the shell uses the directory you're in. It treats a collection as the root folder itself or any immediate subfolder that holds `.nexus-state.json` (the state file `sync` creates). Nothing deeper is scanned, and a folder with a broken state file is skipped instead of blocking the list.
+The directory you pass is the root (`ROOT_DIR` in the help text). Leave it out and the shell uses the directory you're in. It treats a collection as the root folder itself or any immediate subfolder that holds `.nexus-state.json` (the state file `sync` creates). Nothing deeper is scanned, and a folder with a broken state file is skipped instead of blocking the list. The prompt keeps you posted on the current collection: `nexus-dl [Name]> ` once one is selected, plain `nexus-dl>` when none is. A root with exactly one collection selects that one at startup.
 
 ### A sample session
 
@@ -408,7 +408,7 @@ Command                  | Description
 /help                    | show this command list
 /collections             | list collections under the root
 /games                   | list games with collection and mod counts
-/use <index|name>        | select the collection other commands work on
+/use [<index|name>]      | select the collection other commands work on, or show the current one
 /mods [collection]       | list tracked mods (default: current collection)
 /add <url>               | add one mod (https:// mod page or nxm:// link)
 /sync [<index|name|url>] | sync a collection (default: the current collection)
@@ -427,23 +427,23 @@ Collections under $HOME/mods/starfield
 nexus-dl> /use Weightless QoL
 Using 'Weightless QoL' ($HOME/mods/starfield/Weightless QoL).
 
-nexus-dl> /mods
+nexus-dl [Weightless QoL]> /mods
 Mods in Weightless QoL
 file_id | Name                       | Version | Download status
 9034551 | Compact Inventory UI       | 0.9     | pending_download
 9012345 | Faster Scanning            | 1.1     | downloaded
 8842117 | Starfield Community Patch  | 2.4     | downloaded
 
-nexus-dl> /add https://www.nexusmods.com/starfield/mods/2885
+nexus-dl [Weightless QoL]> /add https://www.nexusmods.com/starfield/mods/2885
 Added 'Ship Builder Categories' as manual mod (phase 999).
 
-nexus-dl> /remove 9012345
+nexus-dl [Weightless QoL]> /remove 9012345
 Remove 'Faster Scanning' (file_id 9012345, mod_id 110477) and all its files?
 this removes the mod from the collection and it stays removed through sync/update; files on disk are kept; re-add restores it
 Remove 'Faster Scanning'? [yes/no]: yes
 Removed 'Faster Scanning' (mod_id 110477); file(s) 9012345 left the collection.
 
-nexus-dl> /status
+nexus-dl [Weightless QoL]> /status
 Games and collections
 Game      | Collections | Total mods | Pending
 starfield |           2 |          5 |       1
@@ -461,7 +461,7 @@ OK Desktop tools: xdg-mime and notify-send are present and working
 OK State files: 2 collection state file(s) readable
 OK State locks: no collection state lock is in use; flock locks are released on exit, so stale lock files cannot exist
 
-nexus-dl> /status 2
+nexus-dl [Weightless QoL]> /status 2
 Collection: Weightless QoL
 State path: $HOME/mods/starfield/Weightless QoL/.nexus-state.json
 Collection URL: https://next.nexusmods.com/starfield/collections/weightless-qol
@@ -474,11 +474,11 @@ Compact Inventory UI       | 0.9     | pending_download
 Ship Builder Categories    | 1.2     | manual
 Starfield Community Patch  | 2.4     | update_available
 
-nexus-dl> /quit
+nexus-dl [Weightless QoL]> /quit
 Goodbye.
 ```
 
-A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, and `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. `/sync` syncs a collection into the root and takes its target three ways: a collection URL (`/sync <collection-url>`), the index or name of a collection you already have on disk (`/sync 2`, `/sync Clean Visuals`), or nothing at all to resync the current collection from the URL recorded in its state (with no recorded URL it asks for one explicitly). `/add` also takes an `nxm://` link if you have one, and free accounts get the manual download instructions from `/add`, same as the plain `add` command. Every command also answers a bare `--help` as its only argument (or `/help <command>`) with its usage and one example instead of running. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
+A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, and `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. `/sync` syncs a collection into the root and takes its target three ways: a collection URL (`/sync <collection-url>`), the index or name of a collection you already have on disk (`/sync 2`, `/sync Clean Visuals`), or nothing at all to resync the current collection from the URL recorded in its state (with no recorded URL it asks for one explicitly). Either way it updates that collection's own directory, even if you renamed its folder since the last sync. `/add` also takes an `nxm://` link if you have one, and free accounts get the manual download instructions from `/add`, same as the plain `add` command. Every command also answers a bare `--help` as its only argument (or `/help <command>`) with its usage and one example instead of running. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
 
 ```
 nexus-dl> hello world
@@ -487,10 +487,11 @@ Error: Unknown input. For the command list, try /help. Bare nxm or https links a
 
 ### Picking a collection with /use
 
-Most commands work on one selected collection, and `/use` picks it two ways:
+Most commands work on one selected collection, and `/use` picks it in this order, first match wins:
 
-- **The index from `/collections`** (the `#` column). Always unambiguous, even when two collections share a name.
-- **A name.** An exact case-sensitive match wins first; if there isn't one, a unique case-insensitive match is used. If the name fits more than one collection, the shell refuses to guess and lists the indexes:
+- **An exact name.** Case-sensitive first, so a collection named `2024` is selected by name even though it looks like an index.
+- **An index.** The `#` column from `/collections`, ASCII digits only; a unicode digit is never read as an index.
+- **A name, case-insensitively.** A unique match is used. If the name fits more than one collection, the shell refuses to guess and lists the indexes:
 
 ```
 nexus-dl> /use DUP
@@ -499,7 +500,7 @@ Error: 'DUP' matches 2 collections (names differ only by case); pick one by inde
   2: dup [starfield]
 ```
 
-An unknown name gets `no collection named '...'` plus the same listing, so you can always fall back to an index.
+An unknown name gets `no collection named '...'` plus the same listing, so you can always fall back to an index. `/use` on its own changes nothing: it reports the current selection (or `none selected`) and prints the collection list. An explicit `/use` remembers the selection for that root in `.nexus-shell.json` (one value: the collection's directory name, nothing else), and the next shell on that root restores it; a stale or corrupt file is ignored.
 
 ### Checking status with /status
 
@@ -517,7 +518,7 @@ What removal actually does, spelled out because "remove" can mean several things
 
 - **State only.** The mod's entries are deleted from `.nexus-state.json` and a tombstone (the `removed_mods` key) is written for its mod page. Files on disk are never touched: extracted content and kept archives stay exactly where they are. That's deliberate, since a collection's extraction tree is merged into one folder where mods share and overwrite paths, so payload files can't be cleanly attributed back to a single mod. Cleaning up deployed files is `undeploy`'s job.
 - **The removal sticks.** `sync` and `update` honor the tombstone and skip the mod (the summary reports `N removed mod(s) skipped`), so a later collection revision can't quietly reinstall it. The tombstone keys on the mod page (mod_id), not on file_id, so new file ids in a newer revision still match.
-- **Re-adding restores it.** Adding the mod again (link, `add`, or `import`) clears the tombstone and brings the mod back.
+- **Re-adding restores it.** Adding the mod again (link, `add`, or `import`) clears the tombstone and brings the mod back. The shell says so honestly in that case: `Re-added '<name>' to '<collection>'; it is a collection member, not a manual mod`, because the next sync folds it back into the collection-managed set either way.
 - **One downgrade caveat.** Older nexus-dl versions don't know about the `removed_mods` key: they ignore it and drop it the next time they save state, so running an older build can resurrect removed mods at the next sync or update.
 
 Removing an id that isn't in `/mods` fails with `No mod file with file_id ... in ...` and changes nothing.
