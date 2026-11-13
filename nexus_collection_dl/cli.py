@@ -939,6 +939,17 @@ def nxm(
             handler_notify("nexus-dl: download failed", _notify_body(message))
         sys.exit(1)
 
+    def redacted(value: object) -> str:
+        # Result fields are untrusted display data, not pre-redacted
+        # text: a hostile or compromised endpoint can reflect the API
+        # key or the link's key/expires values into file names, mod
+        # names, warnings, or error text (the same scope the exception
+        # branches above redact against). Same boundary scope and
+        # short-secret floor as those branches; the notify path adds
+        # URI stripping on top via _notify_body.
+        return _boundary_redact(ctx, uri, str(value), strip_uris=False,
+                                min_secret_len=_MIN_REDACT_SECRET_LEN)
+
     try:
         # The group callback defers service construction for this command
         # so a construction failure lands in the guarded handlers below.
@@ -987,53 +998,61 @@ def nxm(
         detail = _boundary_redact(ctx, uri, str(e)).strip()
         fail(detail or f"Unexpected failure ({type(e).__name__}).")
 
+    # Every user-visible piece of a result-based outcome goes through
+    # boundary redaction before display or notification; only the raw
+    # numeric ids and fixed status tokens are printed as-is.
+    error_text = redacted(result.error)
+    mod_name = redacted(result.mod_name)
+    filename = redacted(result.filename)
+
     if not result.success:
         reason = "re_click_required" if result.re_click_required else "rejected"
         _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
         if result.error:
-            console.print(f"[red]Error:[/red] {escape(result.error)}")
+            console.print(f"[red]Error:[/red] {escape(error_text)}")
         if result.re_click_required:
             console.print(
                 "[yellow]Click 'Mod manager download' on the Nexus website "
                 "again, then retry.[/yellow]"
             )
         if want_notify:
-            handler_notify("nexus-dl: download failed", _notify_body(result.error))
+            handler_notify("nexus-dl: download failed", _notify_body(error_text))
         sys.exit(1)
 
     if result.status == "already_downloaded":
         console.print(
-            f"[green]'{escape(str(result.mod_name))}' (file {result.file_id}) is already "
+            f"[green]'{escape(mod_name)}' (file {result.file_id}) is already "
             f"downloaded in this collection.[/green]"
         )
-        summary = f"Already downloaded: {result.mod_name}"
+        summary = f"Already downloaded: {mod_name}"
     elif result.status == "extracted_from_archive":
         console.print(
-            f"[green]Finished '{escape(str(result.mod_name))}' (file "
+            f"[green]Finished '{escape(mod_name)}' (file "
             f"{result.file_id}) by extracting the retained archive; no "
             "download was needed.[/green]"
         )
-        summary = f"Extracted {result.mod_name} from the retained archive"
+        summary = f"Extracted {mod_name} from the retained archive"
     elif result.status == "saved_to_output":
-        console.print(f"[green]Saved {escape(str(result.output_path))}[/green]")
-        summary = f"Saved {result.filename}"
+        console.print(f"[green]Saved {escape(redacted(result.output_path))}[/green]")
+        summary = f"Saved {filename}"
     else:
         where = (
-            f" into {escape(str(result.collection_dir))}" if result.collection_dir else ""
+            f" into {escape(redacted(result.collection_dir))}"
+            if result.collection_dir else ""
         )
         console.print(
-            f"[green]Downloaded '{escape(str(result.mod_name))}'{where}.[/green]"
+            f"[green]Downloaded '{escape(mod_name)}'{where}.[/green]"
         )
         if result.extracted:
             console.print(
                 "[dim]Archive extracted. Run 'nexus-dl deploy' when ready; "
                 "nothing was deployed automatically.[/dim]"
             )
-        summary = f"Downloaded {result.mod_name}"
+        summary = f"Downloaded {mod_name}"
     # Non-fatal follow-up failures on a completed download (e.g. load
     # order): truthful warnings, still a success exit.
     for warning in result.warnings:
-        console.print(f"[yellow]Warning:[/yellow] {escape(str(warning))}")
+        console.print(f"[yellow]Warning:[/yellow] {escape(redacted(warning))}")
     # One status line for the after-the-fact trail: ids and the fixed
     # status token only, never names, URIs, or credentials.
     _log_nxm(

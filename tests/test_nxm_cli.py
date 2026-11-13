@@ -262,22 +262,133 @@ def test_nxm_no_notify_flag_suppresses(cli_env):
     assert cli_env["notifications"] == []
 
 
+# Fake credential a hostile endpoint reflects into result fields.
+# REFLECTED_ENC is a case-varied, percent-encoded spelling of the same
+# value (V -> %56, U -> %75): boundary redaction must catch both the
+# raw and the encoded form wherever either surfaces.
+REFLECTED_KEY = "SECRETVALUE1"
+REFLECTED_ENC = "SeCrEt%56al%75e1"
+# Link carrying REFLECTED_KEY as its download credential: the reflected
+# value is a scoped secret for the nxm boundary redaction.
+REFLECTED_URI = (f"nxm://{GAME}/mods/9/files/9"
+                 f"?key={REFLECTED_KEY}&expires=1893456000")
+
+
+def assert_reflected_secret_never_surfaces(result, notifications):
+    """Neither spelling of the reflected credential reaches any output.
+
+    CliRunner's ``output`` mixes stdout and stderr; ``stderr`` is also
+    checked directly so a stream split can never hide a leak. Every
+    notification tuple element (title, body or summary line) is checked.
+    """
+    for form in (REFLECTED_KEY, REFLECTED_ENC):
+        assert form not in result.output
+        assert form not in result.stderr
+        for title, body in notifications:
+            assert form not in title
+            assert form not in body
+
+
 def test_nxm_failure_result_shows_reclick_hint_and_notifies_redacted(cli_env):
     FakeService.result = NxmResult(
         success=False, status="error", game_domain=GAME, mod_id=1, file_id=2,
         error=(
             "This link carries no download credentials; see "
-            "https://www.nexusmods.com/example?key=SECRETVALUE1"
+            f"https://www.nexusmods.com/example?key={REFLECTED_KEY} "
+            f"(echo check {REFLECTED_ENC})"
         ),
         re_click_required=True,
     )
-    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2"])
+    # The fake credential is the API key here: the endpoint reflected it
+    # into the error text. The terminal is asserted as tightly as the
+    # notification, not only the popup.
+    result = CliRunner().invoke(
+        cli_module.main, ["--api-key", REFLECTED_KEY,
+                          "nxm", f"nxm://{GAME}/mods/1/files/2"],
+    )
     assert result.exit_code == 1
     assert "Mod manager download" in result.output  # actionable re-click line
     summary, body = cli_env["notifications"][0]
     assert summary == "nexus-dl: download failed"
     assert "SECRETVALUE1" not in body
     assert "[url redacted]" in body               # notify body is sanitized
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_success_mod_name_reflection_never_surfaces(cli_env):
+    # Success path: the mod name carries the reflected credential in raw
+    # and percent-encoded spellings and reaches the terminal line and
+    # the notification summary.
+    FakeService.result = NxmResult(
+        success=True, status="already_downloaded", game_domain=GAME,
+        mod_id=1, file_id=2,
+        mod_name=f"Mod {REFLECTED_KEY} {REFLECTED_ENC}",
+    )
+    result = invoke(["nxm", REFLECTED_URI, "--notify"])
+    assert result.exit_code == 0, result.output
+    assert "already downloaded" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_success_filename_reflection_never_surfaces(cli_env):
+    # Success path: the file name (and the output path built from it)
+    # carries the credential to the terminal line and the summary.
+    name = f"{REFLECTED_KEY}-{REFLECTED_ENC}.zip"
+    FakeService.result = NxmResult(
+        success=True, status="saved_to_output", game_domain=GAME, mod_id=1,
+        file_id=2, filename=name,
+        output_path=cli_env["tmp_path"] / "out" / name,
+    )
+    result = invoke(["nxm", REFLECTED_URI, "--notify"])
+    assert result.exit_code == 0, result.output
+    assert "Saved" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_failure_mod_name_reflection_never_surfaces(cli_env):
+    # Failure path: the mod name is reflected into the result error text.
+    FakeService.result = NxmResult(
+        success=False, status="error", game_domain=GAME, mod_id=1, file_id=2,
+        mod_name=f"Mod {REFLECTED_KEY}",
+        error=(f"Verification failed for 'Mod {REFLECTED_KEY}' "
+               f"({REFLECTED_ENC})"),
+    )
+    result = invoke(["nxm", REFLECTED_URI])
+    assert result.exit_code == 1
+    assert "Verification failed" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_failure_filename_reflection_never_surfaces(cli_env):
+    # Failure path, the documented threat shape:
+    # DownloadError(f"{filename}: size mismatch ...") with the reflected
+    # credential inside the file name.
+    FakeService.result = NxmResult(
+        success=False, status="error", game_domain=GAME, mod_id=1, file_id=2,
+        filename=f"{REFLECTED_KEY}-{REFLECTED_ENC}.zip",
+        error=(f"{REFLECTED_KEY}-{REFLECTED_ENC}.zip: size mismatch "
+               "(expected 10, got 9)"),
+    )
+    result = invoke(["nxm", REFLECTED_URI])
+    assert result.exit_code == 1
+    assert "size mismatch" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_warnings_reflection_never_surfaces(cli_env):
+    # Non-fatal warnings on a completed download are untrusted text too.
+    FakeService.result = NxmResult(
+        success=True, status="downloaded", game_domain=GAME, mod_id=1,
+        file_id=2, mod_name="Test Mod",
+        collection_dir=cli_env["tmp_path"] / "col",
+        warnings=[f"Load order regeneration failed for {REFLECTED_KEY} "
+                  f"({REFLECTED_ENC}). Run 'nexus-dl load-order /x' to "
+                  "retry."],
+    )
+    result = invoke(["nxm", REFLECTED_URI, "--notify"])
+    assert result.exit_code == 0, result.output
+    assert "Warning:" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
 
 
 def test_nxm_busy_lock_surfaces_as_clean_failure(cli_env):
