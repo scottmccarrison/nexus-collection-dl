@@ -241,7 +241,7 @@ nexus-dl nxm "nxm://..." --output ~/Downloads
 nexus-dl nxm "nxm://..." --no-extract --no-load-order
 ```
 
-Advanced footnote: run a copied link manually without putting its credentials in shell history. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (Pasting the link onto the `read` command line just hangs, because `read` waits for a newline before it returns.)
+Advanced footnote: if you have an `nxm://` link on hand, you can run it yourself without putting its credentials in shell history. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (Pasting the link onto the `read` command line just hangs, because `read` waits for a newline before it returns.)
 
 ```bash
 read -s -r NXM_LINK
@@ -255,11 +255,11 @@ Notes:
 - The stored API key lives in `~/.config/nexus-dl/api-key` with owner-only (0600) permissions. No command ever prints its value.
 - The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
 - Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
-- Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: the nxm:// link comes from the "Mod manager download" button (right-click it and copy the link address).
+- Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: that command runs the `nxm://` link the "Mod manager download" click hands to your handler, and the website does not offer the link as anything you can copy. To add a mod from its page URL, use `nexus-dl add` (or `/add` in the shell) instead.
 - Downloads are verified before they are published (exact size, manifest MD5 when known); a file with neither a positive expected size nor a well-formed cached checksum is refused with nothing written. A re-click with the verified archive still on disk triggers no download traffic: an entry already marked downloaded reports "already downloaded" with zero network calls, and an entry whose extraction failed finishes extracting from the retained archive, verified against the cached manifest hash when one is known (with track-sync enabled, a background tracked-mod sync may still make API calls); the default flow deletes the archive after a successful extraction, so a re-click then re-downloads and re-verifies it.
 - Extraction publishes staged files one by one, not atomically as a set: a rare mid-publication failure (disk full, permissions) can leave a subset of extracted files in place while the error is reported and staging is cleaned up; re-running (the link or `nexus-dl import`) is safe and overwrites the partial set.
 - Re-running `handler install` is idempotent: the desktop entry is always rewritten (refreshing entries from older versions). Install also probes what the click flow needs (xdg-mime, notify-send, and the desktop's notification switch where one is known), warns about anything missing or switched off, and runs a best-effort notification-daemon self-test pointing at `~/.local/state/nexus-dl/nxm.log`. Warnings never block the install.
-- Platform support and the notification gotchas have their own subsections below. The one universal limit: Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported - use a native browser build or run `nexus-dl nxm` on a copied link.
+- Platform support and the notification gotchas have their own subsections below. The one universal limit: Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported - use a native browser build or run `nexus-dl nxm` with a link you have on hand.
 - `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
 - Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
 
@@ -274,7 +274,7 @@ The click-through flow was live-tested end to end on one machine: Linux Mint (Ci
 | MATE, XFCE, Budgie | Expected to work, untested | GIO-family desktops; standard xdg-mime/desktop-entry handling. No notification switch to probe. |
 | KDE Plasma (including CachyOS) | Expected to work, untested | KIO-based rather than GIO, but scheme handlers register through the same xdg-mime/desktop-entry mechanisms and notify-send works. No notification switch to probe. |
 | Tiling setups (i3, Sway, Hyprland) | Expected to work, untested | Needs a notification daemon (`dunst`, `mako`, ...) for click feedback. |
-| Flatpak/Snap browsers | Unsupported | Sandboxed browsers generally cannot launch host desktop handlers. Use a native browser build, or copy the link and run `nexus-dl nxm` yourself. |
+| Flatpak/Snap browsers | Unsupported | Sandboxed browsers generally cannot launch host desktop handlers. Use a native browser build, or run `nexus-dl nxm` yourself with a link you have on hand. |
 
 #### Notifications
 
@@ -351,7 +351,7 @@ For browsing and quick changes without retyping paths, `nexus-dl shell` opens an
 nexus-dl shell ~/mods/starfield
 ```
 
-List collections and games, pick one with `/use`, then `/mods`, `/add`, `/sync`, `/remove`, and `/status` work on it (paste an `nxm://` link on its own line to add a mod; the link is never echoed back). `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
+List collections and games, pick one with `/use`, then `/mods`, `/add`, `/sync`, `/remove`, and `/status` work on it. `/add` takes an `https://` mod page URL (an `nxm://` link works too if you have one, bare on its own line or after `/add`, and the shell never echoes a link back), and `/sync` takes a collection URL, a collection you already have by index or name, or nothing to resync the current one. `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
 
 Honest note on `/remove`: it drops the mod's entries from collection state and records a tombstone so `sync`/`update` skip the mod from then on, but it never deletes files already on disk (a collection's extraction tree is merged, so payload files can't be attributed back to one mod). Re-adding the mod clears the tombstone and restores it.
 

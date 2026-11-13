@@ -799,7 +799,8 @@ def test_nxm_non_nxm_input_explains_link_type(cli_env):
     assert "not an nxm:// link" in result.output
     assert "not usable" in result.output
     assert "Mod manager download" in result.output   # how to get the link
-    assert "copy link address" in result.output      # right-click copy
+    assert "anything you can copy" in result.output  # the site has no copyable link
+    assert "nexus-dl add" in result.output           # the mod page URL path instead
     assert "handler install" in result.output        # click-through setup
     # Never echoes the raw URI, its host, or its query.
     assert url not in result.output

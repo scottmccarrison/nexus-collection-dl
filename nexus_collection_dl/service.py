@@ -718,6 +718,20 @@ def list_mods(mods_dir: Path) -> list[ModSummary]:
     return summaries
 
 
+def get_collection_url(mods_dir: Path) -> str:
+    """Return the collection URL recorded in a collection's state.
+
+    This is the URL the collection was last synced from, the one
+    ``sync``/``update`` can be pointed at again without a trip back to
+    the website. Returns "" when the state records none (for example a
+    hand-created state file). Read-only and offline: raises StateError
+    when the state cannot be read, exactly like list_mods.
+    """
+    state = CollectionState(mods_dir)
+    state.load()
+    return state.collection_url
+
+
 class ModManagerService:
     """Business logic for managing Nexus Mods collections."""
 

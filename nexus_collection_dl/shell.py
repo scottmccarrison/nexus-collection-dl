@@ -25,6 +25,11 @@ Design notes:
 * Removal goes through ModManagerService.remove_mod: the tombstone is
   written at the service layer (so sync/update honor it), payload files
   on disk are never deleted, and re-adding the mod clears the tombstone.
+* /sync takes three targets: a collection URL, an index or name
+  resolved exactly like /use, or nothing to resync the current
+  collection. The last two sync the collection_url the state recorded
+  at its last sync (service.get_collection_url) and fail with a
+  pointer to the URL form when the state records none.
 * No new dependencies: stdlib input() plus the rich console the CLI
   already uses. No completion, no history.
 """
@@ -54,6 +59,7 @@ from .service import (
     ModManagerService,
     NxmResult,
     SyncResult,
+    get_collection_url,
     list_collections,
     list_mods,
 )
@@ -82,8 +88,11 @@ _HELP_LINES = (
     ("/games", "list games with collection and mod counts"),
     ("/use <index|name>", "select the collection other commands work on"),
     ("/mods [collection]", "list tracked mods (default: current collection)"),
-    ("/add <url>", "add one mod (nxm:// link or https:// mod page)"),
-    ("/sync <collection-url>", "sync a collection into the root"),
+    ("/add <url>", "add one mod (https:// mod page or nxm:// link)"),
+    (
+        "/sync [<index|name|url>]",
+        "sync a collection (default: the current collection)",
+    ),
     ("/remove <file_id|mod:id>", "remove a mod from the current collection"),
     ("/status", "show collection status vs the latest revision"),
     ("/quit", "leave the shell (also /exit, or Ctrl-D)"),
@@ -381,7 +390,9 @@ class _ShellSession:
         table.add_column("Command", style="cyan", no_wrap=True)
         table.add_column("Description")
         for command, description in _HELP_LINES:
-            table.add_row(command, description)
+            # Escape both cells: rich markup must not swallow bracketed
+            # arguments like /mods [collection].
+            table.add_row(escape(command), escape(description))
         self.console.print(table)
         self._emit(
             "Bare nxm:// or https:// links on a line are handled as /add."
@@ -469,7 +480,7 @@ class _ShellSession:
         current = self._require_current()
         if not rest:
             raise ValueError(
-                "usage: /add <nxm link or http(s) mod page URL>"
+                "usage: /add <http(s) mod page URL or nxm link>"
             )
         low = rest.lower()
         if low.startswith("nxm://"):
@@ -482,7 +493,7 @@ class _ShellSession:
             self._report_add(result)
         else:
             raise ValueError(
-                "/add expects an nxm link or an http(s) mod page URL"
+                "/add expects an http(s) mod page URL or an nxm link"
             )
 
     def _report_add(self, result: AddResult) -> None:
@@ -540,10 +551,42 @@ class _ShellSession:
         for warning in result.warnings:
             self._emit_warning(warning)
 
+    def _sync_target_url(self, rest: str) -> str:
+        """Resolve the /sync target to the collection URL to sync.
+
+        Three forms: an http(s) collection URL (synced as-is), an
+        index or name resolved exactly like /use, or nothing to resync
+        the current collection. The index/name and resync forms use the
+        collection_url the collection's state recorded at its last
+        sync, so nobody has to go re-find a collection they already
+        have on disk. A state with no recorded URL gets an honest error
+        pointing at the URL form instead of a guess.
+        """
+        target = rest.strip()
+        if target.lower().startswith(("http://", "https://")):
+            return target
+        if target:
+            summary = self._resolve_collection(target)
+        elif self.current is not None:
+            summary = self.current
+        else:
+            raise ValueError(
+                "no collection selected yet; use /use <index|name> first "
+                "(see /collections)\n"
+                "usage: /sync [<index|name|url>]"
+            )
+        url = get_collection_url(summary.path)
+        if not url:
+            raise ValueError(
+                f"no collection URL is stored for '{summary.name}'; "
+                "pass it explicitly\n"
+                "usage: /sync <collection-url>"
+            )
+        return url
+
     def _cmd_sync(self, rest: str) -> None:
-        if not rest:
-            raise ValueError("usage: /sync <collection-url>")
-        result: SyncResult = self.svc.sync(rest, self.root)
+        url = self._sync_target_url(rest)
+        result: SyncResult = self.svc.sync(url, self.root)
         # Per-mod errors render before any success text.
         for err in result.errors:
             self._emit_error(err)

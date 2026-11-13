@@ -1,13 +1,14 @@
 """Service-layer tests for collection enumeration and safe mod removal.
 
-list_collections/list_mods are read-only local scans (no network), and
-remove_mod drops state entries only: payload files on disk are never
-touched, saves are atomic under the collection lock, and a load order
-regeneration failure after the save is reported as a warning instead of
-masking the completed removal. Regeneration failures are exercised via
-real output write failures (load-order.txt pre-created as a directory),
-never by monkeypatching the regeneration helper away. Everything runs
-in tmp_path; all state is built locally and no network is ever reached.
+list_collections/list_mods/get_collection_url are read-only local scans
+(no network), and remove_mod drops state entries only: payload files on
+disk are never touched, saves are atomic under the collection lock, and
+a load order regeneration failure after the save is reported as a
+warning instead of masking the completed removal. Regeneration failures
+are exercised via real output write failures (load-order.txt pre-created
+as a directory), never by monkeypatching the regeneration helper away.
+Everything runs in tmp_path; all state is built locally and no network
+is ever reached.
 """
 
 import io
@@ -21,6 +22,7 @@ from nexus_collection_dl import state as state_module
 from nexus_collection_dl.manifest import CollectionManifest
 from nexus_collection_dl.service import (
     ModManagerService,
+    get_collection_url,
     list_collections,
     list_mods,
 )
@@ -57,11 +59,16 @@ def mod_entry(
     }
 
 
-def write_state(cdir: Path, collection_name="Test Collection", mods=()):
-    """Create a collection state file in cdir (which must not exist yet)."""
+def write_state(cdir: Path, collection_name="Test Collection", mods=(),
+                url=COLLECTION_URL):
+    """Create a collection state file in cdir (which must not exist yet).
+
+    ``url`` is the collection_url recorded in the state; pass "" to
+    simulate a state with no stored URL.
+    """
     cdir.mkdir(parents=True, exist_ok=True)
     state = CollectionState(cdir)
-    state.set_collection_info(COLLECTION_URL, collection_name, 1, GAME)
+    state.set_collection_info(url, collection_name, 1, GAME)
     for m in mods:
         state.add_mod(m)
     state.save()
@@ -167,6 +174,32 @@ def test_list_collections_empty_name_falls_back_to_dir_name(tmp_path):
 
     found = list_collections(root)
     assert [c.name for c in found] == ["FallsBack"]
+
+
+# ---------------------------------------------------------------------------
+# (a2) get_collection_url: the URL recorded in state, "" when none,
+#      StateError on an unreadable state
+# ---------------------------------------------------------------------------
+
+def test_get_collection_url_returns_the_recorded_url(tmp_path):
+    cdir = write_state(tmp_path / "Coll", collection_name="Coll")
+
+    assert get_collection_url(cdir) == COLLECTION_URL
+
+
+def test_get_collection_url_empty_when_state_records_none(tmp_path):
+    cdir = write_state(tmp_path / "Coll", collection_name="Coll", url="")
+
+    assert get_collection_url(cdir) == ""
+
+
+def test_get_collection_url_raises_state_error_on_unreadable_state(tmp_path):
+    cdir = tmp_path / "Broken"
+    cdir.mkdir()
+    (cdir / STATE_FILENAME).write_text("{not valid json")
+
+    with pytest.raises(StateError):
+        get_collection_url(cdir)
 
 
 # ---------------------------------------------------------------------------

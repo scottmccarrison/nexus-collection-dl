@@ -126,7 +126,8 @@ def test_non_nxm_scheme_error_explains_link_type():
     assert "not an nxm:// link" in message
     assert "not usable" in message
     assert "Mod manager download" in message   # where nxm:// links come from
-    assert "copy link address" in message      # right-click copy
+    assert "anything you can copy" in message  # the site has no copyable link
+    assert "nexus-dl add" in message           # the mod page URL path instead
     assert "handler install" in message        # click-through registration
     # The raw URI is never echoed: no host, path, or query values.
     assert url not in message

@@ -364,11 +364,11 @@ What clicking the button again does depends on whether the verified archive is s
 
 A full smoke test looks like this: finish the setup above, click **Mod manager download** once on a mod file page, accept the browser's launch confirmation, check for the desktop notification, the extracted mod in your collection folder, and the redacted success line in `~/.local/state/nexus-dl/nxm.log`. A second click re-downloads and re-verifies the file (the zero-network dedupe only shows up with a retained archive, for example after running with `--no-extract`). Run `nexus-dl handler uninstall` when you want your previous handler back.
 
-Platform notes: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox. GNOME, MATE, XFCE, Budgie, and KDE (including KIO-based distros like CachyOS) are expected to work through the standard xdg-mime and desktop-entry mechanisms but are untested; the README's platform support table has the details. nexus-dl never gates install on which desktop you run. Browsers installed as Flatpak or Snap generally cannot launch host desktop handlers, so click-through from those is unsupported; use a native browser build, or copy the link and run `nexus-dl nxm` yourself (see below).
+Platform notes: the click-through flow was live-tested on Linux Mint (Cinnamon) with Firefox. GNOME, MATE, XFCE, Budgie, and KDE (including KIO-based distros like CachyOS) are expected to work through the standard xdg-mime and desktop-entry mechanisms but are untested; the README's platform support table has the details. nexus-dl never gates install on which desktop you run. Browsers installed as Flatpak or Snap generally cannot launch host desktop handlers, so click-through from those is unsupported; use a native browser build, or run `nexus-dl nxm` yourself with a link you have on hand (see below).
 
 ### Running a link yourself (advanced)
 
-You can also run a copied link in the terminal. To keep the link's temporary credentials out of your shell history, use a hidden read. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (If you paste the link onto the same line as the `read` command, it looks like it hung - `read` is just waiting for you to press Enter.)
+If you have an `nxm://` link on hand (the click handler flow produces them, and other tools can hand you one), you can run it in the terminal yourself. To keep the link's temporary credentials out of your shell history, use a hidden read. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (If you paste the link onto the same line as the `read` command, it looks like it hung - `read` is just waiting for you to press Enter.)
 
 ```bash
 read -s -r NXM_LINK
@@ -376,7 +376,7 @@ read -s -r NXM_LINK
 nexus-dl nxm "$NXM_LINK" --output "$HOME/Downloads"
 ```
 
-An `nxm://` link only works with `nexus-dl nxm`. Pasting an `https://` mod-page URL there is refused with an explanation of how to get the nxm:// link instead (right-click the **Mod manager download** button and copy the link address).
+An `nxm://` link only works with `nexus-dl nxm`. Pasting an `https://` mod-page URL there is refused with an explanation: that command runs the link the **Mod manager download** click produces, and the website doesn't offer that link as anything you can copy. For a mod page URL, use `nexus-dl add` (or `/add` in the shell) instead.
 
 ### When it asks you to click again
 
@@ -386,7 +386,7 @@ Collection links (`nxm://.../collections/...`) are not handled this way - use `n
 
 ## Using the interactive shell
 
-If you find yourself typing the same directory paths over and over, `nexus-dl shell` gives you a prompt to work in instead. It covers the everyday jobs in one place: browsing collections and games, listing and removing mods, adding a mod by link, syncing a collection, and checking status.
+If you find yourself typing the same directory paths over and over, `nexus-dl shell` gives you a prompt to work in instead. It covers the everyday jobs in one place: browsing collections and games, listing and removing mods, adding a single mod, syncing a collection, and checking status.
 
 ```bash
 nexus-dl shell ~/mods/starfield
@@ -396,7 +396,7 @@ The directory you pass is the root (`ROOT_DIR` in the help text). Leave it out a
 
 ### A sample session
 
-Here's a complete session. The output is real; the pasted `nxm://` link is the one thing not shown literally, since the shell never echoes a link back (more on that below).
+Here's a complete session. The output is real.
 
 ```
 $ nexus-dl shell ~/mods/starfield
@@ -409,9 +409,9 @@ Command                  | Description
 /collections             | list collections under the root
 /games                   | list games with collection and mod counts
 /use <index|name>        | select the collection other commands work on
-/mods                    | list tracked mods (default: current collection)
-/add <url>               | add one mod (nxm:// link or https:// mod page)
-/sync <collection-url>   | sync a collection into the root
+/mods [collection]       | list tracked mods (default: current collection)
+/add <url>               | add one mod (https:// mod page or nxm:// link)
+/sync [<index|name|url>] | sync a collection (default: the current collection)
 /remove <file_id|mod:id> | remove a mod from the current collection
 /status                  | show collection status vs the latest revision
 /quit                    | leave the shell (also /exit, or Ctrl-D)
@@ -433,9 +433,8 @@ file_id | Name                       | Version | Download status
 9012345 | Faster Scanning            | 1.1     | downloaded
 8842117 | Starfield Community Patch  | 2.4     | downloaded
 
-nexus-dl> nxm://starfield/mods/.../files/...?key=REDACTED
-Downloaded 'Ship Builder Categories' into $HOME/mods/starfield/Weightless QoL.
-Archive extracted. Run 'nexus-dl deploy' when ready; nothing was deployed automatically.
+nexus-dl> /add https://www.nexusmods.com/starfield/mods/2885
+Added 'Ship Builder Categories' as manual mod (phase 999).
 
 nexus-dl> /remove 9012345
 Remove 'Faster Scanning' (file_id 9012345, mod_id 110477) and all its files?
@@ -456,7 +455,7 @@ nexus-dl> /quit
 Goodbye.
 ```
 
-A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, `/add <url>` adds one mod from a mod page URL (free accounts get the manual download instructions, same as the plain `add` command), and `/sync <collection-url>` syncs a collection into the root. `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
+A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, and `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. `/sync` syncs a collection into the root and takes its target three ways: a collection URL (`/sync <collection-url>`), the index or name of a collection you already have on disk (`/sync 2`, `/sync Clean Visuals`), or nothing at all to resync the current collection from the URL recorded in its state (with no recorded URL it asks for one explicitly). `/add` also takes an `nxm://` link if you have one, and free accounts get the manual download instructions from `/add`, same as the plain `add` command. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
 
 ```
 nexus-dl> hello world
@@ -494,7 +493,7 @@ Removing an id that isn't in `/mods` fails with `No mod file with file_id ... in
 
 ### Pasting nxm:// links
 
-Pasting an `nxm://` link on a line by itself is the same as `/add` with that link. The shell never echoes the link back: everything it prints goes through a redactor that covers the link and its `key`/`expires` credentials, so even error messages can't reflect them. That's also why the transcript above shows `?key=REDACTED` instead of a real link. A link that expired or belongs to a different account gets `Click 'Mod manager download' on the Nexus website again, then retry.` and nothing is written.
+Pasting an `nxm://` link on a line by itself is the same as `/add` with that link. Where you get one: the **Mod manager download** click produces it for the handler flow, or another tool can hand you one; the website itself doesn't offer the link as anything you can copy. The shell never echoes the link back: everything it prints goes through a redactor that covers the link and its `key`/`expires` credentials, so even error messages can't reflect them. A link that expired or belongs to a different account gets `Click 'Mod manager download' on the Nexus website again, then retry.` and nothing is written.
 
 ### If a link click seems to do nothing
 

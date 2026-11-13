@@ -62,11 +62,12 @@ class NxmParseError(Exception):
 class NxmSchemeError(NxmParseError):
     """Raised when the input carries a non-nxm scheme (e.g. an https:// URL).
 
-    The message explains that the link type is not usable here and how
-    to get an nxm:// link instead. Only the scheme token, matched from
-    a strict charset, is echoed; host, path, and query of the input are
-    never repeated, so a credential-bearing query string can never leak
-    through this error.
+    The message explains that the link type is not usable here and what
+    to do instead: add the mod from its page URL with 'nexus-dl add',
+    or register the handler so the button hands links over directly.
+    Only the scheme token, matched from a strict charset, is echoed;
+    host, path, and query of the input are never repeated, so a
+    credential-bearing query string can never leak through this error.
     """
 
     def __init__(self, scheme: str):
@@ -75,10 +76,12 @@ class NxmSchemeError(NxmParseError):
             f"This is a {scheme}:// link, not an nxm:// link, so this "
             "link type is not usable with 'nexus-dl nxm'.\n"
             "The 'Mod manager download' button on a Nexus Mods file page "
-            "is what produces an nxm:// link: right-click it and choose "
-            "copy link address to get the link for manual use.\n"
-            "To make that button hand links to nexus-dl directly, run "
-            "'nexus-dl handler install' once."
+            "produces nxm:// links, but the website does not offer them "
+            "as anything you can copy: the click hands the link straight "
+            "to your registered handler.\n"
+            "To add a mod from its page URL, run 'nexus-dl add <mod page "
+            "URL>' instead. To make that button hand links to nexus-dl "
+            "directly, run 'nexus-dl handler install' once."
         )
 
 

@@ -189,11 +189,15 @@ def mod_entry(file_id=456, mod_id=123, name="Test Mod", filename=None,
     }
 
 
-def write_collection(cdir: Path, name="Test Collection", mods=()):
-    """Create a synced collection state file under cdir."""
+def write_collection(cdir: Path, name="Test Collection", mods=(), url=COLLECTION_URL):
+    """Create a synced collection state file under cdir.
+
+    ``url`` is the collection_url recorded in the state; pass "" to
+    simulate a state with no stored URL (hand-created or very old).
+    """
     cdir.mkdir(parents=True, exist_ok=True)
     state = CollectionState(cdir)
-    state.set_collection_info(COLLECTION_URL, name, 1, GAME)
+    state.set_collection_info(url, name, 1, GAME)
     for m in mods:
         state.add_mod(m)
     state.save()
@@ -703,6 +707,19 @@ def test_use_prefers_exact_case_sensitive_match(shell_env, tmp_path):
     assert f"Using 'Dup' ({root / 'cs'})" in result.output
 
 
+def test_help_shows_every_commands_arguments(shell_env, tmp_path):
+    """The /help table must show each command's arguments: rich markup
+    must not swallow bracketed arguments like /mods [collection], and
+    /sync must show its optional target form."""
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+
+    result = run_cli(root, "/help\n/quit\n")
+    assert result.exit_code == 0
+    out = result.output
+    assert "/mods [collection]" in out
+    assert "/sync [<index|name|url>]" in out
+
+
 def test_sync_lists_per_mod_errors_before_success_text(
     shell_env, tmp_path, monkeypatch
 ):
@@ -714,8 +731,9 @@ def test_sync_lists_per_mod_errors_before_success_text(
         collection_dir=root / "Synced Collection",
     )
 
+    url = "https://www.nexusmods.com/skyrimspecialedition/collections/abc"
     result = run_cli(
-        root, "/sync https://www.nexusmods.com/skyrimspecialedition/collections/abc\n/quit\n",
+        root, f"/sync {url}\n/quit\n",
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
@@ -724,13 +742,122 @@ def test_sync_lists_per_mod_errors_before_success_text(
     assert "Synced 3 mods" in out
     # Errors render before any success text.
     assert out.index("mod 5 failed") < out.index("Synced 3 mods")
+    # The URL form still syncs exactly the URL given.
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": url, "mods_dir": root}
+    ]
 
 
-def test_sync_without_url_is_a_usage_error(shell_env, tmp_path):
+# ---------------------------------------------------------------------------
+# /sync targets: URL, index/name, and resync of the current collection
+# ---------------------------------------------------------------------------
+
+def test_sync_without_target_resyncs_current_from_stored_url(
+    shell_env, tmp_path, monkeypatch
+):
+    """/sync with no argument resyncs the current collection from the
+    URL its state recorded, with no trip back to nexusmods.com."""
     root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
-    result = run_cli(root, "/sync\n/quit\n")
+
+    result = run_cli(
+        root, "/use 1\n/sync\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
     assert result.exit_code == 0
-    assert "usage: /sync" in result.output
+    # The service received the stored URL, not some re-found one.
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+    ]
+    assert "Synced 1 mods" in result.output
+
+
+def test_sync_without_target_and_no_current_is_a_clear_error(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+
+    result = run_cli(
+        root, "/sync\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "no collection selected yet" in out
+    # The error shows the new optional form.
+    assert "usage: /sync [<index|name|url>]" in out
+    assert FakeShellService.calls == []
+
+
+def test_sync_by_index_and_by_name_uses_stored_url(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(
+        tmp_path,
+        ("clean-visuals", "Clean Visuals", []),
+        ("test-collection", "Test Collection", [mod_entry()]),
+    )
+
+    # By index (indexes follow the /collections listing order).
+    result = run_cli(
+        root, "/sync 2\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+    ]
+
+    # By name: unique case-insensitive match, exactly like /use.
+    FakeShellService.calls = []
+    result = run_cli(
+        root, "/sync test collection\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert FakeShellService.calls == [
+        {"method": "sync", "collection_url": COLLECTION_URL, "mods_dir": root}
+    ]
+
+
+def test_sync_by_ambiguous_name_lists_indexes(
+    shell_env, tmp_path, monkeypatch
+):
+    root = make_root(
+        tmp_path,
+        ("dup-a", "Dup", []),
+        ("dup-b", "Dup", []),
+    )
+
+    result = run_cli(
+        root, "/sync Dup\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "'Dup' matches 2 collections" in out
+    assert "pick one by index" in out
+    assert "1: " in out and "2: " in out
+    assert FakeShellService.calls == []
+
+
+def test_sync_resync_without_stored_url_requires_explicit_url(
+    shell_env, tmp_path, monkeypatch
+):
+    """A state with no collection_url fails honestly and points at the
+    URL form instead of guessing where the collection came from."""
+    root = tmp_path / "root"
+    write_collection(root / "no-url", name="No Url", mods=[mod_entry()], url="")
+
+    result = run_cli(
+        root, "/use 1\n/sync\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    out = result.output
+    assert "no collection URL is stored for 'No Url'" in out
+    assert "pass it explicitly" in out
+    assert "usage: /sync <collection-url>" in out
+    assert FakeShellService.calls == []
 
 
 def test_remove_by_mod_id_prefix(shell_env, tmp_path, monkeypatch):
@@ -882,7 +1009,7 @@ def test_add_rejects_unsupported_scheme(shell_env, tmp_path, monkeypatch):
         monkeypatch=monkeypatch, service_cls=FakeShellService,
     )
     assert result.exit_code == 0
-    assert "nxm link or an http(s) mod page URL" in result.output
+    assert "http(s) mod page URL or an nxm link" in result.output
     assert FakeShellService.calls == []
 
 
