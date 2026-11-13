@@ -413,9 +413,10 @@ Command                  | Description
 /add <url>               | add one mod (https:// mod page or nxm:// link)
 /sync [<index|name|url>] | sync a collection (default: the current collection)
 /remove <file_id|mod:id> | remove a mod from the current collection
-/status                  | show collection status vs the latest revision
+/status [<index|name>]   | tool-wide overview and health report, or one collection vs the latest revision
 /quit                    | leave the shell (also /exit, or Ctrl-D)
 Bare nxm:// or https:// links on a line are handled as /add.
+Every command takes a bare --help (its only argument) or /help <command> for its usage.
 
 nexus-dl> /collections
 Collections under $HOME/mods/starfield
@@ -443,19 +444,41 @@ Remove 'Faster Scanning'? [yes/no]: yes
 Removed 'Faster Scanning' (mod_id 110477); file(s) 9012345 left the collection.
 
 nexus-dl> /status
+Games and collections
+Game      | Collections | Total mods | Pending
+starfield |           2 |          5 |       1
+Total: 1 game(s), 2 collection(s), 5 mod(s), 1 pending.
+Removals
+Collection      | Tombstoned mods
+Clean Visuals   |               0
+Weightless QoL  |               1
+Total removed (tombstoned): 1 mod(s). They stay removed through sync/update; re-adding a mod clears its tombstone.
+Health
+OK API key: stored (keystore)
+OK nxm handler: installed and the default nxm:// handler
+OK Notifications: enabled in this desktop's settings
+OK Desktop tools: xdg-mime and notify-send are present and working
+OK State files: 2 collection state file(s) readable
+OK State locks: no collection state lock is in use; flock locks are released on exit, so stale lock files cannot exist
+
+nexus-dl> /status 2
 Collection: Weightless QoL
+State path: $HOME/mods/starfield/Weightless QoL/.nexus-state.json
+Collection URL: https://next.nexusmods.com/starfield/collections/weightless-qol
+Local: 3 mod(s), 1 pending, 1 removed (tombstoned)
 Installed revision: 7
 Latest revision: 8 (update available)
 Mod status
 Name                       | Version | Status
 Compact Inventory UI       | 0.9     | pending_download
+Ship Builder Categories    | 1.2     | manual
 Starfield Community Patch  | 2.4     | update_available
 
 nexus-dl> /quit
 Goodbye.
 ```
 
-A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, and `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. `/sync` syncs a collection into the root and takes its target three ways: a collection URL (`/sync <collection-url>`), the index or name of a collection you already have on disk (`/sync 2`, `/sync Clean Visuals`), or nothing at all to resync the current collection from the URL recorded in its state (with no recorded URL it asks for one explicitly). `/add` also takes an `nxm://` link if you have one, and free accounts get the manual download instructions from `/add`, same as the plain `add` command. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
+A few things the session doesn't show: `/games` rolls the collection list up into per-game totals, and `/mods` on its own lists the selected collection; `/mods 2` or `/mods Clean Visuals` lists another one without switching to it. `/sync` syncs a collection into the root and takes its target three ways: a collection URL (`/sync <collection-url>`), the index or name of a collection you already have on disk (`/sync 2`, `/sync Clean Visuals`), or nothing at all to resync the current collection from the URL recorded in its state (with no recorded URL it asks for one explicitly). `/add` also takes an `nxm://` link if you have one, and free accounts get the manual download instructions from `/add`, same as the plain `add` command. Every command also answers a bare `--help` as its only argument (or `/help <command>`) with its usage and one example instead of running. Anything typed that isn't a command or a link gets a hint instead of a crash, and the shell keeps running after errors and after Ctrl-C (which just cancels the line you were typing):
 
 ```
 nexus-dl> hello world
@@ -477,6 +500,14 @@ Error: 'DUP' matches 2 collections (names differ only by case); pick one by inde
 ```
 
 An unknown name gets `no collection named '...'` plus the same listing, so you can always fall back to an index.
+
+### Checking status with /status
+
+`/status` comes in two forms, and the sample session above shows both.
+
+Bare `/status` is the tool-wide report: a per-game overview with totals, the removal tombstone counts per collection, and a short health check. It reads local state only, never touches the network, and works before you `/use` anything. It also stays tool-wide when a collection is selected; if you want one collection, name it. The health check prints one line per check (`OK`, `WARN`, or `ERROR` with a short fix) covering the API key (source only, never the value), the nxm handler and its default, your desktop's notification switch (with the exact `gsettings` command when it's off, and nothing at all when the desktop is unknown), `xdg-mime` and `notify-send`, unreadable state files that the listings skip, and the collection write locks. A check that fails renders as a line, not a crash: `/status` always finishes. One note on locks: the writer lock is a kernel flock that releases itself when a process exits, so a leftover lock file is normal and there is no such thing as a stale one here; the report only says which collections a running operation is using.
+
+`/status <index|name>` is the per-collection form, and it does hit the API: it compares your installed revision and each mod against the latest revision (the `Mod status` table), and adds the local picture next to it: the mod, pending, and tombstone counts, the collection URL recorded at the last sync, and the state file path.
 
 ### Removing a mod
 
