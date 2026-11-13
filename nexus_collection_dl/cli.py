@@ -940,15 +940,26 @@ def nxm(
         sys.exit(1)
 
     def redacted(value: object) -> str:
-        # Result fields are untrusted display data, not pre-redacted
-        # text: a hostile or compromised endpoint can reflect the API
-        # key or the link's key/expires values into file names, mod
-        # names, warnings, or error text (the same scope the exception
-        # branches above redact against). Same boundary scope and
-        # short-secret floor as those branches; the notify path adds
-        # URI stripping on top via _notify_body.
+        # Result fields and progress messages are untrusted display
+        # data, not pre-redacted text: a hostile or compromised endpoint
+        # can reflect the API key or the link's key/expires values into
+        # file names, mod names, warnings, error text, or progress
+        # lines (the same scope the exception branches above redact
+        # against). Same boundary scope and short-secret floor as those
+        # branches; the notify path adds URI stripping on top via
+        # _notify_body.
         return _boundary_redact(ctx, uri, str(value), strip_uris=False,
                                 min_secret_len=_MIN_REDACT_SECRET_LEN)
+
+    def safe_progress(event: str, pct: float, msg: str) -> None:
+        # Progress lines print BEFORE the result block and echo
+        # endpoint-controlled names ("Downloading {filename}",
+        # "Downloaded {mod_name}", "Saved {filename}", "Extracted
+        # {name}"), so they get the same boundary redaction scope.
+        # escape() for the same bracketed-text reason as fail(). The
+        # event=="download" suppression inside _cli_progress is
+        # unchanged.
+        _cli_progress(event, pct, escape(redacted(msg)))
 
     try:
         # The group callback defers service construction for this command
@@ -962,7 +973,7 @@ def nxm(
             output_dir=output_dir,
             no_load_order=no_load_order,
             no_extract=no_extract,
-            on_progress=_cli_progress,
+            on_progress=safe_progress,
         )
     except NxmCollectionLinkError as e:
         # Recognized collection shape: helpful guidance, no unsafe URL.
@@ -999,8 +1010,9 @@ def nxm(
         fail(detail or f"Unexpected failure ({type(e).__name__}).")
 
     # Every user-visible piece of a result-based outcome goes through
-    # boundary redaction before display or notification; only the raw
-    # numeric ids and fixed status tokens are printed as-is.
+    # boundary redaction before display or notification, the same
+    # scope safe_progress applied to the progress lines above; only the
+    # raw numeric ids and fixed status tokens are printed as-is.
     error_text = redacted(result.error)
     mod_name = redacted(result.mod_name)
     filename = redacted(result.filename)

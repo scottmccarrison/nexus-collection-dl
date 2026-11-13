@@ -58,6 +58,31 @@ class RaisingLinkSession:
         )
 
 
+class FakeBodyResponse:
+    """download_link response whose body fails to parse as expected."""
+
+    def __init__(self, json_result):
+        self._json_result = json_result
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        if isinstance(self._json_result, Exception):
+            raise self._json_result
+        return self._json_result
+
+
+class FakeBodySession:
+    """Session whose download_link lookup returns a canned body."""
+
+    def __init__(self, json_result):
+        self._response = FakeBodyResponse(json_result)
+
+    def get(self, url, **kwargs):
+        return self._response
+
+
 def assert_url_free(excinfo):
     """The wrapped message carries no URL and no query secret."""
     message = str(excinfo.value)
@@ -111,6 +136,60 @@ def test_bundle_status_failure_is_wrapped(monkeypatch):
     with pytest.raises(ManifestError) as excinfo:
         download_and_parse_manifest(
             "/v2/collections/x/download_link", session=FakeLinkSession()
+        )
+    assert "manifest download failed" in str(excinfo.value)
+    assert_url_free(excinfo)
+
+
+def test_link_lookup_non_json_body_is_wrapped():
+    # requests.JSONDecodeError subclasses RequestException but is a body
+    # parse failure: it must surface as ManifestError, not a raw
+    # requests traceback.
+    session = FakeBodySession(
+        requests.exceptions.JSONDecodeError(
+            "Expecting value: line 1 column 1 (char 0)", "<html>nope", 0
+        )
+    )
+    with pytest.raises(ManifestError) as excinfo:
+        download_and_parse_manifest(
+            "/v2/collections/x/download_link", session=session
+        )
+    assert "manifest download failed" in str(excinfo.value)
+    assert_url_free(excinfo)
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"download_links": []}, {"download_links": None}]
+)
+def test_link_lookup_missing_links_is_wrapped(body):
+    with pytest.raises(ManifestError) as excinfo:
+        download_and_parse_manifest(
+            "/v2/collections/x/download_link", session=FakeBodySession(body)
+        )
+    message = str(excinfo.value)
+    assert "manifest download failed" in message
+    # The endpoint-controlled api path is never interpolated (finding 3):
+    # the old "No download links returned from {api_url}" quoted it.
+    assert "download_link" not in message
+    assert_url_free(excinfo)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ["not", "an", "object"],
+        {"download_links": [{"no_uri": 1}]},
+        {"download_links": [{"URI": None}]},
+        {"download_links": ["https://cdn.example/bundle.7z"]},
+    ],
+)
+def test_link_lookup_malformed_link_entry_is_wrapped(body):
+    # Non-dict JSON, a link entry without "URI", a non-string URI, and a
+    # non-mapping link entry: none may escape as AttributeError,
+    # KeyError, or TypeError.
+    with pytest.raises(ManifestError) as excinfo:
+        download_and_parse_manifest(
+            "/v2/collections/x/download_link", session=FakeBodySession(body)
         )
     assert "manifest download failed" in str(excinfo.value)
     assert_url_free(excinfo)

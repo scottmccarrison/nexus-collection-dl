@@ -34,6 +34,7 @@ class FakeService:
     error = None
     calls = []
     keys = []  # api_key each instance was constructed with (never printed)
+    progress_msgs = []  # (event, pct, msg) lines to emit via on_progress
 
     def __init__(self, api_key=None, force_free=False):
         FakeService.keys.append(api_key)
@@ -47,6 +48,11 @@ class FakeService:
         # Run the real strict parser so shape/credential errors surface at
         # the CLI boundary exactly as they do in production (no network).
         parse_nxm_url(uri)
+        # Progress lines are emitted during the run, before the outcome,
+        # exactly as the real service does.
+        for event, pct, msg in FakeService.progress_msgs:
+            if on_progress is not None:
+                on_progress(event, pct, msg)
         if FakeService.error is not None:
             raise FakeService.error
         return FakeService.result
@@ -95,6 +101,7 @@ def cli_env(monkeypatch, tmp_path):
     FakeService.error = None
     FakeService.calls = []
     FakeService.keys = []
+    FakeService.progress_msgs = []
     FakeInstaller.calls = []
     FakeInstaller.mode = "ok"
     version_checks = []
@@ -372,6 +379,43 @@ def test_nxm_failure_filename_reflection_never_surfaces(cli_env):
     result = invoke(["nxm", REFLECTED_URI])
     assert result.exit_code == 1
     assert "size mismatch" in result.output
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_progress_lines_reflection_never_surfaces(cli_env):
+    # Progress lines print BEFORE the result block and echo
+    # endpoint-controlled names ("Downloaded {mod_name}", "Saved
+    # {filename}", "Extracted {name}"): they must pass through the same
+    # boundary redaction scope as the result fields.
+    FakeService.progress_msgs = [
+        ("extract", 0.75, f"Extracted {REFLECTED_KEY}"),
+        ("done", 1.0, f"Downloaded {REFLECTED_KEY} ({REFLECTED_ENC})"),
+    ]
+    FakeService.result = NxmResult(
+        success=True, status="downloaded", game_domain=GAME, mod_id=1,
+        file_id=2, mod_name="Test Mod",
+        collection_dir=cli_env["tmp_path"] / "col",
+    )
+    result = invoke(["nxm", REFLECTED_URI, "--no-notify"])
+    assert result.exit_code == 0, result.output
+    assert "Extracted" in result.output       # the progress line really printed
+    assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
+
+
+def test_nxm_progress_download_events_stay_suppressed(cli_env):
+    # The event=="download" suppression in _cli_progress is unchanged:
+    # byte-progress lines never print at all.
+    FakeService.progress_msgs = [
+        ("download", 0.2, f"Downloading {REFLECTED_KEY}-{REFLECTED_ENC}.zip..."),
+    ]
+    FakeService.result = NxmResult(
+        success=True, status="downloaded", game_domain=GAME, mod_id=1,
+        file_id=2, mod_name="Test Mod",
+        collection_dir=cli_env["tmp_path"] / "col",
+    )
+    result = invoke(["nxm", REFLECTED_URI, "--no-notify"])
+    assert result.exit_code == 0, result.output
+    assert "Downloading" not in result.output
     assert_reflected_secret_never_surfaces(result, cli_env["notifications"])
 
 
