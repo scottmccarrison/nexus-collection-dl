@@ -871,7 +871,8 @@ def collection_manifest_mod_ids(mods_dir: Path) -> set[int]:
     genuinely new manual mod. Reads only the manifest cached in state
     (state.manifest_data); no network. Returns an empty set when no
     manifest is cached or it carries no recognizable mod ids. Raises
-    StateError exactly like list_mods when the state cannot be read.
+    StateError when the state file is invalid and ValueError on
+    malformed state keys, exactly like list_mods.
     """
     state = CollectionState(mods_dir)
     state.load()

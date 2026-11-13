@@ -549,7 +549,7 @@ class _ShellSession:
         """
         selector = selector.strip()
         if not selector:
-            raise ValueError("usage: /use <index|name>")
+            raise ValueError("usage: /use [<index|name>]")
         # Display copy of the selector: echoed back in error messages,
         # so control characters collapse before they reach the terminal.
         shown = _safe_text(selector)

@@ -1615,18 +1615,26 @@ def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
 
 def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
     root = make_root(tmp_path, ("Alpha", [mod_entry()]), ("Beta", []))
+    # Bare /use alone never writes the memory file (only explicit
+    # selection does).
     code, out, prompts = run_capture_prompts(
-        FakeShellService(), root, ["/use", "/use Beta", "/use", "/quit"]
+        FakeShellService(), root, ["/use", "/quit"]
     )
     assert code == 0
     assert "Current collection: none selected." in out
+    assert not (root / ".nexus-shell.json").exists()
+
+    code, out, prompts = run_capture_prompts(
+        FakeShellService(), root, ["/use Beta", "/use", "/quit"]
+    )
+    assert code == 0
     assert "Current collection: 'Beta'" in out
     # The same collection table as /collections renders alongside.
     assert "Collections under" in out
     assert "Alpha" in out and "Beta" in out
     # Bare /use changed nothing: prompts before and after match.
-    assert prompts[0] == prompts[1] == "nexus-dl> "
-    assert prompts[2] == prompts[3] == "nexus-dl [Beta]> "
+    assert prompts[0] == "nexus-dl> "
+    assert prompts[1] == prompts[2] == "nexus-dl [Beta]> "
 
 
 def test_explicit_use_remembers_the_selection(shell_env, tmp_path):
@@ -1651,12 +1659,13 @@ def test_startup_restores_the_remembered_selection(shell_env, tmp_path):
     root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
     memory = root / ".nexus-shell.json"
     memory.write_text(json.dumps({"current": "Beta"}))
+    before = memory.read_bytes()
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
     assert prompts[0] == "nexus-dl [Beta]> "
     assert "Using 'Beta'" in out
-    # Restore never rewrites the memory file.
-    assert json.loads(memory.read_text()) == {"current": "Beta"}
+    # Restore never rewrites the memory file: bytes are identical.
+    assert memory.read_bytes() == before
 
 
 def test_startup_restores_a_root_level_collection(shell_env, tmp_path):
@@ -1993,3 +2002,18 @@ def test_status_target_surfaces_removed_skipped(
     )
     assert result.exit_code == 0
     assert "Removed mods skipped: 2 (tombstoned)." in result.output
+
+
+@pytest.mark.parametrize("value", ["../../etc", "/etc", "sub/dir", "."])
+def test_traversal_shaped_memory_values_are_ignored(
+    shell_env, tmp_path, value
+):
+    """A remembered value that is not a plain child-directory name can
+    never select anything: matching is by exact collection path, so
+    traversal or absolute values fall through to a silent ignore."""
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    (root / ".nexus-shell.json").write_text(json.dumps({"current": value}))
+    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert prompts[0] == "nexus-dl> "
+    assert "Error:" not in out and "Warning:" not in out

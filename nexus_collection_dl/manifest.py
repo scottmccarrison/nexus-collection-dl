@@ -198,7 +198,7 @@ def _resolve_download_url(api_url: str, session: requests.Session) -> str:
         raise ManifestError(
             "manifest download failed: malformed response"
         ) from None
-    if not isinstance(link, str) or not link:
+    if not isinstance(link, str) or not link.strip():
         raise ManifestError("manifest download failed: malformed response")
     return link
 
