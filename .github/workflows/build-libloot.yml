@@ -26,7 +26,9 @@ jobs:
       - name: Build wheel
         run: |
           set -e
-          docker run --rm -v "$PWD":/work -w /work ghcr.io/pyo3/maturin:latest bash -euc '
+          # The image's ENTRYPOINT is maturin, so `docker run ... bash` would
+          # invoke `maturin bash`. Override it to get an actual shell.
+          docker run --rm --entrypoint bash -v "$PWD":/work -w /work ghcr.io/pyo3/maturin:latest -euc '
             set -e
 
             # No git and no package manager in this image (apt-get is absent
