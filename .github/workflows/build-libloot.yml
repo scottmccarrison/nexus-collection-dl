@@ -37,19 +37,30 @@ jobs:
           cargo --version
 
       - name: Build wheel
+        # libloot is a Cargo workspace, so maturin writes wheels to the
+        # workspace root target/, not python/target/.
+        #
+        # Build for the interpreters nexus-collection-dl actually supports.
+        # maturin with no -i picks whichever python3 is first on PATH, which
+        # is cp39 in this image and would ship a wheel nobody can install.
+        #
+        # Tag manylinux_2_17 (manylinux2014), which maturin confirms the
+        # binary qualifies for; asking for 2_28 only narrows compatibility.
         run: |
+          set -e
           cd /tmp/libloot/python
-          maturin build --release --strip --manylinux 2_28
-          ls -la target/wheels/
+          maturin build --release --strip --manylinux 2_17 \
+            -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          ls -la /tmp/libloot/target/wheels/
 
       - name: Upload wheel to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: /tmp/libloot/python/target/wheels/*.whl
+          files: /tmp/libloot/target/wheels/*.whl
 
       - name: Upload wheel as artifact
         uses: actions/upload-artifact@v4
         with:
           name: libloot-wheel
-          path: /tmp/libloot/python/target/wheels/*.whl
+          path: /tmp/libloot/target/wheels/*.whl
