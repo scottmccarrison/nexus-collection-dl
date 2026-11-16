@@ -38,3 +38,10 @@ include = ["nexus_collection_dl*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+    "pyright>=1.1.414",
+    "ruff>=0.17.5",
+]
