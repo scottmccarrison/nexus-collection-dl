@@ -22,7 +22,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-loot = ["loot"]
+# There is deliberately no `loot` extra. The libloot Python bindings are not
+# published to PyPI, and `pip install loot` resolves to an unrelated GitHub CLI
+# helper, so an extra of that name installed the wrong package. Get the real
+# bindings by running setup.sh (builds from source) or by installing a libloot
+# wheel from one of this repo's releases.
 dev = ["pytest>=8.0"]
 
 [project.scripts]

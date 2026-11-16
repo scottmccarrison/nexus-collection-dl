@@ -865,17 +865,6 @@ wheels = [
 ]
 
 [[package]]
-name = "loot"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "click" },
-    { name = "colorama" },
-    { name = "requests" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/9c/46/1e954f917f118af97737326d00495517bffd6a2dab7974af7bbd6684b87e/loot-0.2.0.tar.gz", hash = "sha256:fef8ffbdf3a7d6cc63c85a9aba1b317be26fa51156bda819da685d43fc676161", size = 2072, upload-time = "2016-08-10T12:27:46.21Z" }
-
-[[package]]
 name = "markdown-it-py"
 version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1085,9 +1074,6 @@ dependencies = [
 dev = [
     { name = "pytest" },
 ]
-loot = [
-    { name = "loot" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -1100,7 +1086,6 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.0.0" },
     { name = "flask", specifier = ">=3.0.0" },
-    { name = "loot", marker = "extra == 'loot'" },
     { name = "packaging", specifier = ">=21.0" },
     { name = "py7zr", specifier = ">=0.20.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
@@ -1109,7 +1094,7 @@ requires-dist = [
     { name = "rich", specifier = ">=13.0.0" },
     { name = "typing-extensions", specifier = ">=4.0" },
 ]
-provides-extras = ["loot", "dev"]
+provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
