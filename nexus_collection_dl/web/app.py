@@ -250,7 +250,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
                 tracked, untracked = svc.track_sync_push(mods_path)
                 return jsonify({"tracked": tracked, "untracked": untracked})
             else:
-                return jsonify({"error": f"Unknown action: {action}"}), 400
+                return jsonify({"error": "unknown track-sync action; use enable, disable, or push"}), 400
         except (StateError, NexusAPIError) as e:
             return jsonify({"error": client_error_message(e)}), 400
 
