@@ -9,7 +9,7 @@ the server side where it belongs.
 
 from ..api import NexusAPIError
 from ..collection import CollectionParseError, ModParseError
-from ..state import StateError
+from ..state import StateBusyError, StateError
 
 
 def client_error_message(exc: Exception) -> str:
@@ -18,6 +18,8 @@ def client_error_message(exc: Exception) -> str:
     Never returns text derived from the exception message, so no stack
     or request detail can flow to a client through this function.
     """
+    if isinstance(exc, StateBusyError):
+        return "another operation is already running for this collection"
     if isinstance(exc, StateError):
         return "collection state is not usable"
     if isinstance(exc, (CollectionParseError, ModParseError)):
