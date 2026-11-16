@@ -26,13 +26,11 @@ class ModInfo:
 class CollectionParseError(Exception):
     """Raised when a collection URL cannot be parsed."""
 
-    pass
 
 
 class ModParseError(Exception):
     """Raised when a mod URL cannot be parsed."""
 
-    pass
 
 
 def parse_collection_url(url: str) -> CollectionInfo:

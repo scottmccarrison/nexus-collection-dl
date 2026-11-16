@@ -3,7 +3,6 @@
 import re
 from pathlib import Path
 
-
 # Map Nexus game domains to Steam app IDs
 STEAM_APP_IDS = {
     "starfield": "1716740",

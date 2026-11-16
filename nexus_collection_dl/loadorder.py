@@ -2,14 +2,13 @@
 
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from .manifest import CollectionManifest
 
 
 class LoadOrderError(Exception):
     """Raised when load order generation fails."""
-    pass
 
 
 class LoadOrderGenerator:
@@ -22,7 +21,7 @@ class LoadOrderGenerator:
     """
 
     # Bethesda game domains that support ESP/ESM plugins
-    BETHESDA_GAMES = {
+    BETHESDA_GAMES: ClassVar[set[str]] = {
         "starfield",
         "skyrimspecialedition",
         "skyrim",
@@ -192,14 +191,15 @@ class LoadOrderGenerator:
         if visited < len(all_mod_ids):
             # Cycle detected — append remaining mods in phase/name order
             remaining = all_mod_ids - set(result)
-            for mod_id in sorted(
-                remaining,
-                key=lambda m: (
-                    self.manifest.mod_phases.get(m, 0),
-                    self.mod_name_by_id.get(m, "").lower(),
-                ),
-            ):
-                result.append(mod_id)
+            result.extend(
+                sorted(
+                    remaining,
+                    key=lambda m: (
+                        self.manifest.mod_phases.get(m, 0),
+                        self.mod_name_by_id.get(m, "").lower(),
+                    ),
+                )
+            )
 
         return result
 

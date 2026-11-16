@@ -12,7 +12,6 @@ from .extractor import extract_archive
 
 class ManifestError(Exception):
     """Raised when manifest parsing fails."""
-    pass
 
 
 class CollectionManifest:

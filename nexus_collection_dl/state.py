@@ -5,12 +5,14 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from typing_extensions import Self
 
 try:
     import fcntl
 except ImportError:  # non-POSIX platforms: locking degrades to a no-op
-    fcntl = None
+    fcntl = None  # type: ignore[assignment]
 
 STATE_FILENAME = ".nexus-state.json"
 LOCK_FILENAME = ".nexus-state.lock"
@@ -18,12 +20,10 @@ LOCK_FILENAME = ".nexus-state.lock"
 
 class StateError(Exception):
     """Raised when state file operations fail."""
-    pass
 
 
 class StateBusyError(StateError):
     """Raised when another deploy/undeploy holds the collection lock."""
-    pass
 
 
 class CollectionLock:
@@ -39,7 +39,7 @@ class CollectionLock:
         self.lock_path = Path(mods_dir) / LOCK_FILENAME
         self._fd: int | None = None
 
-    def __enter__(self) -> "CollectionLock":
+    def __enter__(self) -> Self:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -54,7 +54,7 @@ class CollectionLock:
         self._fd = fd
         return self
 
-    def __exit__(self, *exc_info) -> bool:
+    def __exit__(self, *exc_info) -> Literal[False]:
         if self._fd is not None:
             try:
                 if fcntl is not None:
@@ -321,7 +321,7 @@ class CollectionState:
             - to_remove: file_ids installed but not in collection (excluding manual)
         """
         collection_file_ids = {m["file_id"] for m in collection_mods}
-        collection_mod_ids = {m["mod_id"] for m in collection_mods}
+        {m["mod_id"] for m in collection_mods}
         installed_file_ids = set(self.mods.keys())
 
         to_install = []

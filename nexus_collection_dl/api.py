@@ -14,12 +14,10 @@ REST_BASE_URL = "https://api.nexusmods.com/v1"
 
 class NexusAPIError(Exception):
     """Base exception for Nexus API errors."""
-    pass
 
 
 class NexusPremiumRequired(NexusAPIError):
     """Raised when Premium membership is required for an operation."""
-    pass
 
 
 class NexusRateLimited(NexusAPIError):

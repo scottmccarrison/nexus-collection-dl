@@ -2,9 +2,10 @@
 
 import threading
 import uuid
+from collections.abc import Generator
 from dataclasses import dataclass, field
-from queue import Queue, Empty
-from typing import Any, Generator
+from queue import Empty, Queue
+from typing import Any
 
 from .errors import client_error_message
 
@@ -90,7 +91,7 @@ class TaskManager:
         """Yield SSE-formatted event strings."""
         task = self.get(task_id)
         if not task:
-            yield f"event: error\ndata: {{\"msg\": \"Task not found\"}}\n\n"
+            yield "event: error\ndata: {\"msg\": \"Task not found\"}\n\n"
             return
 
         import json
