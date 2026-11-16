@@ -1,22 +1,26 @@
 """Service layer - business logic extracted from CLI for programmatic use."""
 
+import hashlib
 import os
 import re
-import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from .api import NexusAPI, NexusAPIError, NexusPremiumRequired
-from .collection import parse_collection_url, parse_mod_url, CollectionParseError, ModParseError
+from .api import NexusAPI, NexusAPIError
+from .collection import (
+    CollectionParseError,
+    parse_collection_url,
+    parse_mod_url,
+)
 from .deploy import (
     BackupStore,
     DeployError,
     DeployJournal,
     UndeployError,
     classify_files,
-    deploy as deploy_files,
     get_game_ini_path,
     get_plugins_txt_dest,
     recover_ownership,
@@ -24,7 +28,10 @@ from .deploy import (
     write_game_ini,
     write_plugins_txt,
 )
-from .downloader import DownloadError, Downloader
+from .deploy import (
+    deploy as deploy_files,
+)
+from .downloader import Downloader
 from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
 from .loadorder import LoadOrderGenerator
 from .loot_sort import (
@@ -35,9 +42,8 @@ from .loot_sort import (
     write_loot_plugins_txt,
 )
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
-from .state import CollectionState, CollectionLock, StateError, STATE_FILENAME
+from .state import STATE_FILENAME, CollectionLock, CollectionState, StateError
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
-
 
 # progress callback: (event_type, percentage 0-1, message)
 ProgressCallback = Callable[[str, float, str], None]
@@ -327,8 +333,11 @@ def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
     for mod in mods:
         if mod.get("expected_md5"):
             continue
-        key = (_as_int(mod.get("mod_id")), _as_int(mod.get("file_id")))
-        md5 = by_identity.get(key)
+        mod_id = _as_int(mod.get("mod_id"))
+        file_id = _as_int(mod.get("file_id"))
+        if mod_id is None or file_id is None:
+            continue
+        md5 = by_identity.get((mod_id, file_id))
         if md5:
             mod["expected_md5"] = md5
 
@@ -702,7 +711,7 @@ class ModManagerService:
 
             # Cache manifest + generate load order even for free users
             # (the manifest download is a public URL, doesn't need premium)
-            load_order_files: list[str] = []
+            load_order_files = []
             if not no_load_order:
                 progress("loadorder", 0.8, "Caching manifest and generating load order...")
                 lo_files = self._generate_load_order(collection_data, mods_dir, state)
@@ -872,7 +881,7 @@ class ModManagerService:
                 def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
                     if total_bytes > 0:
                         pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                        progress("download", pct, f"Downloading...")
+                        progress("download", pct, "Downloading...")
 
                 progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
                 _attach_expected_md5(state, mods_to_download)
@@ -1332,9 +1341,9 @@ class ModManagerService:
                     # Journal kept: entries were not all safely resolved, so
                     # dangling intents must stay recoverable for the next run.
                     errors = [
-                        f"Redeploy stopped: {len(kept)} previously deployed "
+                        (f"Redeploy stopped: {len(kept)} previously deployed "
                         f"file(s) could not be safely removed. Resolve the "
-                        f"reported issues and run deploy (or undeploy) again."
+                        f"reported issues and run deploy (or undeploy) again.")
                     ] + problems
                     return DeployResult(
                         0, [], errors, str(game_dir), False, warnings=deploy_warnings
@@ -1749,12 +1758,12 @@ class ModManagerService:
         manifest = CollectionManifest.from_dict(state.manifest_data)
 
         # Inject phase 999 for manual mods (keyed by mod_id in manifest)
-        for file_id, ms in state.mods.items():
+        for ms in state.mods.values():
             if ms.manual:
                 manifest.mod_phases[ms.mod_id] = 999
 
         mod_requirements: dict[int, list[int]] = {}
-        for file_id, mod_state in state.mods.items():
+        for mod_state in state.mods.values():
             if mod_state.requirements:
                 mod_requirements[mod_state.mod_id] = mod_state.requirements
 

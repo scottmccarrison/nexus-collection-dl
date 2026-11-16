@@ -3,7 +3,6 @@
 Everything runs against temporary directories; no network access involved.
 """
 
-import json
 import os
 from pathlib import Path
 
@@ -116,10 +115,8 @@ def test_save_uses_unique_temp_names(tmp_path: Path, monkeypatch):
 def test_lock_blocks_second_holder(tmp_path: Path):
     mods = tmp_path / "mods"
     mods.mkdir()
-    with CollectionLock(mods):
-        with pytest.raises(StateBusyError):
-            with CollectionLock(mods):
-                pass  # pragma: no cover
+    with CollectionLock(mods), pytest.raises(StateBusyError), CollectionLock(mods):
+        pass  # pragma: no cover
     # Released: reacquiring works
     with CollectionLock(mods):
         pass
@@ -130,6 +127,5 @@ def test_lock_is_scoped_per_directory(tmp_path: Path):
     b = tmp_path / "b"
     a.mkdir()
     b.mkdir()
-    with CollectionLock(a):
-        with CollectionLock(b):
-            pass  # different collection dirs do not block each other
+    with CollectionLock(a), CollectionLock(b):
+        pass  # different collection dirs do not block each other

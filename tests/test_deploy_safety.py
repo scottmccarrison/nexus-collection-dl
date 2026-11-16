@@ -19,10 +19,8 @@ from nexus_collection_dl.deploy import (
     BackupStore,
     DeployError,
     DeployJournal,
-    DeployedFile,
     DeploymentPlan,
     UndeployError,
-    deploy as run_deploy,
     fingerprint_state,
     get_game_ini_path,
     get_plugins_txt_dest,
@@ -30,8 +28,16 @@ from nexus_collection_dl.deploy import (
     sha256_file,
     undeploy_records,
 )
+from nexus_collection_dl.deploy import (
+    deploy as run_deploy,
+)
 from nexus_collection_dl.service import ModManagerService
-from nexus_collection_dl.state import CollectionLock, CollectionState, StateBusyError, StateError
+from nexus_collection_dl.state import (
+    CollectionLock,
+    CollectionState,
+    StateBusyError,
+    StateError,
+)
 
 DOMAIN = "skyrimspecialedition"
 
@@ -151,7 +157,7 @@ def test_symlink_deploy_and_undeploy(env: Env):
     assert dest.is_symlink()
     assert os.readlink(dest) == str(src.resolve())
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert kept == [] and cleared == 1
     assert not dest.exists()
     assert src.exists()  # staging source is never touched
@@ -159,14 +165,14 @@ def test_symlink_deploy_and_undeploy(env: Env):
 
 def test_copy_deploy_and_undeploy(env: Env):
     src = _src(env, "mod.esp", b"copy me")
-    result = _deploy(env, [(src, Path("mod.esp"))], method="copy")
+    _deploy(env, [(src, Path("mod.esp"))], method="copy")
     dest = env.game / "Data" / "mod.esp"
     assert dest.read_bytes() == b"copy me"
     rec = env.ownership[str(dest)]
     assert rec["sha256"] == hashlib.sha256(b"copy me").hexdigest()
     assert rec["had_original"] is False
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert kept == [] and cleared == 1
     assert not dest.exists()
 
@@ -189,7 +195,7 @@ def test_preexisting_regular_original_restored_with_mode(env: Env):
     assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(env.backups.dir.stat().st_mode) == 0o700
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert kept == [] and cleared == 1
     assert dest.read_bytes() == b"USER ORIGINAL"
     assert stat.S_IMODE(dest.stat().st_mode) == 0o640
@@ -207,7 +213,7 @@ def test_preexisting_symlink_original_restored_exact_target(env: Env):
     assert rec["orig_link_target"] == "../relative/target.esp"
     assert rec["backup"] is None  # symlink originals need no content backup
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert kept == [] and cleared == 1
     assert dest.is_symlink()
     assert os.readlink(dest) == "../relative/target.esp"
@@ -250,7 +256,7 @@ def test_empty_parent_cleanup_bounded_by_data_and_root(env: Env):
     assert (env.game / "Data" / "textures" / "t.dds").exists()
     assert (env.game / "sfse_loader.exe").is_symlink()
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 2 and kept == []
     assert not (env.game / "Data" / "textures").exists()  # empty dir removed
     assert (env.game / "Data").exists()                   # Data itself kept
@@ -269,7 +275,7 @@ def test_same_size_same_mtime_edit_refused_on_undeploy(env: Env):
     dest.write_bytes(b"MOD CONTENT")  # same length, different bytes
     os.utime(dest, (st.st_atime, st.st_mtime))  # same mtime too
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, problems, _notes, cleared = _undeploy(env)
     assert cleared == 0
     assert len(kept) == 1
     assert any("refused" in p for p in problems)
@@ -283,14 +289,14 @@ def test_externally_replaced_symlink_refused(env: Env):
     dest.unlink()
     os.symlink(str(env.tmp / "elsewhere"), dest)
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert os.readlink(dest) == str(env.tmp / "elsewhere")  # untouched
 
     # Repair: point it back at the recorded target, retry succeeds
     dest.unlink()
     os.symlink(str(src.resolve()), dest)
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 1 and kept == []
 
 
@@ -365,7 +371,7 @@ def test_missing_backup_blocks_removal(env: Env):
     rec = env.ownership[str(dest)]
     env.backups.path_for(rec["backup"]).unlink()  # lose the backup
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert any("missing or corrupt" in p for p in problems)
     # Fail closed: the deployed file is NOT removed without a restore path
@@ -382,7 +388,7 @@ def test_corrupt_backup_blocks_removal(env: Env):
     bp = env.backups.path_for(rec["backup"])
     bp.write_bytes(bp.read_bytes() + b"corruption")
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert dest.read_bytes() == b"mod content"  # deployed file untouched
 
@@ -399,7 +405,7 @@ def test_legacy_symlink_matching_target_removed_with_note(env: Env):
     rec = {"src": str(src), "dest": str(dest), "method": "symlink"}
     env.ownership[str(dest)] = rec
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, notes, cleared = _undeploy(env)
     assert cleared == 1 and kept == []
     assert not dest.exists()
     assert any("pre-0.2.1" in n for n in notes)
@@ -413,7 +419,7 @@ def test_legacy_symlink_changed_target_refused(env: Env):
     rec = {"src": str(src), "dest": str(dest), "method": "symlink"}
     env.ownership[str(dest)] = rec
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert os.readlink(dest) == "/somewhere/else"
 
@@ -426,7 +432,7 @@ def test_legacy_copy_content_match_removed(env: Env):
     rec = {"src": str(src), "dest": str(dest), "method": "copy"}
     env.ownership[str(dest)] = rec
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 1 and kept == []
     assert not dest.exists()
 
@@ -439,7 +445,7 @@ def test_legacy_copy_content_mismatch_refused(env: Env):
     rec = {"src": str(src), "dest": str(dest), "method": "copy"}
     env.ownership[str(dest)] = rec
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert dest.read_bytes() == b"user edited this"
 
@@ -451,7 +457,7 @@ def test_legacy_copy_missing_source_refused(env: Env):
     rec = {"src": str(env.staging / "gone.esp"), "dest": str(dest), "method": "copy"}
     env.ownership[str(dest)] = rec
 
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert dest.exists()
 
@@ -496,13 +502,13 @@ def test_record_outside_trusted_roots_refused(env: Env):
         "orig_mode": None, "backup": None, "ts": "",
     }
     env.ownership[str(outside_file)] = rec
-    kept, problems, notes, cleared = _undeploy(env)
+    kept, _problems, _notes, cleared = _undeploy(env)
     assert cleared == 0 and len(kept) == 1
     assert outside_file.read_bytes() == b"mine"
 
 
 def test_service_rejects_staging_game_overlap(svc, tmp_path):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, _game, _prefix = _svc_env(tmp_path)
     # Same path
     result = svc.deploy(mods, game_dir=mods)
     assert result.deployed_count == 0
@@ -531,7 +537,7 @@ def test_service_rejects_staging_inside_game(svc, tmp_path):
 
 
 def test_busy_lock_serializes_deploy_and_undeploy(svc, tmp_path):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     with CollectionLock(mods):
         with pytest.raises(StateBusyError):
             svc.deploy(mods, game_dir=game)
@@ -592,10 +598,10 @@ def test_replay_intent_after_install_folds_ownership(env: Env):
     rec = _manual_record(env, src, dest, None)
     env.journal.deploy_intent(rec)
 
-    ownership, reports = recover_ownership([], env.mods, [env.game])
+    ownership, _reports = recover_ownership([], env.mods, [env.game])
     assert ownership[str(dest)] == rec
     # The recovered record undeploys cleanly
-    kept, problems, notes, cleared = undeploy_records(
+    kept, _problems, _notes, cleared = undeploy_records(
         ownership, [env.game], env.backups, env.journal
     )
     assert cleared == 1 and kept == []
@@ -635,7 +641,7 @@ def test_replay_midway_undeploy_not_yet_removed_retries(env: Env):
     assert str(dest) in ownership  # kept for retry
     assert any("retried" in r or "retry" in r for r in reports)
 
-    kept, problems, notes, cleared = undeploy_records(
+    kept, _problems, _notes, cleared = undeploy_records(
         ownership, [env.game], env.backups, env.journal
     )
     assert cleared == 1 and kept == []
@@ -679,9 +685,9 @@ def test_install_failure_leaves_recoverable_journal(env: Env, monkeypatch):
     # Dangling intent for bad.esp resolves cleanly (nothing was installed)
     monkeypatch.setattr(deploy_module, "install_deploy", real_install)
     records = list(env.ownership.values())
-    ownership, reports = recover_ownership(records, env.mods, [env.game])
+    ownership, _reports = recover_ownership(records, env.mods, [env.game])
     assert len(ownership) == 1  # only good.esp tracked
-    kept, problems, notes, cleared = undeploy_records(
+    kept, _problems, _notes, cleared = undeploy_records(
         ownership, [env.game], env.backups, env.journal
     )
     assert cleared == 1 and kept == []
@@ -789,7 +795,7 @@ def test_service_deploy_failure_skips_plugins_and_ini(svc, tmp_path):
 
 
 def test_service_redeploy_stops_on_unsafe_removal(svc, tmp_path):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     result = svc.deploy(mods, game_dir=game, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
@@ -806,7 +812,7 @@ def test_service_redeploy_stops_on_unsafe_removal(svc, tmp_path):
 
 
 def test_service_undeploy_partial_raises_and_retry_succeeds(svc, tmp_path):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     result = svc.deploy(mods, game_dir=game, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
@@ -832,7 +838,7 @@ def test_service_undeploy_partial_raises_and_retry_succeeds(svc, tmp_path):
 
 
 def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkeypatch):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     real_save = CollectionState.save
 
     def failing_save(self):
@@ -866,7 +872,7 @@ def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkey
 
 
 def test_service_nothing_to_deploy_keeps_existing_deployment(svc, tmp_path):
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     result = svc.deploy(mods, game_dir=game)
     assert result.deployed_count == 1
 
@@ -1026,7 +1032,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
 ):
     """Real service.deploy failing mid-publish: journal kept, failed dest never
     enters ownership, retry completes cleanly, undeploy restores original bytes."""
-    mods, game, prefix = _svc_env(
+    mods, game, _prefix = _svc_env(
         tmp_path,
         staging_files={"ModA/plugin.esp": b"esp a", "ModB/other.esp": b"esp b"},
     )
@@ -1074,7 +1080,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
 
 def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeypatch):
     """Ownership lands in saved state even when journal done lines are lost."""
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     real_done = DeployJournal.deploy_done
 
     def failing_done(self, dest_str):
@@ -1103,7 +1109,7 @@ def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeyp
 def test_service_redeploy_stop_preserves_journal(svc, tmp_path):
     """A redeploy that stops on an unsafe removal keeps the dangling undeploy
     intent recoverable; repairing and redeploying finishes cleanly."""
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     result = svc.deploy(mods, game_dir=game, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
@@ -1134,7 +1140,7 @@ def test_service_interrupted_undeploy_retains_entries_and_journal(
     svc, tmp_path, monkeypatch
 ):
     """An interrupted removal keeps both the state entry and the journal."""
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     result = svc.deploy(mods, game_dir=game)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
@@ -1174,7 +1180,7 @@ def test_service_corrupt_backup_mid_restore_never_replaces_deployed_file(
 ):
     """M: the staged restore copy is re-hashed before publish; a backup that
     turns corrupt after pre-verification leaves the deployed file in place."""
-    mods, game, prefix = _svc_env(tmp_path)
+    mods, game, _prefix = _svc_env(tmp_path)
     dest = game / "Data" / "ModA" / "plugin.esp"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"USER ORIGINAL")

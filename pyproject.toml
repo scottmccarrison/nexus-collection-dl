@@ -16,6 +16,9 @@ dependencies = [
     "rarfile>=4.0",
     "flask>=3.0.0",
     "packaging>=21.0",
+    # state.py uses typing.Self via typing_extensions, which is not in the
+    # stdlib until 3.11 and is not guaranteed to arrive transitively.
+    "typing_extensions>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -45,3 +48,21 @@ dev = [
     "pyright>=1.1.414",
     "ruff>=0.17.5",
 ]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# BLE001 is off on purpose. Catching Exception at an outer boundary is a
+# deliberate design here: service calls, the shell loop, and the web routes
+# all keep one catch-all so nothing escapes as a traceback or an invisible
+# failure. Narrowing those to specific types would change behavior, so the
+# rule fights the code rather than protecting it.
+ignore = ["BLE001"]
+
+[tool.mypy]
+python_version = "3.10"
+# rarfile and the optional loot binding ship without type stubs.
+[[tool.mypy.overrides]]
+module = ["rarfile", "loot"]
+ignore_missing_imports = true

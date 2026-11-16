@@ -11,7 +11,6 @@ import rarfile
 
 class ExtractionError(Exception):
     """Raised when archive extraction fails."""
-    pass
 
 
 def sniff_archive_magic(filepath: Path) -> str | None:
@@ -26,7 +25,7 @@ def sniff_archive_magic(filepath: Path) -> str | None:
     try:
         with open(filepath, "rb") as f:
             header = f.read(8)
-    except (OSError, IOError):
+    except OSError:
         return None
 
     if header[:2] == b"PK":
@@ -123,13 +122,13 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         staging_dir.mkdir(parents=True)
 
         if archive_type == "zip":
-            extracted = _extract_zip(archive_path, staging_dir)
+            _extract_zip(archive_path, staging_dir)
         elif archive_type == "7z":
-            extracted = _extract_7z(archive_path, staging_dir)
+            _extract_7z(archive_path, staging_dir)
         elif archive_type == "rar":
-            extracted = _extract_rar(archive_path, staging_dir)
+            _extract_rar(archive_path, staging_dir)
         else:
-            extracted = []
+            pass
 
         # Move extracted files from staging to target, preserving structure
         final_files = _move_staging_contents(staging_dir, target_dir)
@@ -184,6 +183,7 @@ def _extract_7z_system(archive_path: Path, target_dir: Path) -> list[Path]:
         [sz_bin, "x", str(archive_path), f"-o{target_dir}", "-y"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         raise ExtractionError(
@@ -210,7 +210,10 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
                 if path.is_file():
                     extracted.append(path)
         return extracted
-    except Exception:
+    # rarfile cannot handle some archives (RAR5, corrupt, or no backend);
+    # falling through to unar/unrar is the intended path, so a silent
+    # except here is not a swallowed failure worth logging.
+    except Exception:  # noqa: S110
         pass
 
     # Fall back to unar (handles RAR5)
@@ -220,6 +223,7 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
             [unar_bin, "-o", str(target_dir), "-f", str(archive_path)],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             return [p for p in target_dir.rglob("*") if p.is_file()]
@@ -231,6 +235,7 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
             [unrar_bin, "x", "-y", str(archive_path), str(target_dir) + "/"],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             return [p for p in target_dir.rglob("*") if p.is_file()]
