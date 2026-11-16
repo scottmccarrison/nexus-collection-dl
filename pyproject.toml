@@ -16,6 +16,9 @@ dependencies = [
     "rarfile>=4.0",
     "flask>=3.0.0",
     "packaging>=21.0",
+    # state.py uses typing.Self via typing_extensions, which is not in the
+    # stdlib until 3.11 and is not guaranteed to arrive transitively.
+    "typing_extensions>=4.0",
 ]
 
 [project.optional-dependencies]
