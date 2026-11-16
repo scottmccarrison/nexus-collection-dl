@@ -71,6 +71,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, ClassVar
 
 from rich.console import Console
 from rich.markup import escape
@@ -164,8 +165,8 @@ _COMMAND_HELP = (
         (
             "/use 2",
             "/use Clean Visuals",
-            "/use             show the current selection and the "
-            "collection list",
+            ("/use             show the current selection and the "
+            "collection list"),
         ),
     ),
     _CommandHelp(
@@ -188,8 +189,8 @@ _COMMAND_HELP = (
         "/sync [<index|name|url>]",
         "sync a collection (default: the current collection)",
         (
-            "/sync https://next.nexusmods.com/skyrimspecialedition/"
-            "collections/abc123",
+            ("/sync https://next.nexusmods.com/skyrimspecialedition/"
+            "collections/abc123"),
             "/sync 2",
             "/sync",
         ),
@@ -207,10 +208,10 @@ _COMMAND_HELP = (
         "tool-wide overview and health report, or one collection vs the "
         "latest revision",
         (
-            "/status     tool-wide overview and health, no network "
-            "(tool-wide even with a collection selected)",
-            "/status 2   one collection vs the latest revision "
-            "(needs network)",
+            ("/status     tool-wide overview and health, no network "
+            "(tool-wide even with a collection selected)"),
+            ("/status 2   one collection vs the latest revision "
+            "(needs network)"),
         ),
     ),
     _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
@@ -511,7 +512,7 @@ class _ShellSession:
             # still reachable by index through /use).
             self._cmd_help("")
             return
-        if low.startswith("nxm://") or low.startswith(("http://", "https://")):
+        if low.startswith(("nxm://", "http://", "https://")):
             # A bare link on a line is the same thing as /add <link>.
             self._cmd_add(stripped)
             return
@@ -760,17 +761,20 @@ class _ShellSession:
         if low.startswith("nxm://"):
             # mods_dir is passed explicitly so the service never falls
             # back to the global handler game mappings.
-            result = self.svc.add_nxm(rest, mods_dir=current.path)
-            self._report_nxm(result)
-        elif low.startswith("http://") or low.startswith("https://"):
-            result = self.svc.add_mod(rest, current.path)
-            self._report_add(result)
+            nxm_result = self.svc.add_nxm(rest, mods_dir=current.path)
+            self._report_nxm(nxm_result)
+        elif low.startswith(("http://", "https://")):
+            add_result = self.svc.add_mod(rest, current.path)
+            self._report_add(add_result)
         else:
             raise ValueError(
                 "/add expects an http(s) mod page URL or an nxm link"
             )
 
     def _report_add(self, result: AddResult) -> None:
+        # Only reachable after _require_current in _cmd_add, so a
+        # collection is always selected here.
+        current = self._require_current()
         # Failed results render as failures before any success text.
         if not result.success:
             self._emit_failure(result.error or "the mod could not be added.")
@@ -783,7 +787,7 @@ class _ShellSession:
             self._emit(f"Free account - download manually: {_safe_text(p.mod_name)}")
             self._emit(f"  {p.browser_url}")
             self._emit(
-                f"Save the file to {_safe_text(self.current.path)}, then run "
+                f"Save the file to {_safe_text(current.path)}, then run "
                 "'nexus-dl import' on that directory."
             )
             return
@@ -1184,7 +1188,7 @@ class _ShellSession:
             )
         self.console.print(table)
 
-    _COMMANDS = {
+    _COMMANDS: ClassVar[dict[str, Any]] = {
         "/help": _cmd_help,
         "/quit": _cmd_quit,
         "/exit": _cmd_quit,

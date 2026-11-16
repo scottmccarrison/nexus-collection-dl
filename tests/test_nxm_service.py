@@ -15,6 +15,7 @@ import json
 import time
 import zipfile
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import requests
@@ -822,9 +823,8 @@ def test_busy_lock_blocks_nxm_before_network(svc, tmp_path):
     fake = FakeNexusAPI(files=files_meta(make_zip()))
     svc._api = fake
 
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.add_nxm(uri(), mods_dir=cdir)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.add_nxm(uri(), mods_dir=cdir)
     assert fake.calls == []
 
 
@@ -1024,14 +1024,14 @@ def test_nonjson_api_response_at_service_boundary(svc, tmp_path):
 
     class HtmlResponse:
         status_code = 200
-        headers = {}
+        headers: ClassVar[dict] = {}
         url = "https://api.nexusmods.com/v1/validate.json"
 
         def json(self):
             raise ValueError("Expecting value: line 1 column 1 (char 0)")
 
     class HtmlSession:
-        headers = {}
+        headers: ClassVar[dict] = {}
 
         def get(self, url, **kwargs):
             return HtmlResponse()
@@ -1070,7 +1070,7 @@ def test_api_timeout_fails_bounded_state_untouched_lock_released(svc, tmp_path):
     cdir = make_collection(tmp_path, mods=[pending_entry()])
 
     class TimeoutSession:
-        headers = {}
+        headers: ClassVar[dict] = {}
 
         def get(self, url, **kwargs):
             # Every request in the nxm flow must carry an explicit timeout
@@ -1103,7 +1103,7 @@ def test_metadata_connection_error_translated_and_redacted(svc, tmp_path):
     cdir = make_collection(tmp_path, mods=[pending_entry()])
 
     class FlakySession:
-        headers = {}
+        headers: ClassVar[dict] = {}
 
         def get(self, url, **kwargs):
             assert kwargs.get("timeout") is not None

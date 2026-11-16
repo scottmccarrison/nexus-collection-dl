@@ -17,7 +17,8 @@ replacement patterns.
 """
 
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .api import redact_encoded_secret_forms, redact_literal_values

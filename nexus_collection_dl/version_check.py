@@ -1,7 +1,7 @@
 """Check for newer releases on GitHub."""
 
-import urllib.request
 import json
+import urllib.request
 
 from . import __version__
 

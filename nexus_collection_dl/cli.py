@@ -8,26 +8,27 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
-from .api import (
-    NexusAPIError,
-)
+from . import __version__
+from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
 from .handler import (
     DESKTOP_ENTRY_NAME,
+    DesktopInstaller,
     HandlerError,
     NxmRoutingError,
     add_mapping,
     append_nxm_log,
     capability_warnings,
     notification_daemon_available,
-    notify as handler_notify,
     nxm_log_path,
     remove_mapping,
     sanitize_message,
 )
-from .handler import DesktopInstaller
+from .handler import (
+    notify as handler_notify,
+)
 from .keystore import (
     KeyStoreError,
     api_key_path,
@@ -42,10 +43,9 @@ from .redaction import (
     merge_secrets,
     uri_query_secrets,
 )
-from .service import ModManagerService, PendingDownload, _select_mod_file
+from .service import ModManagerService, PendingDownload
 from .state import StateError
 from .version_check import check_for_update
-from . import __version__
 
 console = Console()
 
@@ -324,7 +324,7 @@ def update(
         if result.errors:
             for err in result.errors:
                 console.print(f"[red]Error:[/red] {err}")
-        console.print(f"\n[green]Update complete![/green]")
+        console.print("\n[green]Update complete![/green]")
 
 
 @main.command()
@@ -504,7 +504,7 @@ def deploy(
 
     if result.has_sfse:
         sfse_path = Path(result.game_dir) / "sfse_loader.exe"
-        console.print(f"\n[bold yellow]SFSE detected![/bold yellow]")
+        console.print("\n[bold yellow]SFSE detected![/bold yellow]")
         console.print("  To launch with mods, set your Steam shortcut TARGET to:")
         console.print(f"  [cyan]{sfse_path}[/cyan]")
 
@@ -576,7 +576,7 @@ def add(
 
     if result.pending_download:
         p = result.pending_download
-        console.print(f"[yellow]Free account - download manually:[/yellow]")
+        console.print("[yellow]Free account - download manually:[/yellow]")
         console.print(f"  [cyan]{p.mod_name}[/cyan]: {p.browser_url}")
         console.print(f"\nSave to [cyan]{mods_dir}[/cyan], then run:")
         console.print(f"  [bold]nexus-dl import {mods_dir}[/bold]")
@@ -664,7 +664,6 @@ def import_cmd(
 @main.group(name="track-sync")
 def track_sync_group():
     """Manage Nexus Mods tracked-mod sync."""
-    pass
 
 
 @track_sync_group.command()
@@ -723,7 +722,7 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     console.print(f"[bold]Starting web UI on http://127.0.0.1:{port}[/bold]")
     console.print(f"[dim]Mods directory: {mods_dir}[/dim]")
     if force_free:
-        console.print(f"[yellow]Free-user mode forced[/yellow]")
+        console.print("[yellow]Free-user mode forced[/yellow]")
     create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
 
 
@@ -790,8 +789,8 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
     """Record one status line in the nxm log; must never fail the command."""
     try:
         append_nxm_log(outcome, detail)
-    except Exception:
-        pass  # best-effort logging: a broken log must never break nxm
+    except Exception:  # noqa: S110 - best-effort logging: a broken log must never break nxm
+        pass
 
 
 def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:

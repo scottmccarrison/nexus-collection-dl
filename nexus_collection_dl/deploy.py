@@ -25,6 +25,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 # Bethesda plugin/archive extensions
@@ -92,7 +93,7 @@ SKIP_EXTENSIONS = {".txt", ".md", ".jpg", ".jpeg", ".png", ".gif", ".pdf", ".log
                    ".url", ".lnk", ".json"}
 
 # Starfield/Skyrim/Fallout INI settings for mod support
-GAME_INI_SETTINGS = {
+GAME_INI_SETTINGS: dict[str, dict[str, Any]] = {
     "starfield": {
         "filename": "StarfieldCustom.ini",
         "sections": {
@@ -297,9 +298,7 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     if "sfse" in lower_parts:
         sfse_idx = lower_parts.index("sfse")
         remainder = Path(*parts[sfse_idx:])
-        if lower_parts[0] == "data" and sfse_idx == 1:
-            return ("data", remainder)
-        elif sfse_idx == 0:
+        if lower_parts[0] == "data" and sfse_idx == 1 or sfse_idx == 0:
             return ("data", remainder)
 
     # Explicit Data/ prefix
@@ -418,7 +417,6 @@ class DeployError(Exception):
     Refusals are deliberate: nexus-dl fails closed rather than destroy files
     it cannot positively identify as its own.
     """
-    pass
 
 
 class UndeployError(DeployError):
@@ -921,14 +919,14 @@ def recover_ownership(
     for entry in entries:
         op = entry.get("op")
         if op == "deploy_intent":
-            rec = entry.get("record")
-            if isinstance(rec, dict) and rec.get("dest"):
-                pending_deploys[str(rec["dest"])] = rec
+            entry_rec = entry.get("record")
+            if isinstance(entry_rec, dict) and entry_rec.get("dest"):
+                pending_deploys[str(entry_rec["dest"])] = entry_rec
         elif op == "deploy_done":
             dest = str(entry.get("dest", ""))
-            rec = pending_deploys.pop(dest, None)
-            if rec is not None:
-                ownership[dest] = rec
+            entry_rec = pending_deploys.pop(dest, None)
+            if entry_rec is not None:
+                ownership[dest] = entry_rec
             else:
                 reports.append(
                     f"journal: deploy completion without a matching intent for "
@@ -949,17 +947,17 @@ def recover_ownership(
     # Dangling deploy intents: interrupted after backup/intent, before or
     # after install, without the completion line.
     for dest_str, rec in pending_deploys.items():
-        dest = Path(dest_str)
-        fp = fingerprint_state(dest, rec)[0]
+        dest_path = Path(dest_str)
+        fp = fingerprint_state(dest_path, rec)[0]
         if fp == "deployed":
             ownership[dest_str] = rec
             reports.append(
-                f"recovered {dest}: install completed but was not recorded; "
+                f"recovered {dest_path}: install completed but was not recorded; "
                 f"now tracked"
             )
         elif fp == "original":
             reports.append(
-                f"recovered {dest}: interrupted before install; original left "
+                f"recovered {dest_path}: interrupted before install; original left "
                 f"in place"
             )
         elif fp == "absent":
@@ -967,58 +965,58 @@ def recover_ownership(
                 ok, msg = _safe_restore(dest_str, rec)
                 if ok:
                     reports.append(
-                        f"recovered {dest}: restored the original after an "
+                        f"recovered {dest_path}: restored the original after an "
                         f"interrupted deploy"
                     )
                 else:
                     ownership[dest_str] = rec
                     reports.append(
-                        f"{dest}: interrupted deploy and restore failed: {msg}"
+                        f"{dest_path}: interrupted deploy and restore failed: {msg}"
                     )
             # No original recorded: nothing was there, nothing was installed.
         else:
             ownership[dest_str] = rec
             reports.append(
-                f"{dest}: an interrupted deploy left unexpected content at "
+                f"{dest_path}: an interrupted deploy left unexpected content at "
                 f"the destination; keeping the record for review (nothing "
                 f"was deleted)"
             )
 
     # Dangling undeploy intents: interrupted midway through removal.
     for dest_str in pending_undeploys:
-        rec = ownership.get(dest_str)
-        if rec is None:
+        undeploy_rec = ownership.get(dest_str)
+        if undeploy_rec is None:
             continue
-        dest = Path(dest_str)
-        fp = fingerprint_state(dest, rec)[0]
+        dest_path = Path(dest_str)
+        fp = fingerprint_state(dest_path, undeploy_rec)[0]
         if fp == "deployed":
             reports.append(
-                f"{dest}: interrupted undeploy; removal will be retried on "
+                f"{dest_path}: interrupted undeploy; removal will be retried on "
                 f"the next run"
             )
         elif fp == "original":
             ownership.pop(dest_str, None)
             reports.append(
-                f"recovered {dest}: undeploy had already restored the original"
+                f"recovered {dest_path}: undeploy had already restored the original"
             )
         elif fp == "absent":
-            if rec.get("had_original"):
-                ok, msg = _safe_restore(dest_str, rec)
+            if undeploy_rec.get("had_original"):
+                ok, msg = _safe_restore(dest_str, undeploy_rec)
                 if ok:
                     ownership.pop(dest_str, None)
                     reports.append(
-                        f"recovered {dest}: restored the original after an "
+                        f"recovered {dest_path}: restored the original after an "
                         f"interrupted undeploy"
                     )
                 else:
                     reports.append(
-                        f"{dest}: interrupted undeploy and restore failed: {msg}"
+                        f"{dest_path}: interrupted undeploy and restore failed: {msg}"
                     )
             else:
                 ownership.pop(dest_str, None)
         else:
             reports.append(
-                f"{dest}: an interrupted undeploy left unexpected content at "
+                f"{dest_path}: an interrupted undeploy left unexpected content at "
                 f"the destination; keeping the record for review (nothing "
                 f"was deleted)"
             )
@@ -1565,11 +1563,10 @@ def undeploy_records(
             ownership.pop(dest_str, None)
             cleared += 1
             backup_name = rec.get("backup")
-            if status == "restored" and backup_name:
-                if not any(
-                    r.get("backup") == backup_name for r in ownership.values()
-                ):
-                    backups.drop(backup_name)
+            if status == "restored" and backup_name and not any(
+                r.get("backup") == backup_name for r in ownership.values()
+            ):
+                backups.drop(backup_name)
             if journal is not None:
                 journal.undeploy_done(dest_str)
             if msg:
@@ -1614,6 +1611,8 @@ def deploy(
         if dry_run:
             result.deployed.append(DeployedFile(str(src), str(dest), method))
             return
+        # Non-dry-run deployment requires all three; see the docstring above.
+        assert backups is not None and journal is not None and ownership is not None
         dest_str = str(dest)
         try:
             prior = ownership.get(dest_str)

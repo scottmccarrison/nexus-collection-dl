@@ -16,7 +16,6 @@ class ManifestError(Exception):
     Download failures carry categorical reason text only: request URLs
     (which can hold signing query parameters) never surface.
     """
-    pass
 
 
 class CollectionManifest:

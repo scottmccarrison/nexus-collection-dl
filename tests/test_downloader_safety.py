@@ -13,8 +13,8 @@ import requests
 
 from nexus_collection_dl import downloader as downloader_module
 from nexus_collection_dl.downloader import (
-    DownloadError,
     Downloader,
+    DownloadError,
     _expected_md5,
     _expected_size,
     validate_download_filename,
@@ -133,14 +133,14 @@ def test_safe_filename_accepted(tmp_path):
 def test_successful_download_publishes_and_cleans_up(tmp_path):
     payload = b"archive bytes"
     resp = FakeResponse(payload)
-    d, api = _make_downloader(response=resp)
+    d, _api = _make_downloader(response=resp)
     final = d.download_mod("skyrim", _mod(size=len(payload)), tmp_path)
 
     assert final == tmp_path / "Mod-1.0.zip"
     assert final.read_bytes() == payload
     assert [p.name for p in tmp_path.iterdir()] == ["Mod-1.0.zip"]  # no temp leftovers
     assert resp.closed
-    url, kwargs = d.session.calls[0]
+    _url, kwargs = d.session.calls[0]
     assert kwargs.get("timeout") == (
         downloader_module.CONNECT_TIMEOUT, downloader_module.READ_TIMEOUT
     )
@@ -157,7 +157,7 @@ def test_publish_is_same_directory_rename(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "replace", recording_replace)
     payload = b"archive bytes"
-    d, api = _make_downloader(response=FakeResponse(payload))
+    d, _api = _make_downloader(response=FakeResponse(payload))
     d.download_mod("skyrim", _mod(size=len(payload)), tmp_path)
     assert renames and all(a == b for a, b in renames)
 
@@ -179,7 +179,7 @@ def test_size_mismatch_rejected_final_preserved(tmp_path):
     final = tmp_path / "Mod-1.0.zip"
     final.write_bytes(b"PREVIOUS GOOD DOWNLOAD")
     truncated = b"short"
-    d, api = _make_downloader(response=FakeResponse(truncated))
+    d, _api = _make_downloader(response=FakeResponse(truncated))
     with pytest.raises(DownloadError) as excinfo:
         d.download_mod("skyrim", _mod(size=999), tmp_path)
     assert "size mismatch" in str(excinfo.value)
@@ -190,7 +190,7 @@ def test_size_mismatch_rejected_final_preserved(tmp_path):
 def test_md5_mismatch_rejected_final_preserved(tmp_path):
     final = tmp_path / "Mod-1.0.zip"
     final.write_bytes(b"PREVIOUS GOOD DOWNLOAD")
-    d, api = _make_downloader(response=FakeResponse(b"corrupt payload"))
+    d, _api = _make_downloader(response=FakeResponse(b"corrupt payload"))
     with pytest.raises(DownloadError) as excinfo:
         d.download_mod("skyrim", _mod(md5="0" * 32), tmp_path)
     assert "MD5 mismatch" in str(excinfo.value)
@@ -199,7 +199,7 @@ def test_md5_mismatch_rejected_final_preserved(tmp_path):
 
 def test_unknown_size_skips_check(tmp_path):
     payload = b"whatever length"
-    d, api = _make_downloader(response=FakeResponse(payload))
+    d, _api = _make_downloader(response=FakeResponse(payload))
     final = d.download_mod("skyrim", _mod(size=None), tmp_path)
     assert final.read_bytes() == payload
     d2, _ = _make_downloader(response=FakeResponse(payload))
@@ -208,7 +208,7 @@ def test_unknown_size_skips_check(tmp_path):
 
 def test_malformed_md5_skipped(tmp_path):
     payload = b"whatever"
-    d, api = _make_downloader(response=FakeResponse(payload))
+    d, _api = _make_downloader(response=FakeResponse(payload))
     final = d.download_mod("skyrim", _mod(md5="not-a-hash"), tmp_path)
     assert final.read_bytes() == payload
 
@@ -232,7 +232,7 @@ def test_expected_metadata_parsing():
 # ---------------------------------------------------------------------------
 
 def test_http_error_message_never_leaks_signed_url(tmp_path):
-    d, api = _make_downloader(response=FakeResponse(b"", status=403))
+    d, _api = _make_downloader(response=FakeResponse(b"", status=403))
     with pytest.raises(DownloadError) as excinfo:
         d.download_mod("skyrim", _mod(), tmp_path)
     message = str(excinfo.value)
@@ -245,7 +245,7 @@ def test_http_error_message_never_leaks_signed_url(tmp_path):
 
 def test_timeout_message_never_leaks_signed_url(tmp_path):
     exc = requests.ConnectTimeout(f"connect timed out to {SIGNED_URL}")
-    d, api = _make_downloader(get_exc=exc)
+    d, _api = _make_downloader(get_exc=exc)
     with pytest.raises(DownloadError) as excinfo:
         d.download_mod("skyrim", _mod(), tmp_path)
     message = str(excinfo.value)
@@ -258,7 +258,7 @@ def test_midstream_failure_cleans_temp_and_preserves_final(tmp_path):
     final = tmp_path / "Mod-1.0.zip"
     final.write_bytes(b"PREVIOUS GOOD DOWNLOAD")
     resp = FakeResponse(b"a" * 5000, fail_after=1000)
-    d, api = _make_downloader(response=resp)
+    d, _api = _make_downloader(response=resp)
     with pytest.raises(DownloadError) as excinfo:
         d.download_mod("skyrim", _mod(), tmp_path)
     assert resp.closed  # streamed response closed on failure
@@ -336,7 +336,7 @@ def test_interrupt_cleans_temp_and_leaves_no_partial(tmp_path):
             yield b"par"
             raise KeyboardInterrupt
 
-    d, api = _make_downloader(response=InterruptingResponse(content=b"partial"))
+    d, _api = _make_downloader(response=InterruptingResponse(content=b"partial"))
     with pytest.raises(KeyboardInterrupt):
         d.download_mod("skyrim", _mod(), tmp_path)
     assert list(tmp_path.glob(".nexus-download-*")) == []

@@ -28,12 +28,12 @@ from nexus_collection_dl.service import (
     list_mods,
 )
 from nexus_collection_dl.state import (
+    STATE_FILENAME,
     CollectionLock,
     CollectionState,
     LoadOrderRegenError,
     StateBusyError,
     StateError,
-    STATE_FILENAME,
 )
 
 GAME = "skyrimspecialedition"
@@ -431,9 +431,8 @@ def test_busy_lock_raises_state_busy_error(svc, tmp_path):
     cdir = write_state(tmp_path / "col", mods=[mod_entry(555, 100, "Alpha Mod")])
     before = (cdir / STATE_FILENAME).read_bytes()
 
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.remove_mod(cdir, mod_id=100, no_load_order=True)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.remove_mod(cdir, mod_id=100, no_load_order=True)
 
     assert (cdir / STATE_FILENAME).read_bytes() == before
 

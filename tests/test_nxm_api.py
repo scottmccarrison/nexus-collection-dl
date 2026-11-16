@@ -99,7 +99,7 @@ def test_signed_pair_forwarded_as_query_params(api):
 def test_unsigned_premium_call_has_no_params(api):
     api.session = FakeSession()
     api.get_download_url(GAME, 123, 456)
-    url, kwargs = api.session.calls[0]
+    _url, kwargs = api.session.calls[0]
     assert kwargs.get("params") is None
 
 
@@ -311,9 +311,8 @@ def test_suppress_context_restores_levels_on_error():
     old_level = logger.level
     logger.setLevel(logging.DEBUG)
     try:
-        with pytest.raises(RuntimeError):
-            with suppress_http_debug_logging():
-                raise RuntimeError("boom")
+        with pytest.raises(RuntimeError), suppress_http_debug_logging():
+            raise RuntimeError("boom")
         assert logger.level == logging.DEBUG
     finally:
         logger.setLevel(old_level)
@@ -324,9 +323,9 @@ def test_suppress_context_restores_levels_on_error():
 # timeouts, and thread-safe log suppression
 # ---------------------------------------------------------------------------
 
-import threading  # noqa: E402
+import threading
 
-from nexus_collection_dl.api import (  # noqa: E402
+from nexus_collection_dl.api import (
     SIGNED_REQUEST_TIMEOUT,
     redact_literal_values,
 )
@@ -460,7 +459,7 @@ def test_suppress_contexts_serialize_across_threads_without_debug_leaks():
 # failures are translated into redacted domain errors
 # ---------------------------------------------------------------------------
 
-from nexus_collection_dl.api import API_REQUEST_TIMEOUT  # noqa: E402
+from nexus_collection_dl.api import API_REQUEST_TIMEOUT
 
 
 @pytest.mark.parametrize(

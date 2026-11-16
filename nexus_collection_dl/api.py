@@ -6,7 +6,8 @@ import os
 import re
 import threading
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -206,12 +207,10 @@ def suppress_http_debug_logging():
 
 class NexusAPIError(Exception):
     """Base exception for Nexus API errors."""
-    pass
 
 
 class NexusPremiumRequired(NexusAPIError):
     """Raised when Premium membership is required for an operation."""
-    pass
 
 
 class NexusRateLimited(NexusAPIError):
@@ -611,7 +610,15 @@ class NexusAPI:
                     secrets,
                 )
             )
-        return data[0].get("URI")
+        uri = data[0].get("URI")
+        if not isinstance(uri, str):
+            raise NexusAPIError(
+                redact_literal_values(
+                    "Unexpected download link response from the Nexus API.",
+                    secrets,
+                )
+            )
+        return uri
 
     def get_mod_files(self, game_domain: str, mod_id: int) -> list[dict[str, Any]]:
         """List all files for a mod."""

@@ -12,11 +12,13 @@ import io
 import json
 import re
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from click.testing import CliRunner
 from rich.console import Console
 
+from nexus_collection_dl import __version__
 from nexus_collection_dl import cli as cli_module
 from nexus_collection_dl import service as service_module
 from nexus_collection_dl import updater as updater_module
@@ -29,19 +31,16 @@ from nexus_collection_dl.service import (
     SyncResult,
 )
 from nexus_collection_dl.shell import (
-    _COMMAND_HELP,
     _HELP_BY_NAME,
     _MAX_INPUT_FAILURES,
     _ShellSession,
     run_shell,
 )
 from nexus_collection_dl.state import (
+    STATE_FILENAME,
     CollectionState,
     StateBusyError,
-    StateError,
-    STATE_FILENAME,
 )
-from nexus_collection_dl import __version__
 
 GAME = "skyrimspecialedition"
 COLLECTION_URL = f"https://next.nexusmods.com/{GAME}/collections/testcol"
@@ -58,7 +57,7 @@ HOSTILE_URI = (
 class FakeShellService:
     """Configurable ModManagerService double recording every call."""
 
-    calls = []
+    calls: ClassVar[list] = []
     # Per-method canned results (None means "leave the default").
     add_result = None
     nxm_result = None
@@ -159,7 +158,7 @@ def shell_env(monkeypatch, tmp_path):
                         lambda summary, body="": notifications.append((summary, body)))
     monkeypatch.setattr(cli_module, "notification_daemon_available",
                         lambda: True)
-    monkeypatch.setattr(cli_module, "capability_warnings", lambda: [])
+    monkeypatch.setattr(cli_module, "capability_warnings", list)
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
@@ -1331,19 +1330,19 @@ def test_collection_named_help_flag_is_reachable_by_index(shell_env, tmp_path):
 
 def fake_health_probes(**overrides):
     """Deterministic HealthProbes: no host probes, nothing to warn about."""
-    fields = dict(
-        api_key_source=lambda: ("stored", None),
-        handler_status=lambda: {
+    fields = {
+        "api_key_source": lambda: ("stored", None),
+        "handler_status": lambda: {
             "entry_installed": True,
             "is_default": True,
             "current_default": "nexus-dl-nxm.desktop",
             "xdg_mime_available": True,
         },
-        notifications_enabled=lambda: None,
-        notification_setting=lambda: None,
-        capability_warnings=lambda: [],
-        lock_state=lambda d: "free",
-    )
+        "notifications_enabled": lambda: None,
+        "notification_setting": lambda: None,
+        "capability_warnings": list,
+        "lock_state": lambda d: "free",
+    }
     fields.update(overrides)
     return HealthProbes(**fields)
 
@@ -1592,7 +1591,7 @@ def test_prompt_shows_the_current_collection_and_auto_selects_one(
 
 def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
     root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
-    code, out, prompts = run_capture_prompts(
+    code, _out, prompts = run_capture_prompts(
         FakeShellService(), root, ["/use Beta", "/quit"]
     )
     assert code == 0
@@ -1604,7 +1603,7 @@ def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
 def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
     root = tmp_path / "root"
     write_collection(root / "weird", name="Weird\nName] [x")
-    code, out, prompts = run_capture_prompts(
+    code, _out, prompts = run_capture_prompts(
         FakeShellService(), root, ["/quit"]
     )
     assert code == 0
@@ -1640,7 +1639,7 @@ def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
 def test_explicit_use_remembers_the_selection(shell_env, tmp_path):
     root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
     memory = root / ".nexus-shell.json"
-    code, out, _ = run_capture_prompts(
+    code, _out, _ = run_capture_prompts(
         FakeShellService(), root, ["/use Beta", "/quit"]
     )
     assert code == 0
@@ -1673,7 +1672,7 @@ def test_startup_restores_a_root_level_collection(shell_env, tmp_path):
     write_collection(root, name="Root Collection")
     memory = root / ".nexus-shell.json"
     memory.write_text(json.dumps({"current": "root"}))
-    code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
+    code, _out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
     assert prompts[0] == "nexus-dl [Root Collection]> "
 
@@ -2052,7 +2051,7 @@ def test_sync_renders_conflicts_and_tracked_counts(
 def test_status_target_surfaces_removed_skipped(
     shell_env, tmp_path, monkeypatch
 ):
-    from nexus_collection_dl.service import ModStatus, StatusResult
+    from nexus_collection_dl.service import StatusResult
 
     root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
     FakeShellService.status_result = StatusResult(

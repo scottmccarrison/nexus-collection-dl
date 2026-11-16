@@ -121,34 +121,30 @@ def test_busy_error_is_a_state_error():
 
 def test_update_busy(svc, tmp_path):
     cdir = make_collection(tmp_path)
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.update(cdir)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.update(cdir)
     assert svc._api.calls == []
 
 
 def test_add_mod_busy_after_parse_before_network(svc, tmp_path):
     cdir = make_collection(tmp_path)
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.add_mod(MOD_URL, cdir)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.add_mod(MOD_URL, cdir)
     assert svc._api.calls == []
 
 
 def test_add_local_busy_and_state_conserved(svc, tmp_path):
     cdir = make_collection(tmp_path)
     before = state_raw(cdir)
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.add_local("Local Mod", cdir)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.add_local("Local Mod", cdir)
     assert state_raw(cdir) == before          # failed writer changed nothing
 
 
 def test_import_downloads_busy(svc, tmp_path):
     cdir = make_collection(tmp_path, pending=True)
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.import_downloads(cdir, no_load_order=True)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.import_downloads(cdir, no_load_order=True)
 
 
 def test_deploy_and_undeploy_busy(svc, tmp_path):
@@ -173,9 +169,8 @@ def test_track_sync_enable_disable_busy(svc, tmp_path):
 def test_add_nxm_busy_conserves_state_and_skips_network(svc, tmp_path):
     cdir = make_collection(tmp_path, pending=True)
     before = state_raw(cdir)
-    with CollectionLock(cdir):
-        with pytest.raises(StateBusyError):
-            svc.add_nxm(NXM_URI, mods_dir=cdir)
+    with CollectionLock(cdir), pytest.raises(StateBusyError):
+        svc.add_nxm(NXM_URI, mods_dir=cdir)
     assert svc._api.calls == []               # contention caught before API use
     assert state_raw(cdir) == before
     assert not (cdir / "TestMod-1.0.zip").exists()
@@ -190,9 +185,8 @@ def test_sync_locks_the_resolved_subdirectory(svc, tmp_path):
     subdir = parent / "Test Collection"
     subdir.mkdir()
 
-    with CollectionLock(subdir):
-        with pytest.raises(StateBusyError):
-            svc.sync(COLLECTION_URL, parent)
+    with CollectionLock(subdir), pytest.raises(StateBusyError):
+        svc.sync(COLLECTION_URL, parent)
 
     # The parent dir was never locked: only pre-lock network calls happened.
     assert svc._api.calls == ["validate_key", "get_collection_mods"]

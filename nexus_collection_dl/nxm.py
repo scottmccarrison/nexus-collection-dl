@@ -168,6 +168,8 @@ def _decode_once(value: str, what: str) -> str:
 def _parse_collection(game_domain: str, path: str) -> "NxmLinkInfo":
     """Recognize the Vortex collection shape and turn it into safe guidance."""
     match = _COLLECTION_PATH_RE.match(path)
+    if match is None:
+        raise NxmParseError(_GENERIC_ERROR)
     # Only build a website URL from a slug that validates after decoding;
     # anything else falls back to the generic parse error.
     try:

@@ -1,8 +1,8 @@
 """Flask application - routes for nexus-dl web UI."""
 
-import json
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request
 
@@ -157,7 +157,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
 
     @app.route("/api/pending")
     def api_pending():
-        svc = get_service()
+        get_service()
         try:
             state = CollectionState(get_mods_dir())
             state.load()
@@ -260,7 +260,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
         if not task:
             return jsonify({"error": "Task not found"}), 404
 
-        result_data = None
+        result_data: Any = None
         if task.result is not None:
             try:
                 result_data = asdict(task.result)

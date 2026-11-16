@@ -4,9 +4,10 @@ import hashlib
 import os
 import re
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import requests
 from rich.progress import (
@@ -37,7 +38,6 @@ _URL_RE = re.compile(r"https?://\S+")
 class DownloadError(Exception):
     """Raised when a download fails."""
 
-    pass
 
 
 @dataclass

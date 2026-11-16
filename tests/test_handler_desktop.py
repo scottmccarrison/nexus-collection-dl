@@ -583,7 +583,10 @@ def test_generated_entry_passes_desktop_file_validate(tmp_path, exe):
     entry = tmp_path / DESKTOP_ENTRY_NAME
     entry.write_text(build_desktop_entry_content(exe))
     proc = subprocess.run(
-        ["desktop-file-validate", str(entry)], capture_output=True, text=True
+        ["desktop-file-validate", str(entry)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -596,7 +599,10 @@ def test_tricky_executable_entry_passes_desktop_file_validate(tmp_path):
     entry = tmp_path / DESKTOP_ENTRY_NAME
     entry.write_text(build_desktop_entry_content(tricky))
     proc = subprocess.run(
-        ["desktop-file-validate", str(entry)], capture_output=True, text=True
+        ["desktop-file-validate", str(entry)],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -606,8 +612,8 @@ def test_tricky_executable_entry_passes_desktop_file_validate(tmp_path):
 # single status query
 # ---------------------------------------------------------------------------
 
-import json  # noqa: E402
-import os  # noqa: E402
+import json
+import os
 
 
 class TimeoutRunner:

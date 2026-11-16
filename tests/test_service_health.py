@@ -66,19 +66,19 @@ def mod_entry(file_id=456, mod_id=123, name="Test Mod",
 
 def fake_probes(**overrides):
     """Deterministic HealthProbes: no host access, nothing to warn about."""
-    fields = dict(
-        api_key_source=lambda: (None, None),
-        handler_status=lambda: {
+    fields = {
+        "api_key_source": lambda: (None, None),
+        "handler_status": lambda: {
             "entry_installed": True,
             "is_default": True,
             "current_default": "nexus-dl-nxm.desktop",
             "xdg_mime_available": True,
         },
-        notifications_enabled=lambda: None,
-        notification_setting=lambda: None,
-        capability_warnings=lambda: [],
-        lock_state=lambda d: "free",
-    )
+        "notifications_enabled": lambda: None,
+        "notification_setting": lambda: None,
+        "capability_warnings": list,
+        "lock_state": lambda d: "free",
+    }
     fields.update(overrides)
     return HealthProbes(**fields)
 
@@ -248,8 +248,8 @@ def test_handler_warn_lines_carry_a_remedy():
 CINNAMON = (
     "org.cinnamon.desktop.notifications",
     "display-notifications",
-    "gsettings set org.cinnamon.desktop.notifications"
-    " display-notifications true",
+    ("gsettings set org.cinnamon.desktop.notifications"
+    " display-notifications true"),
 )
 
 
@@ -295,7 +295,7 @@ def test_notifications_disabled_warns_with_the_exact_fix():
 
 def test_capabilities_clean_is_one_ok_line():
     checks = run_checks(probes=fake_probes(
-        capability_warnings=lambda: []))
+        capability_warnings=list))
     (line,) = by_label(checks, "Desktop tools")
     assert line.status == "OK"
 

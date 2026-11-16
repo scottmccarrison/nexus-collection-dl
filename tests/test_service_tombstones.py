@@ -25,7 +25,7 @@ from nexus_collection_dl import service as service_module
 from nexus_collection_dl import state as state_module
 from nexus_collection_dl.manifest import CollectionManifest
 from nexus_collection_dl.service import ModManagerService
-from nexus_collection_dl.state import CollectionState, STATE_FILENAME
+from nexus_collection_dl.state import STATE_FILENAME, CollectionState
 
 GAME = "skyrimspecialedition"
 MOD_ID = 123
@@ -694,7 +694,7 @@ def test_import_does_not_resurrect_tombstoned_mod(svc, tmp_path):
     state = reload_state(cdir)
     state.mark_removed(MOD_ID, "Test Mod")       # stale pending + tombstone
     state.save()
-    before = state_raw(cdir)
+    state_raw(cdir)
 
     result = svc.import_downloads(cdir, no_load_order=True)
 

@@ -1,24 +1,28 @@
 """Service layer - business logic extracted from CLI for programmatic use."""
 
 import contextlib
+import hashlib
 import os
 import re
-import hashlib
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from .api import NexusAPI, NexusAPIError, NexusPremiumRequired
-from .collection import parse_collection_url, parse_mod_url, CollectionParseError, ModParseError
+from .api import NexusAPI, NexusAPIError
+from .collection import (
+    CollectionParseError,
+    parse_collection_url,
+    parse_mod_url,
+)
 from .deploy import (
     BackupStore,
     DeployError,
     DeployJournal,
     UndeployError,
     classify_files,
-    deploy as deploy_files,
     get_game_ini_path,
     get_plugins_txt_dest,
     recover_ownership,
@@ -26,9 +30,12 @@ from .deploy import (
     write_game_ini,
     write_plugins_txt,
 )
+from .deploy import (
+    deploy as deploy_files,
+)
 from .downloader import (
-    DownloadError,
     Downloader,
+    DownloadError,
     SignedLink,
     validate_download_filename,
 )
@@ -60,15 +67,14 @@ from .loot_sort import (
 from .manifest import CollectionManifest, ManifestError, download_and_parse_manifest
 from .nxm import NxmLinkInfo, parse_nxm_url
 from .state import (
-    CollectionState,
-    CollectionLock,
-    LoadOrderRegenError,
-    StateError,
     LOCK_FILENAME,
     STATE_FILENAME,
+    CollectionLock,
+    CollectionState,
+    LoadOrderRegenError,
+    StateError,
 )
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
-
 
 # progress callback: (event_type, percentage 0-1, message)
 ProgressCallback = Callable[[str, float, str], None]
@@ -328,9 +334,7 @@ def _retained_archive_is_sane(archive: Path, expected_md5: str | None) -> bool:
         and sniff_archive_magic(archive) is None
     ):
         return False
-    if expected_md5 is not None and _file_md5(archive) != expected_md5:
-        return False
-    return True
+    return not (expected_md5 is not None and _file_md5(archive) != expected_md5)
 
 
 def _as_int(value: Any) -> int | None:
@@ -476,8 +480,11 @@ def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
     for mod in mods:
         if mod.get("expected_md5"):
             continue
-        key = (_as_int(mod.get("mod_id")), _as_int(mod.get("file_id")))
-        md5 = by_identity.get(key)
+        mod_id = _as_int(mod.get("mod_id"))
+        file_id = _as_int(mod.get("file_id"))
+        if mod_id is None or file_id is None:
+            continue
+        md5 = by_identity.get((mod_id, file_id))
         # Defense in depth: only a well-formed hash is ever attached, so a
         # malformed value can never masquerade as a known checksum.
         if _is_wellformed_md5(md5):
@@ -1178,7 +1185,7 @@ class ModManagerService:
 
                 # Cache manifest + generate load order even for free users
                 # (the manifest download is a public URL, doesn't need premium)
-                load_order_files: list[str] = []
+                load_order_files = []
                 if not no_load_order:
                     progress("loadorder", 0.8, "Caching manifest and generating load order...")
                     lo_files = self._generate_load_order(collection_data, mods_dir, state)
@@ -1366,7 +1373,7 @@ class ModManagerService:
                     def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
                         if total_bytes > 0:
                             pct = 0.1 + 0.6 * (bytes_dl / total_bytes)
-                            progress("download", pct, f"Downloading...")
+                            progress("download", pct, "Downloading...")
 
                     progress("download", 0.1, f"Downloading {len(mods_to_download)} mods...")
                     _attach_expected_md5(state, mods_to_download)
@@ -1684,6 +1691,8 @@ class ModManagerService:
                     )
                 target_mod_id = entry.mod_id
             else:
+                # The guard above guarantees exactly one of the two is set.
+                assert mod_id is not None
                 if state.get_mod(mod_id) is None:
                     raise StateError(
                         f"No mod with mod_id {mod_id} in {mods_dir}"
@@ -1945,9 +1954,9 @@ class ModManagerService:
                     # Journal kept: entries were not all safely resolved, so
                     # dangling intents must stay recoverable for the next run.
                     errors = [
-                        f"Redeploy stopped: {len(kept)} previously deployed "
+                        (f"Redeploy stopped: {len(kept)} previously deployed "
                         f"file(s) could not be safely removed. Resolve the "
-                        f"reported issues and run deploy (or undeploy) again."
+                        f"reported issues and run deploy (or undeploy) again.")
                     ] + problems
                     return DeployResult(
                         0, [], errors, str(game_dir), False, warnings=deploy_warnings
@@ -2570,6 +2579,9 @@ class ModManagerService:
                 return self._nxm_failure(
                     info, meta_error, collection_dir=target
                 )
+            # _nxm_file_metadata returns a dict on success and only pairs a
+            # None dict with an error string.
+            assert selected is not None
             try:
                 filename = validate_download_filename(
                     selected.get("file_name") or selected.get("name")
@@ -2689,11 +2701,11 @@ class ModManagerService:
                     mod_name=mod_name,
                     filename=filename,
                 )
-            signed = (
-                SignedLink(key=info.key, expires=info.expires)
-                if info.has_credentials
-                else None
-            )
+            signed = None
+            if info.has_credentials:
+                # has_credentials is true only when both are present.
+                assert info.key is not None and info.expires is not None
+                signed = SignedLink(key=info.key, expires=info.expires)
 
             def on_download_progress(bytes_dl: int, total_bytes: int) -> None:
                 if total_bytes > 0:
@@ -2821,8 +2833,9 @@ class ModManagerService:
                 existing.browser_url = ""
                 existing.installed_at = datetime.now(timezone.utc).isoformat()
                 existing.filename = filename
-                if selected.get("version"):
-                    existing.version = selected.get("version")
+                version = selected.get("version")
+                if version:
+                    existing.version = str(version)
             else:
                 download_info["manual"] = True
                 download_info["download_status"] = "downloaded"
@@ -2874,7 +2887,7 @@ class ModManagerService:
             # so their failure can no longer crash a completed download:
             # it is reported as a truthful warning on a successful result.
             # No deployment is ever triggered.
-            warnings: list[str] = []
+            warnings = []
             try:
                 self._maybe_sync_tracked(state)
             except Exception as e:
@@ -2925,6 +2938,9 @@ class ModManagerService:
         selected, meta_error = self._nxm_file_metadata(info)
         if meta_error:
             return self._nxm_failure(info, meta_error)
+        # _nxm_file_metadata returns a dict on success and only pairs a
+        # None dict with an error string.
+        assert selected is not None
         try:
             filename = validate_download_filename(
                 selected.get("file_name") or selected.get("name")
@@ -2977,11 +2993,11 @@ class ModManagerService:
             "version": selected.get("version", ""),
             "size_bytes": size_bytes,
         }
-        signed = (
-            SignedLink(key=info.key, expires=info.expires)
-            if info.has_credentials
-            else None
-        )
+        signed = None
+        if info.has_credentials:
+            # has_credentials is true only when both are present.
+            assert info.key is not None and info.expires is not None
+            signed = SignedLink(key=info.key, expires=info.expires)
 
         progress("download", 0.2, f"Downloading {filename}...")
         downloader = Downloader(self.api)
@@ -3049,14 +3065,14 @@ class ModManagerService:
         if not user_info.get("is_premium", False):
             return False
         expiry = user_info.get("profile_expiry")
-        if (
+        # An expired profile is treated as a free account.
+        lapsed = (
             isinstance(expiry, (int, float))
             and not isinstance(expiry, bool)
             and expiry > 0
             and expiry <= time.time()
-        ):
-            return False  # premium lapsed: treat as a free account
-        return True
+        )
+        return not lapsed
 
     def _nxm_account_error(
         self, info: NxmLinkInfo, collection_dir: Path | None = None
@@ -3126,7 +3142,7 @@ class ModManagerService:
 
     def _nxm_mod_name(self, info: NxmLinkInfo, existing: Any = None) -> str:
         """Best-effort mod display name; never blocks the download."""
-        if existing is not None and getattr(existing, "name", ""):
+        if existing is not None and existing.name:
             return existing.name
         with contextlib.suppress(NexusAPIError):
             nexus_mod = self.api.get_mod_info(info.game_domain, info.mod_id)
@@ -3227,12 +3243,12 @@ class ModManagerService:
         manifest = CollectionManifest.from_dict(state.manifest_data)
 
         # Inject phase 999 for manual mods (keyed by mod_id in manifest)
-        for file_id, ms in state.mods.items():
+        for ms in state.mods.values():
             if ms.manual:
                 manifest.mod_phases[ms.mod_id] = 999
 
         mod_requirements: dict[int, list[int]] = {}
-        for file_id, mod_state in state.mods.items():
+        for mod_state in state.mods.values():
             if mod_state.requirements:
                 mod_requirements[mod_state.mod_id] = mod_state.requirements
 

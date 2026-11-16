@@ -8,6 +8,7 @@ live desktop registration, no real notify-send.
 """
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from click.testing import CliRunner
@@ -32,9 +33,9 @@ class FakeService:
 
     result = None
     error = None
-    calls = []
-    keys = []  # api_key each instance was constructed with (never printed)
-    progress_msgs = []  # (event, pct, msg) lines to emit via on_progress
+    calls: ClassVar[list] = []
+    keys: ClassVar[list] = []  # api_key each instance was constructed with (never printed)
+    progress_msgs: ClassVar[list] = []  # (event, pct, msg) lines to emit via on_progress
 
     def __init__(self, api_key=None, force_free=False):
         FakeService.keys.append(api_key)
@@ -62,7 +63,7 @@ class FakeInstaller:
     """Stand-in for DesktopInstaller at the CLI boundary."""
 
     mode = "ok"
-    calls = []
+    calls: ClassVar[list] = []
 
     def __init__(self):
         pass
@@ -122,7 +123,7 @@ def cli_env(monkeypatch, tmp_path):
     # Deterministic capability probe for the same reason: the real one
     # inspects host tools (shutil.which) and may run gsettings. Tests
     # override this to exercise warning display.
-    monkeypatch.setattr(cli_module, "capability_warnings", lambda: [])
+    monkeypatch.setattr(cli_module, "capability_warnings", list)
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     # Pin the state dir too: nxm runs append their status log there, and
@@ -425,9 +426,9 @@ def test_nxm_warnings_reflection_never_surfaces(cli_env):
         success=True, status="downloaded", game_domain=GAME, mod_id=1,
         file_id=2, mod_name="Test Mod",
         collection_dir=cli_env["tmp_path"] / "col",
-        warnings=[f"Load order regeneration failed for {REFLECTED_KEY} "
+        warnings=[(f"Load order regeneration failed for {REFLECTED_KEY} "
                   f"({REFLECTED_ENC}). Run 'nexus-dl load-order /x' to "
-                  "retry."],
+                  "retry.")],
     )
     result = invoke(["nxm", REFLECTED_URI, "--notify"])
     assert result.exit_code == 0, result.output
@@ -575,8 +576,8 @@ def test_handler_status_shows_diagnostics(cli_env, monkeypatch):
 # Bugcheck regressions: host isolation, warnings, timeout surfacing
 # ---------------------------------------------------------------------------
 
-import subprocess as _sp  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
+import subprocess as _sp
+from types import SimpleNamespace
 
 
 @pytest.fixture(autouse=True)
@@ -596,8 +597,8 @@ def test_nxm_success_prints_warnings_and_still_succeeds(cli_env):
         success=True, status="downloaded", game_domain=GAME, mod_id=1,
         file_id=2, mod_name="Test Mod",
         collection_dir=cli_env["tmp_path"] / "col",
-        warnings=["Load order regeneration failed: boom. Run "
-                  "'nexus-dl load-order /x' to retry."],
+        warnings=[("Load order regeneration failed: boom. Run "
+                  "'nexus-dl load-order /x' to retry.")],
     )
     result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2", "--no-notify"])
     assert result.exit_code == 0, result.output
@@ -642,7 +643,7 @@ def test_handler_install_timeout_is_clean_cli_failure(cli_env, monkeypatch):
 # resolution, and CLI precedence (flag > env > stored)
 # ---------------------------------------------------------------------------
 
-from nexus_collection_dl.keystore import remove_api_key, store_api_key  # noqa: E402
+from nexus_collection_dl.keystore import remove_api_key, store_api_key
 
 STORED_SECRET = "StoredSentinel-abc123_XYZ"
 
@@ -877,8 +878,8 @@ def test_nxm_api_failure_appends_redacted_log_line(cli_env):
 
 
 def test_nxm_parse_failure_logs_static_reason(cli_env):
-    result = invoke(["nxm", f"nxm://{GAME}/mods/1/files/2/extra?key={LOG_KEY}"
-                     "&expires=1893456000", "--no-notify"])
+    result = invoke(["nxm", (f"nxm://{GAME}/mods/1/files/2/extra?key={LOG_KEY}"
+                     "&expires=1893456000"), "--no-notify"])
     assert result.exit_code == 1
     content = nxm_log_file(cli_env).read_text()
     assert " error " in content
@@ -1004,10 +1005,10 @@ def test_handler_install_prints_capability_warnings(cli_env, monkeypatch):
     monkeypatch.setattr(cli_module, "DesktopInstaller", FakeInstaller)
     monkeypatch.setattr(cli_module, "capability_warnings", lambda: [
         "notify-send was not found: clicks will complete silently.",
-        "notifications are disabled in this desktop's settings: "
+        ("notifications are disabled in this desktop's settings: "
         "org.cinnamon.desktop.notifications display-notifications is false. "
         "Enable it with 'gsettings set org.cinnamon.desktop.notifications "
-        "display-notifications true'.",
+        "display-notifications true'."),
     ])
     result = invoke(["handler", "install"])
     assert result.exit_code == 0, result.output
@@ -1169,7 +1170,7 @@ def test_nxm_boundary_redacts_encoded_and_case_variants(cli_env):
     for fragment in fragments:
         assert fragment not in result.output
     assert "[redacted]" in result.output
-    summary, body = cli_env["notifications"][0]
+    _summary, body = cli_env["notifications"][0]
     for fragment in fragments:
         assert fragment not in body
     content = nxm_log_file(cli_env).read_text()
@@ -1189,7 +1190,7 @@ def test_nxm_boundary_strips_queryless_nxm_uri(cli_env):
     assert "nxm://" not in result.output
     assert GAME not in result.output
     assert "[url redacted]" in result.output
-    summary, body = cli_env["notifications"][0]
+    _summary, body = cli_env["notifications"][0]
     assert "nxm://" not in body and GAME not in body
     content = nxm_log_file(cli_env).read_text()
     assert "nxm://" not in content and GAME not in content
@@ -1227,7 +1228,7 @@ def test_nxm_typed_error_redacts_secret_variants(cli_env):
         assert fragment not in result.output
     assert "server reflected" in result.output        # benign text survives
     assert "[redacted]" in result.output
-    summary, body = cli_env["notifications"][0]
+    _summary, body = cli_env["notifications"][0]
     for fragment in fragments:
         assert fragment not in body
     content = nxm_log_file(cli_env).read_text()

@@ -21,9 +21,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 from .state import STATE_FILENAME, CollectionState, StateError
 
@@ -448,6 +449,7 @@ def _default_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=SUBPROCESS_TIMEOUT,
+        check=False,
     )
 
 
@@ -464,6 +466,7 @@ def _notify_runner(argv: Sequence[str]) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         timeout=NOTIFY_TIMEOUT,
+        check=False,
     )
 
 
@@ -524,8 +527,8 @@ def notification_daemon_available(runner: Callable | None = None) -> bool | None
             ]
         try:
             proc = run(argv)
-        except Exception:
-            continue  # a broken probe tool must not decide the answer
+        except Exception:  # noqa: S112 - a broken probe tool must not decide the answer
+            continue
         # GetNameOwner exits non-zero when the name is unowned (or there
         # is no session bus at all): either way no daemon is reachable.
         return getattr(proc, "returncode", 1) == 0
@@ -550,8 +553,8 @@ _NOTIFICATION_SETTINGS: dict[str, tuple[str, str, str]] = {
     "cinnamon": (
         "org.cinnamon.desktop.notifications",
         "display-notifications",
-        "gsettings set org.cinnamon.desktop.notifications"
-        " display-notifications true",
+        ("gsettings set org.cinnamon.desktop.notifications"
+        " display-notifications true"),
     ),
     "gnome": (
         "org.gnome.desktop.notifications",
@@ -792,8 +795,8 @@ class DesktopInstaller:
                 self._runner(
                     ["xdg-mime", "default", default_at_start, NXM_MIME_TYPE]
                 )
-            except Exception:
-                pass  # best-effort; the query below decides what is safe
+            except Exception:  # noqa: S110 - best-effort; the query below decides what is safe
+                pass
         if not wrote_entry:
             return ""
         if prior_content is not None:

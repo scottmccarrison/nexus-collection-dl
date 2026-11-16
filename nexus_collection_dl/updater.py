@@ -7,7 +7,6 @@ from pathlib import Path
 
 import click
 
-
 CACHE_DIR = Path.home() / ".cache" / "nexus-dl"
 CACHE_FILE = CACHE_DIR / "version-check.json"
 CACHE_TTL = 3600  # 1 hour
@@ -105,7 +104,7 @@ def do_update() -> bool:
 
     try:
         dist = importlib.metadata.distribution("nexus-collection-dl")
-        src_dir = Path(dist.locate_file(""))
+        src_dir = Path(str(dist.locate_file("")))
     except Exception:
         return False
 
