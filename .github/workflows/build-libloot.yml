@@ -27,6 +27,15 @@ jobs:
           test -f /tmp/libloot/python/Cargo.toml
           echo "libloot source ready"
 
+      - name: Set up Rust toolchain
+        # The maturin image ships rustup but, in current tags, no default
+        # toolchain, so `cargo` refuses to run until one is named.
+        run: |
+          set -e
+          rustup set profile minimal
+          rustup default stable
+          cargo --version
+
       - name: Build wheel
         run: |
           cd /tmp/libloot/python
