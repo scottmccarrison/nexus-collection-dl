@@ -1132,9 +1132,6 @@ class ModManagerService:
                 )
 
             mods = manifest_mods
-            dupes = collection_data.get("duplicates_removed", 0)
-            if dupes:
-                progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
             if skip_optional:
                 mods = [m for m in mods if not m.get("optional", False)]
 
@@ -1355,9 +1352,6 @@ class ModManagerService:
                     f"Skipping {removed_skipped} removed mod(s)",
                 )
             mods = manifest_mods
-            dupes = collection_data.get("duplicates_removed", 0)
-            if dupes:
-                progress("fetch", 0.06, f"Deduplicated {dupes} duplicate mod entries")
             if skip_optional:
                 mods = [m for m in mods if not m.get("optional", False)]
 
