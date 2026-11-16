@@ -854,12 +854,12 @@ def collection_local_details(mods_dir: Path) -> CollectionLocalDetails:
     state = CollectionState(mods_dir)
     state.load()
     return CollectionLocalDetails(
-        name=state.collection_name or mods_dir.name,
-        game_domain=state.game_domain,
+        name=_state_text(state.collection_name or mods_dir.name),
+        game_domain=_state_text(state.game_domain),
         mod_count=len(state.mods),
         pending_count=len(state.get_pending_mods()),
         tombstone_count=len(state.removed_mods),
-        collection_url=state.collection_url,
+        collection_url=_state_text(state.collection_url),
         state_path=mods_dir / STATE_FILENAME,
     )
 

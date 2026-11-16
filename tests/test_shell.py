@@ -1891,7 +1891,9 @@ def test_control_characters_never_reach_the_terminal(shell_env, tmp_path):
         root / "weird", name=evil, mods=[mod_entry(name="M\x07od\nX")]
     )
     code, out, prompts = run_capture_prompts(
-        FakeShellService(), root, ["/use", "/use 1", "/remove 456", "no", "/quit"]
+        FakeShellService(), root,
+        ["/use", "/use 1", "/evil\x07cmd", "/help evil\x07name",
+         "/remove 456", "no", "/quit"],
     )
     assert code == 0
     # Raw control bytes never reach the terminal: not in output, not in
@@ -1904,9 +1906,79 @@ def test_control_characters_never_reach_the_terminal(shell_env, tmp_path):
         assert "\n" not in p
     # The name renders collapsed to one plain line everywhere.
     assert "Evil [2JName X Y" in out
+    # Hostile typed input is collapsed in the unknown-command echoes
+    # (both the /run_line path and the /help <command> path).
+    assert "Unknown command '/evil cmd'" in out
+    assert "Unknown command 'evil name'" in out
     # The confirm prompt (an input() string, recorded by input_fn)
     # shows the collapsed mod name too.
     assert "Remove 'M od X'? [yes/no]: " in prompts
+
+
+def test_control_chars_in_name_bearing_error_lines(shell_env, tmp_path):
+    evil = "Bad\x1bName\x07!"
+    root = tmp_path / "root"
+    # No mods (hits the "No mods tracked in" line) and no stored URL
+    # (hits the "no collection URL is stored for" line).
+    write_collection(root / "bad", name=evil, url="")
+
+    code, out, _ = run_capture_prompts(
+        FakeShellService(), root, ["/use 1", "/mods", "/sync", "/quit"],
+    )
+    assert code == 0
+    assert "\x1b" not in out
+    assert "\x07" not in out
+    assert "No mods tracked in 'Bad Name !'." in out
+    assert "no collection URL is stored for 'Bad Name !'" in out
+
+
+def test_control_chars_in_root_url_and_typed_input(shell_env, tmp_path):
+    """Root/path echoes, the stored-URL display, typed numeric input, and
+    the health report all collapse control characters."""
+    # Hostile root name with no collections: the resolver's error.
+    empty_root = tmp_path / "evil\x07root"
+    empty_root.mkdir()
+    code, out, _ = run_capture_prompts(
+        FakeShellService(), empty_root, ["/use nope", "/quit"],
+    )
+    assert code == 0
+    assert "\x07" not in out
+    assert "no collections found under" in out
+
+    # Hostile stored URL (query stripped for display, path collapsed),
+    # a broken state dir with a hostile name (the health report lists
+    # it), and typed numeric input carrying a BEL.
+    root = tmp_path / "root"
+    write_collection(
+        root / "good", name="Good",
+        url="https://example.com/evil\x07path?q=1",
+    )
+    bad = root / "bad\x07dir"
+    bad.mkdir(parents=True)
+    (bad / ".nexus-state.json").write_text("{not json")
+    from nexus_collection_dl.service import StatusResult
+    FakeShellService.status_result = StatusResult(
+        collection_name="Good",
+        collection_url="",
+        game_domain=GAME,
+        installed_revision=1,
+        latest_revision=None,
+        mods=[],
+        deployed_at=None,
+        deployed_file_count=0,
+        game_dir="",
+        track_sync_enabled=False,
+    )
+    code, out, _ = run_capture_prompts(
+        FakeShellService(), root,
+        ["/use 1", "/status 1", "/remove ban\x07ana", "/status", "/quit"],
+    )
+    assert code == 0
+    assert "\x07" not in out
+    assert "Collection URL: https://example.com/evil path" in out
+    assert "must be a whole number, got 'ban ana'" in out
+    assert "State files" in out
+    assert "bad dir" in out
 
 
 def test_short_absorbed_secret_does_not_garble_prose(

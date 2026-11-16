@@ -200,7 +200,7 @@ def _resolve_download_url(api_url: str, session: requests.Session) -> str:
         ) from None
     if not isinstance(link, str) or not link.strip():
         raise ManifestError("manifest download failed: malformed response")
-    return link
+    return link.strip()
 
 
 def _find_collection_json(extract_dir: Path) -> Path | None:

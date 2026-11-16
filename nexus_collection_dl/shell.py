@@ -382,7 +382,8 @@ class _ShellSession:
             if match is not None:
                 self.current = match
                 self._emit(
-                    f"Using '{_safe_text(match.name)}' ({match.path})."
+                    f"Using '{_safe_text(match.name)}' "
+                    f"({_safe_text(match.path)})."
                 )
                 return
         if len(colls) == 1:
@@ -484,7 +485,7 @@ class _ShellSession:
             handler = self._COMMANDS.get(command.lower())
             if handler is None:
                 self._emit_failure(
-                    f"Unknown command '{command}'. "
+                    f"Unknown command '{_safe_text(command)}'. "
                     "For the command list, try /help."
                 )
                 return
@@ -530,7 +531,7 @@ class _ShellSession:
     def _format_listing(self, colls: list[CollectionSummary]) -> str:
         """Index-numbered listing used by /collections and error hints."""
         if not colls:
-            return f"  (no collections under {self.root})"
+            return f"  (no collections under {_safe_text(self.root)})"
         return "\n".join(
             f"  {i}: {_safe_text(c.name)} [{_safe_text(c.game_domain) or '-'}]"
             for i, c in enumerate(colls, 1)
@@ -555,7 +556,9 @@ class _ShellSession:
         shown = _safe_text(selector)
         colls = self._collection_listing()
         if not colls:
-            raise ValueError(f"no collections found under {self.root}")
+            raise ValueError(
+                f"no collections found under {_safe_text(self.root)}"
+            )
 
         exact = [c for c in colls if c.name == selector]
         if len(exact) == 1:
@@ -620,7 +623,7 @@ class _ShellSession:
             spec = _HELP_BY_NAME.get(token.lstrip("/").lower())
             if spec is None:
                 self._emit_failure(
-                    f"Unknown command '{token}'. "
+                    f"Unknown command '{_safe_text(token)}'. "
                     "For the command list, try /help."
                 )
                 return
@@ -657,9 +660,9 @@ class _ShellSession:
         bare /use."""
         colls = self._collection_listing()
         if not colls:
-            self._emit(f"No collections found under {self.root}.")
+            self._emit(f"No collections found under {_safe_text(self.root)}.")
             return
-        table = Table(title=f"Collections under {escape(str(self.root))}")
+        table = Table(title=f"Collections under {escape(_safe_text(self.root))}")
         table.add_column("#", justify="right")
         table.add_column("Name", style="cyan")
         table.add_column("Game", style="green")
@@ -680,7 +683,7 @@ class _ShellSession:
             raise ValueError("usage: /games")
         colls = self._collection_listing()
         if not colls:
-            self._emit(f"No collections found under {self.root}.")
+            self._emit(f"No collections found under {_safe_text(self.root)}.")
             return
         totals: dict[str, list[int]] = {}
         for c in colls:
@@ -707,13 +710,14 @@ class _ShellSession:
             else:
                 self._emit(
                     f"Current collection: '{_safe_text(self.current.name)}' "
-                    f"({self.current.path})."
+                    f"({_safe_text(self.current.path)})."
                 )
             self._print_collections()
             return
         self.current = self._resolve_collection(rest)
         self._emit(
-            f"Using '{_safe_text(self.current.name)}' ({self.current.path})."
+            f"Using '{_safe_text(self.current.name)}' "
+            f"({_safe_text(self.current.path)})."
         )
         # Remembered only on explicit selection: startup auto-select and
         # restore never write the memory file.
@@ -730,7 +734,7 @@ class _ShellSession:
             target = self._require_current()
         mods = list_mods(target.path)
         if not mods:
-            self._emit(f"No mods tracked in '{target.name}'.")
+            self._emit(f"No mods tracked in '{_safe_text(target.name)}'.")
             return
         table = Table(title=f"Mods in {escape(self._scrub(_safe_text(target.name)))}")
         table.add_column("file_id", justify="right")
@@ -779,7 +783,7 @@ class _ShellSession:
             self._emit(f"Free account - download manually: {_safe_text(p.mod_name)}")
             self._emit(f"  {p.browser_url}")
             self._emit(
-                f"Save the file to {self.current.path}, then run "
+                f"Save the file to {_safe_text(self.current.path)}, then run "
                 "'nexus-dl import' on that directory."
             )
             return
@@ -891,7 +895,8 @@ class _ShellSession:
         url = get_collection_url(summary.path)
         if not url:
             raise ValueError(
-                f"no collection URL is stored for '{summary.name}'; "
+                f"no collection URL is stored for "
+                f"'{_safe_text(summary.name)}'; "
                 "pass it explicitly\n"
                 "usage: /sync <collection-url>"
             )
@@ -945,9 +950,11 @@ class _ShellSession:
                     f"  ... and {len(result.conflicts) - 20} more"
                 )
         if result.collection_dir:
-            self._emit(f"Collection directory: {result.collection_dir}")
+            self._emit(
+                f"Collection directory: {_safe_text(result.collection_dir)}"
+            )
         for f in result.load_order_files:
-            self._emit(f"Wrote {f}")
+            self._emit(f"Wrote {_safe_text(f)}")
 
     def _cmd_remove(self, rest: str) -> None:
         current = self._require_current()
@@ -1087,7 +1094,7 @@ class _ShellSession:
                 f"{sum(c.pending_count for c in scan.collections)} pending."
             )
         else:
-            self._emit(f"No collections found under {self.root}.")
+            self._emit(f"No collections found under {_safe_text(self.root)}.")
 
         # (b) removal tombstones per collection (state.removed_mods).
         if scan.collections:
@@ -1131,11 +1138,11 @@ class _ShellSession:
         )
         self.console.print(
             f"[{color}]{escape(check.status)}[/{color}] "
-            + escape(self._scrub(f"{check.label}: {check.detail}"))
+            + escape(self._scrub(_safe_text(f"{check.label}: {check.detail}")))
         )
         if check.remedy:
             self.console.print(
-                f"      fix: {escape(self._scrub(check.remedy))}"
+                f"      fix: {escape(self._scrub(_safe_text(check.remedy)))}"
             )
 
     def _status_collection(self, target: CollectionSummary) -> None:
@@ -1143,8 +1150,11 @@ class _ShellSession:
         local = collection_local_details(target.path)
         result = self.svc.get_status(target.path)
         self._emit(f"Collection: {_safe_text(result.collection_name)}")
-        self._emit(f"State path: {local.state_path}")
-        self._emit(f"Collection URL: {_display_url(local.collection_url) or '-'}")
+        self._emit(f"State path: {_safe_text(local.state_path)}")
+        self._emit(
+            f"Collection URL: "
+            f"{_safe_text(_display_url(local.collection_url)) or '-'}"
+        )
         self._emit(
             f"Local: {local.mod_count} mod(s), {local.pending_count} "
             f"pending, {local.tombstone_count} removed (tombstoned)"
@@ -1194,7 +1204,7 @@ def _parse_int(text: str, what: str) -> int:
         return int(text.strip())
     except ValueError:
         raise ValueError(
-            f"{what} must be a whole number, got {text!r}"
+            f"{what} must be a whole number, got '{_safe_text(text)}'"
         ) from None
 
 
