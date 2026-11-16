@@ -8,59 +8,73 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: ghcr.io/pyo3/maturin:latest
+    timeout-minutes: 30
+    # GITHUB_TOKEN is read-only by default in this repo, and a read-only
+    # contents scope makes the release upload fail with a 422. Elevate only
+    # what the upload needs.
+    permissions:
+      contents: write
     steps:
-      - name: Fetch libloot source
-        # No package manager here: the maturin image is manylinux-based and
-        # has neither apt-get (the old step died on that) nor a live yum
-        # mirror (its CentOS 7 base is EOL). Fetch the source without git.
-        run: |
-          set -e
-          URL=https://github.com/loot/libloot/archive/refs/heads/master.tar.gz
-          if command -v curl >/dev/null 2>&1; then
-            curl -sSL -o /tmp/libloot.tar.gz "$URL"
-          else
-            python3 -c "import urllib.request; urllib.request.urlretrieve('$URL', '/tmp/libloot.tar.gz')"
-          fi
-          mkdir -p /tmp/libloot
-          tar -xzf /tmp/libloot.tar.gz -C /tmp/libloot --strip-components=1
-          test -f /tmp/libloot/python/Cargo.toml
-          echo "libloot source ready"
-
-      - name: Set up Rust toolchain
-        # The maturin image ships rustup but, in current tags, no default
-        # toolchain, so `cargo` refuses to run until one is named.
-        run: |
-          set -e
-          rustup set profile minimal
-          rustup default stable
-          cargo --version
-
+      # Build in the manylinux container, but keep the job itself on the
+      # host. The job cannot declare `container:` because the upload steps
+      # are JavaScript actions and JS actions run inside the job container:
+      # this image is manylinux2014 (glibc 2.17) and node24 needs 2.28+, so
+      # any actions/upload-artifact or action-gh-release step dies with
+      # "GLIBC_2.28 not found" before it can upload anything. Running the
+      # container explicitly keeps the manylinux toolchain for the build and
+      # a modern glibc for the uploads.
       - name: Build wheel
-        # libloot is a Cargo workspace, so maturin writes wheels to the
-        # workspace root target/, not python/target/.
-        #
-        # Build for the interpreters nexus-collection-dl actually supports.
-        # maturin with no -i picks whichever python3 is first on PATH, which
-        # is cp39 in this image and would ship a wheel nobody can install.
-        #
-        # Tag manylinux_2_17 (manylinux2014), which maturin confirms the
-        # binary qualifies for; asking for 2_28 only narrows compatibility.
         run: |
           set -e
-          cd /tmp/libloot/python
-          maturin build --release --strip --manylinux 2_17 \
-            -i python3.10 -i python3.11 -i python3.12 -i python3.13
-          ls -la /tmp/libloot/target/wheels/
+          docker run --rm -v "$PWD":/work -w /work ghcr.io/pyo3/maturin:latest bash -euc '
+            set -e
+
+            # No git and no package manager in this image (apt-get is absent
+            # and its CentOS 7 yum mirrors are gone since the distro went
+            # EOL), so fetch the source as a tarball.
+            URL=https://github.com/loot/libloot/archive/refs/heads/master.tar.gz
+            if command -v curl >/dev/null 2>&1; then
+              curl -sSL -o /tmp/libloot.tar.gz "$URL"
+            else
+              python3 -c "import urllib.request; urllib.request.urlretrieve(\"$URL\", \"/tmp/libloot.tar.gz\")"
+            fi
+            mkdir -p /tmp/libloot
+            tar -xzf /tmp/libloot.tar.gz -C /tmp/libloot --strip-components=1
+            test -f /tmp/libloot/python/Cargo.toml
+
+            # rustup is present but current image tags configure no default
+            # toolchain, so cargo refuses to run until one is named.
+            rustup set profile minimal
+            rustup default stable
+            cargo --version
+
+            # libloot is a Cargo workspace, so maturin writes wheels to the
+            # workspace root target/, not python/target/.
+            #
+            # Build for the interpreters nexus-collection-dl supports.
+            # maturin with no -i picks whichever python3 is first on PATH,
+            # which is cp39 here and would ship a wheel nobody can install.
+            #
+            # Tag manylinux_2_17 (manylinux2014), which maturin confirms the
+            # binary qualifies for; asking for 2_28 only narrows where it
+            # installs.
+            cd /tmp/libloot/python
+            maturin build --release --strip --manylinux 2_17 \
+              -i python3.10 -i python3.11 -i python3.12 -i python3.13
+
+            mkdir -p /work/wheels
+            cp /tmp/libloot/target/wheels/*.whl /work/wheels/
+            ls -la /work/wheels/
+          '
 
       - name: Upload wheel to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: /tmp/libloot/target/wheels/*.whl
+          files: wheels/*.whl
 
       - name: Upload wheel as artifact
         uses: actions/upload-artifact@v4
         with:
           name: libloot-wheel
-          path: /tmp/libloot/target/wheels/*.whl
+          path: wheels/*.whl
