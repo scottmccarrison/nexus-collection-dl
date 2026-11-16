@@ -10,13 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     container: ghcr.io/pyo3/maturin:latest
     steps:
-      - name: Install git
+      - name: Fetch libloot source
+        # No package manager here: the maturin image is manylinux-based and
+        # has neither apt-get (the old step died on that) nor a live yum
+        # mirror (its CentOS 7 base is EOL). Fetch the source without git.
         run: |
-          apt-get update && apt-get install -y git
-
-      - name: Clone libloot
-        run: |
-          git clone --depth 1 https://github.com/loot/libloot.git /tmp/libloot
+          set -e
+          URL=https://github.com/loot/libloot/archive/refs/heads/master.tar.gz
+          if command -v curl >/dev/null 2>&1; then
+            curl -sSL -o /tmp/libloot.tar.gz "$URL"
+          else
+            python3 -c "import urllib.request; urllib.request.urlretrieve('$URL', '/tmp/libloot.tar.gz')"
+          fi
+          mkdir -p /tmp/libloot
+          tar -xzf /tmp/libloot.tar.gz -C /tmp/libloot --strip-components=1
+          test -f /tmp/libloot/python/Cargo.toml
+          echo "libloot source ready"
 
       - name: Build wheel
         run: |
