@@ -7,20 +7,25 @@ from typing import Any
 
 import requests
 
-# Map Nexus game domains to LOOT game identifiers and masterlist repos
+# Map Nexus game domains to LOOT game identifiers and masterlist repos.
+# `game_type` is the exact libloot GameType member name; it cannot be derived
+# from the display name (Skyrim Special Edition is `SkyrimSE`, not
+# `SkyrimSpecialEdition`).
 LOOT_GAME_MAP: dict[str, dict[str, str]] = {
-    "starfield": {"loot_game": "Starfield", "repo": "starfield"},
-    "skyrimspecialedition": {"loot_game": "Skyrim Special Edition", "repo": "skyrimse"},
-    "skyrim": {"loot_game": "Skyrim", "repo": "skyrim"},
-    "fallout4": {"loot_game": "Fallout 4", "repo": "fallout4"},
-    "falloutnv": {"loot_game": "Fallout: New Vegas", "repo": "falloutnv"},
-    "fallout3": {"loot_game": "Fallout 3", "repo": "fallout3"},
-    "oblivion": {"loot_game": "Oblivion", "repo": "oblivion"},
-    "morrowind": {"loot_game": "Morrowind", "repo": "morrowind"},
-    "fallout4vr": {"loot_game": "Fallout 4 VR", "repo": "fallout4vr"},
-    "skyrimvr": {"loot_game": "Skyrim VR", "repo": "skyrimvr"},
-    "enderal": {"loot_game": "Enderal: Forgotten Stories", "repo": "enderal"},
-    "enderalspecialedition": {"loot_game": "Enderal: Forgotten Stories (Special Edition)", "repo": "enderalse"},
+    "starfield": {"game_type": "Starfield", "repo": "starfield"},
+    "skyrimspecialedition": {"game_type": "SkyrimSE", "repo": "skyrimse"},
+    "skyrim": {"game_type": "Skyrim", "repo": "skyrim"},
+    "fallout4": {"game_type": "Fallout4", "repo": "fallout4"},
+    "falloutnv": {"game_type": "FalloutNV", "repo": "falloutnv"},
+    "fallout3": {"game_type": "Fallout3", "repo": "fallout3"},
+    "oblivion": {"game_type": "Oblivion", "repo": "oblivion"},
+    "morrowind": {"game_type": "Morrowind", "repo": "morrowind"},
+    "fallout4vr": {"game_type": "Fallout4VR", "repo": "fallout4vr"},
+    "skyrimvr": {"game_type": "SkyrimVR", "repo": "skyrimvr"},
+    # Enderal has no libloot GameType, so it keeps its masterlist repo but
+    # cannot be sorted: sorting falls back to collection order.
+    "enderal": {"game_type": "", "repo": "enderal"},
+    "enderalspecialedition": {"game_type": "", "repo": "enderalse"},
 }
 
 MASTERLIST_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "nexus-dl" / "masterlists"
@@ -135,41 +140,53 @@ def sort_plugins_with_loot(
         if not found_plugins:
             return existing_plugins
 
+        # Enderal has a masterlist but no libloot GameType, so it cannot be sorted.
+        game_type_name = game_info.get("game_type", "")
+        if not game_type_name:
+            return existing_plugins
+
         # Create a temporary game directory structure for LOOT
         with tempfile.TemporaryDirectory(prefix="nexus-loot-") as tmp_dir:
             tmp_path = Path(tmp_dir)
             data_dir = tmp_path / "Data"
             data_dir.mkdir()
+            # libloot needs a local app data folder as well as the game folder,
+            # and will not fall back to detecting one inside a temp dir.
+            local_dir = tmp_path / "local"
+            local_dir.mkdir()
 
-            # Symlink plugin files into the Data directory
+            # Symlink plugin files into the Data directory, keeping the names
+            # LOOT will be asked to sort.
+            loaded_plugins: list[str] = []
             for plugin_name in found_plugins:
                 for plugin_path in mods_dir.rglob(plugin_name):
                     if plugin_path.is_file():
                         link = data_dir / plugin_name
                         if not link.exists():
                             link.symlink_to(plugin_path)
+                        loaded_plugins.append(plugin_name)
                         break
 
-            # Initialize LOOT
-            game_type = getattr(loot.GameType, game_info["loot_game"].replace(" ", "").replace(":", "").replace("'", ""), None)
-            if game_type is None:
-                # Try common attribute names
-                for attr_name in dir(loot.GameType):
-                    if attr_name.lower().replace("_", "") == game_domain.replace("_", ""):
-                        game_type = getattr(loot.GameType, attr_name)
-                        break
+            if not loaded_plugins:
+                return existing_plugins
 
+            game_type = getattr(loot.GameType, game_type_name, None)
             if game_type is None:
                 return existing_plugins
 
-            db = loot.create_game_handle(game_type, str(tmp_path))
+            # libloot 0.29 exposes loot.Game and game.database(). The older
+            # binding this was written against used create_game_handle(),
+            # Database.load_lists() and Database.sort_plugins(), none of which
+            # exist any more, so the old call sequence silently sorted nothing.
+            game = loot.Game(game_type, str(tmp_path), str(local_dir))
 
             if masterlist_path and masterlist_path.exists():
-                db.load_lists(str(masterlist_path), "")
+                game.database().load_masterlist(str(masterlist_path))
 
-            # Get sorted plugins
-            sorted_plugins = db.sort_plugins(found_plugins)
-            return sorted_plugins
+            # sort_plugins raises PluginNotLoadedError on names that were not
+            # loaded first, so load before sorting.
+            game.load_plugins([str(data_dir / name) for name in loaded_plugins])
+            return game.sort_plugins(loaded_plugins)
 
     except Exception:
         # LOOT sorting failed — return None to fall back to collection order
