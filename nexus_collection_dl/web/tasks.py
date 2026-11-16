@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from queue import Queue, Empty
 from typing import Any, Generator
 
+from .errors import client_error_message
+
 
 @dataclass
 class TaskInfo:
@@ -47,7 +49,7 @@ class TaskManager:
                 result = fn(*args, **kwargs)
                 self.complete(task_id, result)
             except Exception as e:
-                self.fail(task_id, str(e))
+                self.fail(task_id, client_error_message(e))
 
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()

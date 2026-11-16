@@ -7,9 +7,9 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, render_template, request
 
 from ..api import NexusAPIError
-from ..collection import CollectionParseError, ModParseError
 from ..service import ModManagerService
 from ..state import CollectionState, StateError
+from .errors import client_error_message
 from .tasks import TaskManager
 
 
@@ -39,10 +39,8 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             status = svc.get_status(mods_path)
         except StateError:
             error = "No collection synced yet. Use Sync to download a collection."
-        except NexusAPIError as e:
-            error = f"API error: {e}"
         except Exception as e:
-            error = str(e)
+            error = client_error_message(e)
         return render_template("index.html", status=status, error=error, mods_dir=str(mods_path))
 
     @app.route("/mods")
@@ -56,7 +54,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
         except StateError:
             error = "No collection synced yet."
         except Exception as e:
-            error = str(e)
+            error = client_error_message(e)
         return render_template("mods.html", status=status, error=error, mods_dir=str(mods_path))
 
     # -- API routes --
@@ -68,7 +66,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             result = svc.get_status(get_mods_dir())
             return jsonify(asdict(result))
         except (StateError, NexusAPIError) as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"error": client_error_message(e)}), 400
 
     @app.route("/api/sync", methods=["POST"])
     def api_sync():
@@ -155,7 +153,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             mod_id = svc.add_local(name, get_mods_dir())
             return jsonify({"mod_id": mod_id, "name": name})
         except StateError as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"error": client_error_message(e)}), 400
 
     @app.route("/api/pending")
     def api_pending():
@@ -235,7 +233,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             files = svc.regenerate_load_order(get_mods_dir())
             return jsonify({"files": files})
         except StateError as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"error": client_error_message(e)}), 400
 
     @app.route("/api/track-sync/<action>", methods=["POST"])
     def api_track_sync(action: str):
@@ -254,7 +252,7 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             else:
                 return jsonify({"error": f"Unknown action: {action}"}), 400
         except (StateError, NexusAPIError) as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify({"error": client_error_message(e)}), 400
 
     @app.route("/api/tasks/<task_id>")
     def api_task_status(task_id: str):
