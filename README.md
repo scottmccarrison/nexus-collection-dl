@@ -2,6 +2,9 @@
 
 A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. Comes with a local web UI and a CLI.
 
+> [!IMPORTANT]
+> **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
+
 ## Why?
 
 Nexus Mods collections are a great way to grab a curated set of mods in one shot, but the official tools (Vortex, the NexusMods App) are Windows-only. If you're gaming on Linux - whether native or through Proton/Wine - there's no built-in way to download collections from the command line.
@@ -15,6 +18,26 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 - Python 3.10+
 - Nexus Mods account (free or Premium - see [Free vs Premium](#free-vs-premium-accounts) below)
 - `unrar` system package (only if the collection includes RAR archives)
+
+## Stable vs beta
+
+**`main` is stable.** It gets bug fixes and the features that have proven out. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
+
+**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly, with the web UI planned for deprecation once the shell covers the workflows people use. Beta points are tagged as `v0.3.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+
+Switch channels by checking out the branch before the install steps below. Stay on `main` for stable:
+
+```bash
+git checkout beta
+```
+
+Or install straight from a channel with no clone:
+
+```bash
+uv tool install "nexus-collection-dl @ git+https://github.com/scottmccarrison/nexus-collection-dl@beta"
+```
+
+The current beta point, what's in it, and how to report problems live in the [beta testing thread](https://github.com/scottmccarrison/nexus-collection-dl/discussions/68). Each new beta point gets its own thread.
 
 ## Installation
 
