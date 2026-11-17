@@ -397,11 +397,22 @@ class NexusAPI:
         )
         data = self._handle_response(response)
         if "errors" in data:
-            # Server-controlled text: a hostile or compromised endpoint
-            # could reflect the apikey or a signed URL inside an error
-            # entry. Redact known secrets and strip residual URLs before
-            # the text is embedded in the exception (same defense as
-            # every other error path).
+            # Deliberate choice, recorded here because it was contested:
+            # GraphQL error text IS embedded in the message, after redaction,
+            # rather than replaced by a static category.
+            #
+            # The threat is credential reflection. A hostile or compromised
+            # endpoint controls this text and can echo the apikey or a signed
+            # URL back at us, so known secrets are redacted and residual URLs
+            # are stripped before the text is embedded. That is the same
+            # defense every other error path uses.
+            #
+            # The text survives past that because it is the only useful
+            # debugging signal a GraphQL API gives: "field 'collection' is
+            # unknown" is actionable and a static category is not. The
+            # stable line briefly went fully static here (#83) and that was
+            # reverted in favour of this. See test_nxm_api.py
+            # ::test_graphql_errors_redact_reflected_secrets.
             raise NexusAPIError(
                 redact_secret_values(
                     f"GraphQL errors: {data['errors']}", (self.api_key,)
