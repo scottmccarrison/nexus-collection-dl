@@ -449,7 +449,8 @@ def test_suppress_contexts_serialize_across_threads_without_debug_leaks():
         # This line deliberately logs a secret so the next assertion can
         # prove it is NOT suppressed here. That is the property under test.
         records.clear()
-        logger.debug(secret_line)  # lgtm[py/clear-text-logging-sensitive-information]
+        # codeql[py/clear-text-logging-sensitive-information]
+        logger.debug(secret_line)
         assert any(KEY in m for m in records)
     finally:
         logger.removeHandler(handler)

@@ -132,7 +132,8 @@ def download_and_parse_manifest(
                         # in clear text. The archive is the payload, not the
                         # URL, and it lands in a private TemporaryDirectory
                         # that is removed on exit.
-                        f.write(chunk)  # lgtm[py/clear-text-storage-sensitive-information]
+                        # codeql[py/clear-text-storage-sensitive-information]
+                        f.write(chunk)
         except requests.RequestException as e:
             raise ManifestError(
                 f"manifest download failed: {_transport_reason(e)}"
