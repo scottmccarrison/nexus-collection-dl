@@ -61,14 +61,20 @@ class NexusAPI:
             retry_after = int(response.headers.get("Retry-After", 60))
             raise NexusRateLimited(retry_after)
         if response.status_code == 403:
+            # The body is inspected privately for the premium hint but is never
+            # included in the message. A hostile or compromised endpoint can
+            # reflect request contents back at us, and this message is reachable
+            # from CLI output and web task results.
             data = response.json() if response.text else {}
             if "premium" in str(data).lower():
                 raise NexusPremiumRequired(
                     "Premium membership required for direct download links."
                 )
-            raise NexusAPIError(f"Access forbidden: {data}")
+            raise NexusAPIError("Access forbidden by the Nexus API (HTTP 403).")
         if response.status_code == 404:
-            raise NexusAPIError(f"Resource not found: {response.url}")
+            # No URL: it is not needed to identify the failure and a request URL
+            # can carry a query string.
+            raise NexusAPIError("Resource not found (HTTP 404).")
         response.raise_for_status()
         return response.json()
 
@@ -81,7 +87,9 @@ class NexusAPI:
         )
         data = self._handle_response(response)
         if "errors" in data:
-            raise NexusAPIError(f"GraphQL errors: {data['errors']}")
+            # The GraphQL error payload is not reflected: it is whatever the
+            # endpoint chose to send back.
+            raise NexusAPIError("The Nexus API returned GraphQL errors.")
         return data.get("data", {})
 
     def get_collection_mods(self, game_domain: str, slug: str) -> dict[str, Any]:
@@ -217,7 +225,12 @@ class NexusAPI:
         data = self._handle_response(response)
 
         if not data or not isinstance(data, list):
-            raise NexusAPIError(f"Unexpected download link response: {data}")
+            # Never include the payload: a download-link response carries the
+            # signed-link key/expires pair, so reflecting it here would put
+            # download credentials into an exception message.
+            raise NexusAPIError(
+                f"Unexpected download link response for mod {mod_id} file {file_id}."
+            )
 
         return data[0].get("URI")
 
