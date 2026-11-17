@@ -87,6 +87,8 @@ pip install -e .
 export NEXUS_API_KEY="your-api-key-here"
 ```
 
+Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
+
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
 
 ## Web UI
@@ -207,6 +209,111 @@ Downloads a single mod and registers it as a "manual" mod. Manual mods are prote
 
 If the tool can't auto-select a file (no main file category), it lists all available files so you can re-run with `--file-id`.
 
+### nxm:// link handler
+
+Handle "Mod manager download" links from the Nexus website directly, without another mod manager. No daemon or background service is involved: when you click the button (and accept the browser's first-run "Launch application" confirmation for nxm:// links), your browser hands the `nxm://` link to your desktop environment, the desktop environment looks up the registered handler, and the OS launches nexus-dl as a short-lived process with the link as its argument. The click runs headless (no terminal window); the outcome arrives as a desktop notification, and every run appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` (or `$XDG_STATE_HOME/nexus-dl/nxm.log` if `XDG_STATE_HOME` is set) as the diagnostic fallback. When the download finishes, the process exits.
+
+One catch: a browser-launched process sees your desktop session's environment, not your shell's, so a `NEXUS_API_KEY` exported in `.bashrc` never reaches it. Store the key once instead. The prompt is hidden: the key is never echoed, never lands in shell history, and never appears in the process list:
+
+```bash
+nexus-dl handler set-api-key
+```
+
+Every command resolves the key in this order: `--api-key` flag, then `NEXUS_API_KEY`, then the stored key. `nexus-dl handler status` shows which source is active (never the value), and `nexus-dl handler remove-api-key` deletes the stored key.
+
+**Full setup, start to finish** (from a source checkout; this is also the smoke test):
+
+```bash
+# 1. Install dependencies (use --extra dev if you want to run the tests)
+uv sync
+uv sync --extra dev
+
+# 2. Create a disposable collection with sync. sync creates the
+#    per-collection subfolder holding .nexus-state.json that the
+#    handler downloads into.
+nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" "$HOME/mods/nxm-smoke"
+
+# 3. Store your API key for browser-launched clicks (hidden prompt)
+nexus-dl handler set-api-key
+
+# 4. Map the game to the SYNCED COLLECTION directory: the subfolder
+#    created by sync that contains .nexus-state.json, not its parent.
+#    (Use $HOME, not a quoted ~: the shell only expands ~ when unquoted)
+nexus-dl handler map starfield "$HOME/mods/nxm-smoke/My Collection"
+
+# 5. Register nexus-dl as the desktop nxm:// handler (user-level, opt-in)
+nexus-dl handler install
+```
+
+Now click **Mod manager download** once on any mod file page for that game:
+
+- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
+- Clicking again for the same file re-downloads and re-verifies it: the default flow deletes the archive after extracting, so there is nothing left to dedupe against. A re-click with a retained verified archive triggers no download: an entry already marked downloaded (for example with `--no-extract`) reports "already downloaded" with zero network calls, and an entry whose extraction previously failed finishes extracting from the retained archive (no file download; with track-sync enabled a background tracked-mod sync may still make API calls). Every click also appends a redacted line to `~/.local/state/nexus-dl/nxm.log`.
+- `nexus-dl handler uninstall` removes the desktop entry and restores the app that handled nxm:// links before, when one was recorded and nexus-dl is still the default.
+
+Useful flags when running `nxm` yourself:
+
+```bash
+# Choose the collection explicitly (overrides the game mapping)
+nexus-dl nxm "nxm://..." --mods-dir "$HOME/mods/starfield/My Collection"
+
+# Save the verified archive to a folder without touching any collection
+nexus-dl nxm "nxm://..." --output ~/Downloads
+
+# Keep the archive intact / skip load order regeneration
+nexus-dl nxm "nxm://..." --no-extract --no-load-order
+```
+
+Advanced footnote: if you have an `nxm://` link on hand, you can run it yourself without putting its credentials in shell history. Run `read` first, THEN paste the nxm:// link on its own line and press Enter. (Pasting the link onto the `read` command line just hangs, because `read` waits for a newline before it returns.)
+
+```bash
+read -s -r NXM_LINK
+# paste the nxm:// link here, then press Enter
+nexus-dl nxm "$NXM_LINK" --output "$HOME/Downloads"
+```
+
+Notes:
+
+- `handler map` requires an already-synced collection: the directory must contain `.nexus-state.json` (the collection subfolder created by `nexus-dl sync`, not its parent), and its game must match the mapping key.
+- The stored API key lives in `~/.config/nexus-dl/api-key` with owner-only (0600) permissions. No command ever prints its value.
+- The link's `key`/`expires` credentials are used for the download request only and are never stored in state, logs, or error messages. The `user_id` is a local check that the link matches your API key's account; it is never sent to the API.
+- Free accounts need a fresh signed link from the website. If a link has expired or carries no credentials, nexus-dl says so and tells you to click "Mod manager download" again - nothing is downloaded or written.
+- Pasting an `https://` mod-page URL into `nexus-dl nxm` is refused with an explanation: that command runs the `nxm://` link the "Mod manager download" click hands to your handler, and the website does not offer the link as anything you can copy. To add a mod from its page URL, use `nexus-dl add` (or `/add` in the shell) instead.
+- Downloads are verified before they are published (exact size, manifest MD5 when known); a file with neither a positive expected size nor a well-formed cached checksum is refused with nothing written. A re-click with the verified archive still on disk triggers no download traffic: an entry already marked downloaded reports "already downloaded" with zero network calls, and an entry whose extraction failed finishes extracting from the retained archive, verified against the cached manifest hash when one is known (with track-sync enabled, a background tracked-mod sync may still make API calls); the default flow deletes the archive after a successful extraction, so a re-click then re-downloads and re-verifies it.
+- Extraction publishes staged files one by one, not atomically as a set: a rare mid-publication failure (disk full, permissions) can leave a subset of extracted files in place while the error is reported and staging is cleaned up; re-running (the link or `nexus-dl import`) is safe and overwrites the partial set.
+- Re-running `handler install` is idempotent: the desktop entry is always rewritten (refreshing entries from older versions). Install also probes what the click flow needs (xdg-mime, notify-send, and the desktop's notification switch where one is known), warns about anything missing or switched off, and runs a best-effort notification-daemon self-test pointing at `~/.local/state/nexus-dl/nxm.log`. Warnings never block the install.
+- Platform support and the notification gotchas have their own subsections below. The one universal limit: Flatpak/Snap browsers generally cannot launch host desktop handlers, which is unsupported - use a native browser build or run `nexus-dl nxm` with a link you have on hand.
+- `nxm://` collection links are not supported - use `nexus-dl sync` with the collection URL; the handler detects them and says so.
+- Nothing is deployed automatically. Run `nexus-dl deploy` when you're ready.
+
+#### Platform support
+
+The click-through flow was live-tested end to end on one machine: Linux Mint (Cinnamon) with Firefox. Everything else below is expected to work through standard mechanisms and honestly marks itself as untested. nexus-dl never gates install on desktop identity: `handler install` probes the tools and settings that actually matter (xdg-mime, notify-send, and the notification switch where one is known) and warns about what it finds.
+
+| Desktop | Status | Notes |
+|---|---|---|
+| Cinnamon (Linux Mint) | Tested live | With Firefox. On the machine tested, Settings > Notifications > "Display notifications" was already off, so check it first if a click seems to do nothing (see [Notifications](#notifications)); the install probe warns when it finds the switch off. |
+| GNOME | Expected to work, untested | Standard xdg-mime/desktop-entry handling. Its `show-banners` switch must be on for click notifications; the install probe warns when it finds it off. |
+| MATE, XFCE, Budgie | Expected to work, untested | GIO-family desktops; standard xdg-mime/desktop-entry handling. No notification switch to probe. |
+| KDE Plasma (including CachyOS) | Expected to work, untested | KIO-based rather than GIO, but scheme handlers register through the same xdg-mime/desktop-entry mechanisms and notify-send works. No notification switch to probe. |
+| Tiling setups (i3, Sway, Hyprland) | Expected to work, untested | Needs a notification daemon (`dunst`, `mako`, ...) for click feedback. |
+| Flatpak/Snap browsers | Unsupported | Sandboxed browsers generally cannot launch host desktop handlers. Use a native browser build, or run `nexus-dl nxm` yourself with a link you have on hand. |
+
+#### Notifications
+
+The desktop notification is the normal confirmation for a click: successes and failures both report one, and every run also appends one redacted status line to `~/.local/state/nexus-dl/nxm.log` whatever the desktop does. Two things silently take the notification away while the download still works:
+
+- **The desktop's notification switch is off.** On the Linux Mint (Cinnamon) machine this was tested on, Settings > Notifications > "Display notifications" was already off, so a click showed nothing even though the download worked. Check it first when a click seems to do nothing; this was a real support trap. GNOME hides the same switch behind "Show banners". `nexus-dl handler install` probes the switch where it is known and warns when it finds it off. Fixes:
+  - Cinnamon: `gsettings set org.cinnamon.desktop.notifications display-notifications true`
+  - GNOME: `gsettings set org.gnome.desktop.notifications show-banners true`
+- **No notification tooling.** nexus-dl asks for notifications through `notify-send` (package `libnotify`), and tiling setups need a notification daemon (`dunst`, `mako`, ...). Without them clicks complete silently; the install probe warns about both.
+
+When in doubt, the log is the reliable channel: `tail -n 5 ~/.local/state/nexus-dl/nxm.log` after a click.
+
+#### Common problems
+
+For a click that seems to do nothing, start with the [troubleshooting section](GUIDE.md#troubleshooting): short version, check the log first, because a new line means the click ran and only the feedback is missing. A second click re-downloads and re-verifies a file the default flow already extracted; that is by design (the archive is deleted after extraction), and re-clicks are free only when the verified archive was kept. Peer support and a fuller problem list live in [Discussion #61: Start here: common problems and fixes](https://github.com/scottmccarrison/nexus-collection-dl/discussions/61).
+
 ### Register local mods
 
 ```bash
@@ -243,10 +350,12 @@ Removes all symlinks/copies that were deployed and restores the game directory t
 ### Import manually downloaded files
 
 ```bash
-nexus-dl import ~/mods/starfield
+# Point import at the synced collection folder - the subfolder created
+# by 'nexus-dl sync' that contains .nexus-state.json, not its parent
+nexus-dl import "$HOME/mods/starfield/My Collection"
 
 # Keep archives intact
-nexus-dl import --no-extract ~/mods/starfield
+nexus-dl import --no-extract "$HOME/mods/starfield/My Collection"
 ```
 
 Matches files you downloaded through the browser to pending mods, extracts archives, and regenerates load order. See [Free vs Premium](#free-vs-premium-accounts) below for the full workflow.
@@ -256,6 +365,18 @@ Matches files you downloaded through the browser to pending mods, extracts archi
 ```bash
 nexus-dl status ~/mods/starfield
 ```
+
+### Interactive shell
+
+For browsing and quick changes without retyping paths, `nexus-dl shell` opens an interactive prompt over the same service layer:
+
+```bash
+nexus-dl shell ~/mods/starfield
+```
+
+List collections and games, pick one with `/use` (a root with a single collection is picked for you, and bare `/use` shows the current selection; an explicit `/use` sticks across sessions), then `/mods`, `/add`, `/sync`, `/remove`, and `/status <index|name>` work on it. Bare `/status` is the exception and needs no selection: a tool-wide local report (per-game overview with totals, removal tombstone counts, and health checks for the API key, nxm handler, desktop notifications, and more) that never touches the network, while `/status <index|name>` checks one collection against the latest revision. Every command takes a bare `--help` (or `/help <command>`) for its usage and one example instead of running. `/add` takes an `https://` mod page URL (an `nxm://` link works too if you have one, bare on its own line or after `/add`, and the shell never echoes a link back), and `/sync` takes a collection URL, a collection you already have by index or name, or nothing to resync the current one (the index/name and resync forms update that collection's own directory; the URL form makes a new directory named from the API). `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
+
+Honest note on `/remove`: it drops the mod's entries from collection state and records a tombstone so `sync`/`update` skip the mod from then on, but it never deletes files already on disk (a collection's extraction tree is merged, so payload files can't be attributed back to one mod). Re-adding the mod clears the tombstone and restores it.
 
 ## Free vs Premium accounts
 
@@ -268,7 +389,9 @@ Both free and Premium Nexus Mods accounts work with `nexus-dl`. The difference i
 ### Free account workflow
 
 ```bash
-# 1. Sync the collection - fetches metadata, caches manifest, prints download links
+# 1. Sync the collection - fetches metadata, caches manifest, prints download
+#    links. sync creates a per-collection subfolder (e.g. "My Collection")
+#    and prints its path; steps 3-5 use that subfolder, not the parent.
 nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/starfield
 
 # 2. You'll see a table like:
@@ -277,13 +400,14 @@ nexus-dl sync "https://next.nexusmods.com/starfield/collections/xyz789" ~/mods/s
 #    Better Textures   | BetterTex-v3.7z       | 120 MB  | https://www.nexusmods.com/...
 #    ...
 
-# 3. Click each URL, download through Nexus (free countdown timer), save files to ~/mods/starfield
+# 3. Click each URL, download through Nexus (free countdown timer), and save
+#    the files into the collection subfolder: $HOME/mods/starfield/My Collection
 
 # 4. Import the downloaded files
-nexus-dl import ~/mods/starfield
+nexus-dl import "$HOME/mods/starfield/My Collection"
 
 # 5. Deploy as usual
-nexus-dl deploy ~/mods/starfield
+nexus-dl deploy "$HOME/mods/starfield/My Collection"
 ```
 
 The `import` command matches downloaded files by filename (case-insensitive), extracts archives, updates the state, and regenerates load order. If some files are missing, it reports which mods are still pending.
@@ -342,6 +466,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
+- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/status`) over the same commands.
 
 Both the web UI and CLI share the same service layer, so all operations behave identically regardless of interface.
 
@@ -366,6 +491,18 @@ sudo dnf install unrar
 # macOS
 brew install unrar
 ```
+
+## Testing beta builds
+
+The `beta` branch carries new work that is usable but lightly tested. It is always ahead of `main`, and behavior can change between beta points. Testing so far is single-machine (Linux Mint/Cinnamon with Firefox); the current beta (v0.3.0-beta.1) adds the native `nxm://` click-through handler described above.
+
+Install or switch to the beta channel:
+
+```bash
+uv tool install "nexus-collection-dl @ git+https://github.com/scottmccarrison/nexus-collection-dl@beta"
+```
+
+Report what you find in [Discussion #62: Beta testing program: v0.3.0-beta.1](https://github.com/scottmccarrison/nexus-collection-dl/discussions/62) (pinned). Include the redacted lines from `~/.local/state/nexus-dl/nxm.log`; they contain no credentials.
 
 ## License
 

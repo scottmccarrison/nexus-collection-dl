@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +20,12 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from .api import NexusAPI, NexusAPIError
+from .api import (
+    NexusAPI,
+    NexusAPIError,
+    redact_secret_values,
+    suppress_http_debug_logging,
+)
 
 # Seconds: (connect timeout, per-read timeout) for download requests.
 CONNECT_TIMEOUT = 15
@@ -32,6 +38,28 @@ _URL_RE = re.compile(r"https?://\S+")
 class DownloadError(Exception):
     """Raised when a download fails."""
 
+
+
+@dataclass
+class SignedLink:
+    """Website-issued download credentials for a single file.
+
+    Transient by design: the pair is handed straight to the API request
+    and is never persisted in state files, task records, results, or
+    logs. repr/str hide the values so a stray debug print or exception
+    context cannot leak them.
+    """
+
+    key: str
+    expires: int
+
+    def __repr__(self) -> str:
+        return "SignedLink(key='[redacted]', expires=[redacted])"
+
+    @property
+    def secret_values(self) -> tuple:
+        """Literal values to redact from any error text."""
+        return (self.key, self.expires)
 
 
 def validate_download_filename(filename: Any) -> str:
@@ -66,12 +94,14 @@ def _sanitize_message(text: str) -> str:
     return _URL_RE.sub("[url redacted]", text)
 
 
-def _safe_error(exc: Exception) -> str:
+def _safe_error(exc: Exception, secrets: tuple = ()) -> str:
     """Describe a download failure without exposing the signed download URL.
 
     requests exceptions embed the request URL in their text; download URLs
     carry premium credentials, so only error categories and status codes are
-    reported, and any residual URL-looking text is redacted.
+    reported, and any residual URL-looking text is redacted. Known
+    credential values (an nxm:// key/expires pair) are redacted literally
+    in case an exception carries them outside a URL.
     """
     if isinstance(exc, requests.Timeout):
         return "request timed out"
@@ -83,7 +113,7 @@ def _safe_error(exc: Exception) -> str:
         return "connection error"
     if isinstance(exc, requests.RequestException):
         return f"network error ({type(exc).__name__})"
-    return _sanitize_message(f"{type(exc).__name__}: {exc}")
+    return redact_secret_values(f"{type(exc).__name__}: {exc}", secrets)
 
 
 def _expected_size(mod_info: dict[str, Any]) -> int | None:
@@ -131,6 +161,8 @@ class Downloader:
         progress: Progress | None = None,
         task_id: TaskID | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        signed: SignedLink | None = None,
+        no_clobber: bool = False,
     ) -> Path:
         """
         Download a mod file to a temporary location, verify it, and publish
@@ -148,11 +180,26 @@ class Downloader:
           - the final file is published with an atomic same-directory rename,
             so an existing final file is never clobbered by a failed or
             corrupt download,
-          - error messages never include the signed download URL.
+          - with ``no_clobber=True`` the publish additionally refuses to
+            replace ANY existing destination entry (including a dangling
+            symlink or a file created concurrently after the caller's
+            precheck): publication is an atomic hard link from the
+            verified temp file, which fails if the destination exists; a
+            filesystem without hard-link support is a clean failure with
+            nothing written, never a partially visible copy,
+          - error messages never include the signed download URL, and any
+            ``signed`` nxm:// credential pair is redacted from every error
+            path and kept out of DEBUG HTTP logs.
 
         Args:
             on_progress: Optional callback(bytes_downloaded, total_bytes) for
                          generic progress reporting (used by web UI / service layer).
+            signed: Optional website-issued key/expires pair (free-account
+                    nxm:// links). Transient: forwarded to the download-link
+                    request only, never persisted.
+            no_clobber: Refuse to replace an existing destination instead of
+                        atomically overwriting it (nxm:// flows, which never
+                        replace any existing destination entry).
 
         Returns path to the downloaded file.
         """
@@ -161,13 +208,22 @@ class Downloader:
         filename = validate_download_filename(mod_info.get("filename"))
         expected_size = _expected_size(mod_info)
         expected_md5 = _expected_md5(mod_info)
+        secrets: tuple = signed.secret_values if signed is not None else ()
 
-        # Get download URL from API
+        # Get download URL from API. Extra kwargs are only passed when a
+        # signed pair exists, so unsigned callers keep the plain signature.
         try:
-            download_url = self.api.get_download_url(game_domain, mod_id, file_id)
+            if signed is not None:
+                download_url = self.api.get_download_url(
+                    game_domain, mod_id, file_id,
+                    key=signed.key, expires=signed.expires,
+                )
+            else:
+                download_url = self.api.get_download_url(game_domain, mod_id, file_id)
         except NexusAPIError as e:
             raise DownloadError(
-                f"Failed to get download URL for {filename}: {_sanitize_message(str(e))}"
+                f"Failed to get download URL for {filename}: "
+                f"{redact_secret_values(str(e), secrets)}"
             )
         if not download_url:
             raise DownloadError(f"API returned no download URL for {filename}")
@@ -183,37 +239,40 @@ class Downloader:
         temp_path = Path(tmp_name)
 
         try:
-            response = self.session.get(
-                download_url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-            )
-            try:
-                response.raise_for_status()
-
-                header_length = response.headers.get("content-length")
+            # DEBUG HTTP logging is suppressed for the signed CDN request:
+            # urllib3 would otherwise log the URL (with its token query).
+            with suppress_http_debug_logging():
+                response = self.session.get(
+                    download_url, stream=True, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                )
                 try:
-                    total_size = int(header_length) if header_length else 0
-                except ValueError:
-                    total_size = 0
+                    response.raise_for_status()
 
-                if progress and task_id is not None:
-                    progress.update(task_id, total=total_size)
+                    header_length = response.headers.get("content-length")
+                    try:
+                        total_size = int(header_length) if header_length else 0
+                    except ValueError:
+                        total_size = 0
 
-                hasher = hashlib.md5()
-                bytes_downloaded = 0
-                with open(temp_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            hasher.update(chunk)
-                            bytes_downloaded += len(chunk)
-                            if progress and task_id is not None:
-                                progress.update(task_id, advance=len(chunk))
-                            if on_progress:
-                                on_progress(bytes_downloaded, total_size)
-                    f.flush()
-                    os.fsync(f.fileno())
-            finally:
-                response.close()
+                    if progress and task_id is not None:
+                        progress.update(task_id, total=total_size)
+
+                    hasher = hashlib.md5()
+                    bytes_downloaded = 0
+                    with open(temp_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                hasher.update(chunk)
+                                bytes_downloaded += len(chunk)
+                                if progress and task_id is not None:
+                                    progress.update(task_id, advance=len(chunk))
+                                if on_progress:
+                                    on_progress(bytes_downloaded, total_size)
+                        f.flush()
+                        os.fsync(f.fileno())
+                finally:
+                    response.close()
 
             # Verify against trusted metadata before publishing. Failures
             # leave any existing final file untouched.
@@ -234,13 +293,47 @@ class Downloader:
 
             # Atomic publish: replaces the final file only now that the
             # payload is fully downloaded and verified.
-            os.replace(temp_path, final_path)
+            if no_clobber:
+                # No-replace publish: a hard link fails with FileExistsError
+                # if ANY directory entry exists at the destination (regular
+                # file, symlink, even a dangling one), including one created
+                # concurrently after the caller's precheck. os.rename/replace
+                # would silently overwrite it, so it is not used here. There
+                # is deliberately no streamed-copy fallback: an O_EXCL copy
+                # would make a partially written file visible at the final
+                # path and could leave debris on failure, so a filesystem
+                # without hard-link support is a clean, actionable failure
+                # instead. The verified payload stays in the temp file and
+                # the finally block removes it; existing files are never
+                # touched.
+                try:
+                    os.link(temp_path, final_path)
+                except FileExistsError:
+                    raise DownloadError(
+                        f"{filename}: refusing to overwrite an existing "
+                        "file at the destination; nothing was replaced and "
+                        "the temporary download was removed. Remove the "
+                        "file and retry, or use 'nexus-dl nxm --output' to "
+                        "save this download elsewhere."
+                    )
+                except OSError as e:
+                    raise DownloadError(
+                        f"{filename}: this filesystem does not support the "
+                        "safe no-overwrite publication this download "
+                        f"requires ({type(e).__name__}). Nothing was "
+                        "written; use a normal local filesystem for the "
+                        "target directory."
+                    )
+            else:
+                os.replace(temp_path, final_path)
             return final_path
 
         except DownloadError:
             raise
         except Exception as e:
-            raise DownloadError(f"Failed to download {filename}: {_safe_error(e)}")
+            raise DownloadError(
+                f"Failed to download {filename}: {_safe_error(e, secrets)}"
+            )
         finally:
             # Always drop the temp file: after a successful publish it no
             # longer exists, and on any failure (including Ctrl+C) no partial

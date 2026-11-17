@@ -207,6 +207,30 @@ def test_sync_all_optional_skipped_persists_state(svc, tmp_path):
     assert state.game_domain == DOMAIN
 
 
+def test_sync_target_dir_updates_the_resolved_directory(svc, tmp_path):
+    """Regression: sync with an explicit target_dir must update exactly
+    that directory (the shell's resolved collection), never a directory
+    derived from the API's collection name. A renamed directory or a
+    root-as-collection layout used to silently sync elsewhere."""
+    renamed = tmp_path / "Renamed Dir"  # deliberately not the API name
+    renamed.mkdir()
+    mods = [{"mod_id": 1, "file_id": 2, "mod_name": "M",
+             "version": "1.0", "filename": "m.zip", "optional": False}]
+    svc._api = FakeNexusAPI(is_premium=False, collection=_collection_data(mods))
+
+    result = svc.sync(
+        COLLECTION_URL, tmp_path, no_load_order=True, target_dir=renamed
+    )
+
+    assert result.collection_dir == renamed
+    state = CollectionState(renamed)
+    assert state.exists()
+    state.load()
+    assert 2 in state.mods  # the mod landed in the resolved directory
+    # The name-derived directory was never created.
+    assert not (tmp_path / "Test Collection").exists()
+
+
 def test_sync_first_run_prefetches_manifest_for_md5(svc, tmp_path, monkeypatch):
     """First sync fetches the manifest once before downloading so integrity
     checks have MD5s from the very first file, and caches it in state."""
@@ -310,3 +334,57 @@ def test_cli_pending_instructions_point_at_collection_dir(tmp_path, monkeypatch)
     assert f"nexus-dl import {collection_dir}" in result.output
     # The parent mods dir alone must never be the instructed target
     assert f"nexus-dl import {mods}\n" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Round B: tombstone filtering in get_status, target_dir on premium sync
+# ---------------------------------------------------------------------------
+
+def test_get_status_filters_tombstoned_mods(svc, tmp_path):
+    """A removed mod page must never appear as installable in get_status
+    (which also feeds `update --dry-run`)."""
+    state = _state(tmp_path)
+    state.mark_removed(1, "Gone")
+    state.save()
+    mods = [
+        {"mod_id": 1, "file_id": 2, "mod_name": "Gone", "version": "1.0",
+         "filename": "g.zip", "optional": False},
+        {"mod_id": 3, "file_id": 4, "mod_name": "Stays", "version": "1.0",
+         "filename": "s.zip", "optional": False},
+    ]
+    svc._api = FakeNexusAPI(is_premium=False, collection=_collection_data(mods))
+
+    result = svc.get_status(tmp_path)
+
+    names = [m.name for m in result.mods]
+    assert "Gone" not in names          # tombstoned: never installable
+    assert "Stays" in names             # still compared normally
+    assert result.removed_skipped == 1  # the skipped count is surfaced
+
+
+def test_sync_target_dir_honored_on_the_premium_path(svc, tmp_path, monkeypatch):
+    renamed = tmp_path / "Renamed Dir"
+    renamed.mkdir()
+    mods = [{"mod_id": 1, "file_id": 2, "mod_name": "M", "version": "1.0",
+             "filename": "m.zip", "size_bytes": 10, "optional": False}]
+    svc._api = FakeNexusAPI(is_premium=True, collection=_collection_data(mods))
+
+    captured = {}
+
+    def fake_download_mods(self, game_domain, mods, target_dir,
+                           on_complete=None, on_progress=None):
+        captured["target_dir"] = target_dir
+        return []
+
+    monkeypatch.setattr(
+        service_module.Downloader, "download_mods", fake_download_mods
+    )
+
+    result = svc.sync(
+        COLLECTION_URL, tmp_path,
+        no_load_order=True, no_extract=True, target_dir=renamed,
+    )
+
+    assert result.collection_dir == renamed
+    assert captured["target_dir"] == renamed
+    assert not (tmp_path / "Test Collection").exists()

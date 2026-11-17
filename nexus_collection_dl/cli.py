@@ -5,24 +5,67 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
 from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
+from .downloader import DownloadError
+from .handler import (
+    DESKTOP_ENTRY_NAME,
+    DesktopInstaller,
+    HandlerError,
+    NxmRoutingError,
+    add_mapping,
+    append_nxm_log,
+    capability_warnings,
+    notification_daemon_available,
+    nxm_log_path,
+    remove_mapping,
+    sanitize_message,
+)
+from .handler import (
+    notify as handler_notify,
+)
+from .keystore import (
+    KeyStoreError,
+    api_key_path,
+    remove_api_key,
+    resolve_api_key,
+    store_api_key,
+)
+from .nxm import NxmCollectionLinkError, NxmParseError
+from .redaction import (
+    MIN_REDACT_SECRET_LEN,
+    boundary_redact,
+    merge_secrets,
+    uri_query_secrets,
+)
 from .service import ModManagerService, PendingDownload
 from .state import StateError
 from .version_check import check_for_update
 
 console = Console()
 
+# Subcommands invoked by the desktop handler (nxm:// clicks) or used to
+# configure it: they must stay non-interactive and quiet - no banner, no
+# update check, no prompts - so a browser-launched process terminates with
+# useful output and failure codes instead of hanging on a prompt. The
+# interactive shell is quiet too: its own greeting replaces the banner and
+# an update prompt would fight the REPL for input.
+_QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
+
 
 @click.group()
 @click.option(
     "--api-key",
     envvar="NEXUS_API_KEY",
-    help="Nexus Mods API key (or set NEXUS_API_KEY env var)",
+    help=(
+        "Nexus Mods API key. Falls back to NEXUS_API_KEY, then to the "
+        "key stored with 'nexus-dl handler set-api-key'."
+    ),
 )
 @click.option(
     "--free",
@@ -39,18 +82,52 @@ console = Console()
 @click.pass_context
 def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check: bool) -> None:
     """Download mod collections from Nexus Mods."""
-    update_msg = check_for_update()
-    if update_msg:
-        console.print(f"[yellow]{update_msg}[/yellow]")
-    else:
-        console.print(f"[dim]nexus-dl v{__version__}[/dim]")
+    quiet = ctx.invoked_subcommand in _QUIET_SUBCOMMANDS
+    if not quiet:
+        update_msg = check_for_update()
+        if update_msg:
+            console.print(f"[yellow]{update_msg}[/yellow]")
+        else:
+            console.print(f"[dim]nexus-dl v{__version__}[/dim]")
+
+    # Key resolution precedence lives in keystore.resolve_api_key:
+    # explicit flag > NEXUS_API_KEY env > stored key. The option's
+    # envvar wiring hides where the value came from, so click's
+    # parameter source distinguishes the flag from the environment and
+    # the resolver re-reads the environment itself. Desktop-launched
+    # nxm:// clicks have no shell environment; the stored key is what
+    # authenticates them.
+    explicit = (
+        api_key
+        if ctx.get_parameter_source("api_key") is click.ParameterSource.COMMANDLINE
+        else None
+    )
+    try:
+        resolved_key, key_source = resolve_api_key(explicit)
+    except KeyStoreError as e:
+        # A broken key store must not break every command: warn and
+        # continue keyless. 'handler remove-api-key' can still clean up.
+        console.print(f"[yellow]Warning:[/yellow] {escape(str(e))}")
+        resolved_key, key_source = None, None
 
     ctx.ensure_object(dict)
-    ctx.obj["api_key"] = api_key
+    ctx.obj["api_key"] = resolved_key
+    ctx.obj["api_key_source"] = key_source
     ctx.obj["force_free"] = free
-    ctx.obj["service"] = ModManagerService(api_key, force_free=free)
+    if ctx.invoked_subcommand == "nxm":
+        # Deferred construction: the nxm command builds the service inside
+        # its own guarded flow, so a construction-time failure also writes
+        # the redacted nxm status-log line and desktop notification
+        # instead of escaping this callback as a raw traceback with no
+        # visible outcome. Every other command keeps the eager behavior.
+        ctx.obj["service"] = None
+        ctx.obj["service_factory"] = lambda: ModManagerService(
+            resolved_key, force_free=free
+        )
+    else:
+        ctx.obj["service"] = ModManagerService(resolved_key, force_free=free)
 
-    if not skip_update_check:
+    if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
         check_and_prompt_update(console)
 
@@ -647,6 +724,537 @@ def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
     if force_free:
         console.print("[yellow]Free-user mode forced[/yellow]")
     create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
+
+
+@main.command(name="shell")
+@click.argument(
+    "root_dir",
+    metavar="ROOT_DIR",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.pass_context
+def shell_cmd(ctx: click.Context, root_dir: Path | None) -> None:
+    """
+    Open an interactive shell over the service layer.
+
+    ROOT_DIR: Directory holding the collections to browse (default: the
+    current directory). Type /help inside for the command list.
+    """
+    from .shell import run_shell
+
+    svc = ctx.obj["service"]
+    root = root_dir if root_dir is not None else Path.cwd()
+    sys.exit(run_shell(svc, root, console=console))
+
+
+def _notify_body(text: str) -> str:
+    """First line of a URL-sanitized message, safe for a desktop popup."""
+    cleaned = sanitize_message(str(text)).strip()
+    first = cleaned.splitlines()[0] if cleaned else ""
+    return first[:200] or "See the terminal output for details."
+
+
+# Static reason codes for the nxm status log. Deliberately fixed
+# strings, never exception text: a log line must not carry free-form
+# message content that could hold a reflected URL or credential.
+# Order matters: subclasses are checked before their base classes.
+_NXM_REASON_BY_TYPE = (
+    (NxmCollectionLinkError, "collection_link"),
+    (NxmParseError, "parse"),
+    (NxmRoutingError, "routing"),
+    (HandlerError, "handler"),
+    (NexusAPIError, "api"),
+    (DownloadError, "download"),
+    (StateError, "state"),
+)
+
+
+def _nxm_reason(exc: BaseException) -> str:
+    """Map an exception to its static nxm-log reason code."""
+    for cls, code in _NXM_REASON_BY_TYPE:
+        if isinstance(exc, cls):
+            return code
+    return "error"
+
+
+def _nxm_ids(result) -> str:
+    """Safe 'mod=N file=N ' prefix for a log line ('' when unknown)."""
+    if result.mod_id is not None and result.file_id is not None:
+        return f"mod={result.mod_id} file={result.file_id} "
+    return ""
+
+
+def _log_nxm(outcome: str, detail: str = "") -> None:
+    """Record one status line in the nxm log; must never fail the command."""
+    try:
+        append_nxm_log(outcome, detail)
+    except Exception:  # noqa: S110 - best-effort logging: a broken log must never break nxm
+        pass
+
+
+def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
+    """Literal secrets to redact from text leaving the nxm error boundary.
+
+    Thin wrapper over redaction.merge_secrets/uri_query_secrets so the
+    nxm boundary and the interactive shell share ONE redaction helper
+    (see redaction.py for the query-extraction rules; they mirror the
+    nxm parser's acceptance rules rather than parse_qs).
+    """
+    api_key = (ctx.obj or {}).get("api_key")
+    return merge_secrets(
+        [api_key] if api_key else [],
+        uri_query_secrets(uri),
+    )
+
+
+# Floor for bare-literal prose replacement at typed-error boundaries;
+# the rationale lives at redaction.MIN_REDACT_SECRET_LEN.
+_MIN_REDACT_SECRET_LEN = MIN_REDACT_SECRET_LEN
+
+
+def _boundary_redact(
+    ctx: click.Context,
+    uri: str,
+    text: str,
+    strip_uris: bool = True,
+    min_secret_len: int = 0,
+) -> str:
+    """Full redaction scope for text leaving through the nxm boundary.
+
+    Thin wrapper over redaction.boundary_redact binding the secret scope
+    for one request (API key plus the link's query credentials).
+    """
+    return boundary_redact(
+        text,
+        _boundary_secrets(ctx, uri),
+        strip_uris=strip_uris,
+        min_secret_len=min_secret_len,
+    )
+
+
+@main.command()
+@click.argument("uri", metavar="NXM_URI")
+@click.option(
+    "--mods-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Collection directory to download into (overrides the game mapping)",
+)
+@click.option(
+    "--output",
+    "output_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Save the verified archive to this directory without touching any collection",
+)
+@click.option("--no-extract", is_flag=True, help="Keep the downloaded archive without extracting")
+@click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
+@click.option(
+    "--notify/--no-notify",
+    default=None,
+    help="Desktop notification (default: only when not attached to a terminal)",
+)
+@click.pass_context
+def nxm(
+    ctx: click.Context,
+    uri: str,
+    mods_dir: Path | None,
+    output_dir: Path | None,
+    no_extract: bool,
+    no_load_order: bool,
+    notify: bool | None,
+) -> None:
+    """
+    Handle an nxm:// download link from the Nexus website.
+
+    NXM_URI: link from 'Mod manager download', usually passed automatically
+    by the desktop handler installed with 'nexus-dl handler install'.
+    Link credentials are used for the request only and are never stored.
+    """
+    # Notification policy: an explicit --notify/--no-notify flag wins;
+    # otherwise notify unless stdout is a terminal, so a paste-run in a
+    # terminal prints inline instead of popping up. The desktop-handler
+    # path is deterministic regardless of stdout: its Exec line passes
+    # --notify and the entry runs headless (Terminal=false), so every
+    # launched outcome notifies. Do NOT infer "no terminal" from the
+    # launch context: the old Terminal=true entry made a launched run's
+    # stdout a TTY, and the default then suppressed the very
+    # notification the click needed (disproven by live smoke testing).
+    want_notify = notify if notify is not None else (not sys.stdout.isatty())
+
+    if mods_dir is not None and output_dir is not None:
+        console.print("[red]Error:[/red] --mods-dir and --output cannot be combined.")
+        _log_nxm("error", "reason=usage")
+        if want_notify:
+            handler_notify(
+                "nexus-dl: download failed",
+                "--mods-dir and --output cannot be combined.",
+            )
+        sys.exit(1)
+
+    def fail(message: str) -> None:
+        # escape(): messages may contain bracketed text (e.g. "[redacted]")
+        # that must print literally instead of being parsed as rich markup.
+        console.print(f"[red]Error:[/red] {escape(message)}")
+        if want_notify:
+            handler_notify("nexus-dl: download failed", _notify_body(message))
+        sys.exit(1)
+
+    def redacted(value: object) -> str:
+        # Result fields and progress messages are untrusted display
+        # data, not pre-redacted text: a hostile or compromised endpoint
+        # can reflect the API key or the link's key/expires values into
+        # file names, mod names, warnings, error text, or progress
+        # lines (the same scope the exception branches above redact
+        # against). Same boundary scope and short-secret floor as those
+        # branches; the notify path adds URI stripping on top via
+        # _notify_body.
+        return _boundary_redact(ctx, uri, str(value), strip_uris=False,
+                                min_secret_len=_MIN_REDACT_SECRET_LEN)
+
+    def safe_progress(event: str, pct: float, msg: str) -> None:
+        # Progress lines print BEFORE the result block and echo
+        # endpoint-controlled names ("Downloading {filename}",
+        # "Downloaded {mod_name}", "Saved {filename}", "Extracted
+        # {name}"), so they get the same boundary redaction scope.
+        # escape() for the same bracketed-text reason as fail(). The
+        # event=="download" suppression inside _cli_progress is
+        # unchanged.
+        _cli_progress(event, pct, escape(redacted(msg)))
+
+    try:
+        # The group callback defers service construction for this command
+        # so a construction failure lands in the guarded handlers below.
+        svc = ctx.obj["service"]
+        if svc is None:
+            svc = ctx.obj["service_factory"]()
+        result = svc.add_nxm(
+            uri,
+            mods_dir=mods_dir,
+            output_dir=output_dir,
+            no_load_order=no_load_order,
+            no_extract=no_extract,
+            on_progress=safe_progress,
+        )
+    except NxmCollectionLinkError as e:
+        # Recognized collection shape: helpful guidance, no unsafe URL.
+        console.print(f"[yellow]{escape(str(e))}[/yellow]")
+        _log_nxm("error", "reason=collection_link")
+        if want_notify:
+            handler_notify(
+                "nexus-dl: collection link",
+                "Collection nxm:// links are not supported. Use nexus-dl sync with the collection URL.",
+            )
+        sys.exit(1)
+    except (NxmParseError, NxmRoutingError, HandlerError) as e:
+        _log_nxm("error", f"reason={_nxm_reason(e)}")
+        # Typed errors are redacted at the source, but a reflected
+        # credential in any case/encoding variant is caught here too.
+        # Short values stay out of scope so deliberate guidance prose
+        # (which may contain those letters) is not mangled.
+        fail(_boundary_redact(ctx, uri, str(e), strip_uris=False,
+                              min_secret_len=_MIN_REDACT_SECRET_LEN))
+    except (NexusAPIError, DownloadError, StateError) as e:
+        _log_nxm("error", f"reason={_nxm_reason(e)}")
+        fail(_boundary_redact(ctx, uri, str(e), strip_uris=False,
+                              min_secret_len=_MIN_REDACT_SECRET_LEN))
+    except Exception as e:
+        # Outer boundary: any failure not matched above (including the
+        # deferred service construction) still leaves one redacted status
+        # line and the notification instead of an invisible traceback.
+        # The log carries a static reason code only. Free-form text gets
+        # the full scope: literal secrets in every case/encoding variant,
+        # then URL/URI stripping covering ANY scheme with a query and
+        # nxm:// with or without one.
+        _log_nxm("error", "reason=error")
+        detail = _boundary_redact(ctx, uri, str(e)).strip()
+        fail(detail or f"Unexpected failure ({type(e).__name__}).")
+
+    # Every user-visible piece of a result-based outcome goes through
+    # boundary redaction before display or notification, the same
+    # scope safe_progress applied to the progress lines above; only the
+    # raw numeric ids and fixed status tokens are printed as-is.
+    error_text = redacted(result.error)
+    mod_name = redacted(result.mod_name)
+    filename = redacted(result.filename)
+
+    if not result.success:
+        reason = "re_click_required" if result.re_click_required else "rejected"
+        _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
+        if result.error:
+            console.print(f"[red]Error:[/red] {escape(error_text)}")
+        if result.re_click_required:
+            console.print(
+                "[yellow]Click 'Mod manager download' on the Nexus website "
+                "again, then retry.[/yellow]"
+            )
+        if want_notify:
+            handler_notify("nexus-dl: download failed", _notify_body(error_text))
+        sys.exit(1)
+
+    if result.status == "already_downloaded":
+        console.print(
+            f"[green]'{escape(mod_name)}' (file {result.file_id}) is already "
+            f"downloaded in this collection.[/green]"
+        )
+        summary = f"Already downloaded: {mod_name}"
+    elif result.status == "extracted_from_archive":
+        console.print(
+            f"[green]Finished '{escape(mod_name)}' (file "
+            f"{result.file_id}) by extracting the retained archive; no "
+            "download was needed.[/green]"
+        )
+        summary = f"Extracted {mod_name} from the retained archive"
+    elif result.status == "saved_to_output":
+        console.print(f"[green]Saved {escape(redacted(result.output_path))}[/green]")
+        summary = f"Saved {filename}"
+    else:
+        where = (
+            f" into {escape(redacted(result.collection_dir))}"
+            if result.collection_dir else ""
+        )
+        console.print(
+            f"[green]Downloaded '{escape(mod_name)}'{where}.[/green]"
+        )
+        if result.extracted:
+            console.print(
+                "[dim]Archive extracted. Run 'nexus-dl deploy' when ready; "
+                "nothing was deployed automatically.[/dim]"
+            )
+        summary = f"Downloaded {mod_name}"
+    # Non-fatal follow-up failures on a completed download (e.g. load
+    # order): truthful warnings, still a success exit.
+    for warning in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(redacted(warning))}")
+    # One status line for the after-the-fact trail: ids and the fixed
+    # status token only, never names, URIs, or credentials.
+    _log_nxm(
+        "warn" if result.warnings else "success",
+        f"{_nxm_ids(result)}status={result.status}",
+    )
+    if want_notify:
+        handler_notify("nexus-dl: download complete", summary)
+
+
+@main.group(name="handler")
+def handler_group():
+    """Configure nxm:// link handling (game mappings and desktop registration)."""
+
+
+@handler_group.command(name="map")
+@click.argument("game")
+@click.argument(
+    "collection_dir",
+    metavar="COLLECTION_DIR",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+def handler_map(game: str, collection_dir: Path) -> None:
+    """Map GAME to a synced COLLECTION_DIR for nxm:// downloads."""
+    try:
+        add_mapping(game, collection_dir)
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(
+        f"[green]Mapped '{escape(game.strip().lower())}' to "
+        f"{escape(str(collection_dir))}[/green]"
+    )
+
+
+@handler_group.command(name="unmap")
+@click.argument("game")
+def handler_unmap(game: str) -> None:
+    """Remove all mappings for GAME."""
+    try:
+        removed = remove_mapping(game)
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if removed:
+        console.print(f"[green]Removed mapping for '{escape(game.strip().lower())}'.[/green]")
+    else:
+        console.print(f"[yellow]No mapping exists for '{escape(game.strip().lower())}'.[/yellow]")
+
+
+@handler_group.command(name="set-api-key")
+def handler_set_api_key() -> None:
+    """Store the Nexus API key for browser-launched downloads.
+
+    The key is read from hidden input (never a command-line argument,
+    never echoed) and stored with owner-only permissions, so nxm://
+    clicks authenticate even though desktop-launched processes cannot
+    see NEXUS_API_KEY from your shell startup files.
+    """
+    # Hidden prompt: the value never appears on screen, in argv, or in
+    # shell history. click re-prompts on empty input and aborts on EOF.
+    key = click.prompt("Nexus API key", hide_input=True)
+    try:
+        path = store_api_key(key)
+    except KeyStoreError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]API key stored in {escape(str(path))} (0600).[/green]")
+    console.print(
+        "[dim]'Mod manager download' clicks now authenticate with this "
+        "key. 'nexus-dl handler status' shows the active key source; "
+        "'nexus-dl handler remove-api-key' deletes it.[/dim]"
+    )
+
+
+@handler_group.command(name="remove-api-key")
+def handler_remove_api_key() -> None:
+    """Delete the stored API key.
+
+    Removes only the key file; game mappings and the desktop handler
+    record are left untouched.
+    """
+    try:
+        removed = remove_api_key()
+    except KeyStoreError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    if removed:
+        console.print(
+            f"[green]Removed the stored API key from "
+            f"{escape(str(api_key_path()))}.[/green]"
+        )
+    else:
+        console.print("[yellow]No stored API key to remove.[/yellow]")
+
+
+@handler_group.command(name="status")
+@click.pass_context
+def handler_status(ctx: click.Context) -> None:
+    """Show game mappings and desktop handler status."""
+    try:
+        info = DesktopInstaller().status()
+    except HandlerError as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+
+    if info["mappings"]:
+        table = Table(title="Game mappings")
+        table.add_column("Game", style="cyan")
+        table.add_column("Collection directory", style="green")
+        for game, dirs in sorted(info["mappings"].items()):
+            for directory in dirs:
+                table.add_row(game, directory)
+        console.print(table)
+    else:
+        console.print(
+            "No game mappings configured. Add one with:\n"
+            "  nexus-dl handler map GAME COLLECTION_DIR"
+        )
+
+    if info["entry_installed"]:
+        console.print(
+            f"[bold]Desktop entry:[/bold] {escape(str(info['entry_path']))} "
+            "[green](installed)[/green]"
+        )
+    else:
+        console.print(
+            f"[bold]Desktop entry:[/bold] not installed "
+            f"({escape(str(info['entry_path']))}). "
+            "Install with 'nexus-dl handler install'."
+        )
+    if info["executable"]:
+        if info["executable_exists"]:
+            console.print(f"[bold]Executable:[/bold] {escape(str(info['executable']))}")
+        else:
+            console.print(
+                f"[bold]Executable:[/bold] [red]{escape(str(info['executable']))} no longer "
+                "exists[/red] - the virtualenv may have moved or been "
+                "recreated. Re-run 'nexus-dl handler install'."
+            )
+    if info["is_default"]:
+        console.print(f"[bold]Default nxm handler:[/bold] [green]{DESKTOP_ENTRY_NAME}[/green]")
+    elif info["current_default"]:
+        console.print(
+            f"[bold]Default nxm handler:[/bold] "
+            f"{escape(str(info['current_default']))} (not nexus-dl)"
+        )
+    elif info["xdg_mime_available"]:
+        console.print("[bold]Default nxm handler:[/bold] none")
+    else:
+        console.print(
+            "[bold]Default nxm handler:[/bold] unknown (xdg-mime not available)"
+        )
+    if info["previous_default"]:
+        console.print(
+            f"[dim]Previous default (restored on uninstall): "
+            f"{escape(str(info['previous_default']))}[/dim]"
+        )
+
+    # API key availability: source only, never the value. The main
+    # group callback resolved it once, so this reports exactly what the
+    # commands in this run will use.
+    source = (ctx.obj or {}).get("api_key_source")
+    if source == "flag":
+        console.print("[bold]API key:[/bold] available (from the --api-key flag)")
+    elif source == "env":
+        console.print("[bold]API key:[/bold] available (from NEXUS_API_KEY)")
+    elif source == "stored":
+        console.print(
+            f"[bold]API key:[/bold] available (stored: "
+            f"{escape(str(api_key_path()))})"
+        )
+    else:
+        console.print(
+            "[bold]API key:[/bold] not set - store one with 'nexus-dl handler "
+            "set-api-key' for click-through downloads, export NEXUS_API_KEY, "
+            "or pass --api-key"
+        )
+
+
+@handler_group.command(name="install")
+def handler_install() -> None:
+    """Install the user desktop entry so nxm:// links open nexus-dl.
+
+    User-level only (XDG applications dir); remembers the previous
+    default handler so uninstall can restore it. Re-running is
+    idempotent: the entry is always rewritten, so stale entries from
+    older versions are replaced.
+    """
+    # Capability probe (warnings only, never a refusal): the click flow
+    # needs xdg-mime to register, notify-send to report outcomes, and a
+    # desktop that actually displays notifications. Findings print
+    # before install so a degraded system sees them even when install
+    # then stops with an error. Desktop identity is never a gate.
+    for warning in capability_warnings():
+        console.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
+    try:
+        entry = DesktopInstaller().install()
+    except (HandlerError, OSError) as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]NXM handler installed: {escape(str(entry))}[/green]")
+    console.print(
+        "[dim]'Mod manager download' links on Nexus Mods now open nexus-dl. "
+        "Map each game first with 'nexus-dl handler map GAME COLLECTION_DIR'.[/dim]"
+    )
+    # Best-effort notification self-test: launched clicks run headless and
+    # report outcomes as notifications, so a session without a reachable
+    # daemon deserves a visible warning pointing at the log fallback. A
+    # missing probe tool skips silently and never fails the install.
+    if notification_daemon_available() is False:
+        console.print(
+            "[yellow]Warning:[/yellow] no notification daemon was detected "
+            "on this session, so click outcomes may not be visible as "
+            "notifications. Each click still appends a status line to "
+            f"{escape(str(nxm_log_path()))}; check that log after clicking."
+        )
+
+
+@handler_group.command(name="uninstall")
+def handler_uninstall() -> None:
+    """Remove the desktop entry; restores the previous default if ours."""
+    try:
+        message = DesktopInstaller().uninstall()
+    except (HandlerError, OSError) as e:
+        console.print(f"[red]Error:[/red] {escape(str(e))}")
+        sys.exit(1)
+    console.print(f"[green]{escape(message)}[/green]")
 
 
 if __name__ == "__main__":
