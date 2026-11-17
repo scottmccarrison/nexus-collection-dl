@@ -445,9 +445,11 @@ def test_suppress_contexts_serialize_across_threads_without_debug_leaks():
         assert not any(KEY in m or str(EXPIRES) in m for m in records)
         # Exact restoration once every context has exited
         assert logger.level == logging.DEBUG
-        # Suppression is scoped: outside contexts DEBUG flows again
+        # Suppression is scoped: outside contexts DEBUG flows again.
+        # This line deliberately logs a secret so the next assertion can
+        # prove it is NOT suppressed here. That is the property under test.
         records.clear()
-        logger.debug(secret_line)
+        logger.debug(secret_line)  # lgtm[py/clear-text-logging-sensitive-information]
         assert any(KEY in m for m in records)
     finally:
         logger.removeHandler(handler)

@@ -126,7 +126,13 @@ def download_and_parse_manifest(
             with open(bundle_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
-                        f.write(chunk)
+                        # Not a secret. CodeQL propagates the signed bundle
+                        # URL's taint into the response body, so writing the
+                        # downloaded archive looks like storing a credential
+                        # in clear text. The archive is the payload, not the
+                        # URL, and it lands in a private TemporaryDirectory
+                        # that is removed on exit.
+                        f.write(chunk)  # lgtm[py/clear-text-storage-sensitive-information]
         except requests.RequestException as e:
             raise ManifestError(
                 f"manifest download failed: {_transport_reason(e)}"
