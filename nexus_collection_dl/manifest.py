@@ -132,7 +132,6 @@ def download_and_parse_manifest(
                         # in clear text. The archive is the payload, not the
                         # URL, and it lands in a private TemporaryDirectory
                         # that is removed on exit.
-                        # codeql[py/clear-text-storage-sensitive-information]
                         f.write(chunk)
         except requests.RequestException as e:
             raise ManifestError(
