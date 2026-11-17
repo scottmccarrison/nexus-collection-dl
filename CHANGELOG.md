@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-16
+
+### Fixed
+
+- LOOT plugin sorting never worked and now does. `sort_plugins_with_loot` called `loot.create_game_handle()`, `Database.load_lists()` and `Database.sort_plugins()`, none of which current libloot exposes, and derived `GameType` member names from display names, so Skyrim Special Edition looked up `SkyrimSpecialEdition` rather than `SkyrimSE` and returned the collection order before making any call at all. Every path fell back to the collection author's plugin order, so a deploy with libloot installed was indistinguishable from one without it. Sorting now drives `loot.Game`, `Database.load_masterlist`, `Game.load_plugins` and `Game.sort_plugins`, and `LOOT_GAME_MAP` names the exact enum members
+- libloot wheels were not being built or attached to releases. The workflow failed on `v0.2.1`, `v0.3.0-beta.1` and `v0.3.0-beta.2`, each time for a different reason: the manylinux build image has no `apt-get` and its CentOS 7 mirrors are gone; `rustup` in that image configures no default toolchain so `cargo` refuses to run; `maturin` wrote wheels to the Cargo workspace root rather than the crate's `target/` and, with no `-i`, built only for the image's Python 3.9; JavaScript actions (artifact and release upload) run inside the job container and need glibc 2.28 which that image does not have; `GITHUB_TOKEN` lacked `contents: write`, which GitHub reports as `Test artifacts are not permitted here. (HTTP 422)`; and the image's entrypoint is `maturin`, so `docker run ... bash` ran `maturin bash`. Releases now carry cp310-cp313 manylinux wheels
+- `typing_extensions` is a declared dependency. It was previously only present transitively, so `pip install` on Python 3.11 and later could fail at import while `uv run` looked fine
+
+### Changed
+
+- Web UI HTTP error responses return a fixed category string instead of the exception message: `another operation is already running for this collection`, `collection state is not usable`, `the collection manifest could not be parsed`, `the Nexus API rejected the request`, or `internal error`. Exception text is no longer reflected into `{"error": ...}` payloads. Task result payloads can still carry error strings collected while a deploy ran, and the CLI remains the diagnostic surface
+- A busy collection reports `another operation is already running for this collection` instead of being folded into the general unusable-state error
+- Enderal and Enderal SE are called out as not LOOT-sortable. libloot has no `GameType` for either, so both take the collection author's plugin order; they remain supported for `plugins.txt` otherwise
+
+### Removed
+
+- The `loot` optional dependency extra. `pip install nexus-dl[loot]` resolved to `loot`, an unrelated 2014 GitHub CLI helper; the libloot bindings are not published to PyPI at all, so the extra installed the wrong package into a venv meant to sort plugins. Install the bindings with `setup.sh` (builds from source) or a wheel from a release
+
+### Security
+
+- All 7 open Dependabot advisories are closed by bumping five locked dependencies: certifi 2026.7.22 to 2026.10.23, brotli 1.2.0 to 1.2.1, brotlicffi 1.2.0.2 to 1.2.1.0, urllib3 2.7.0 to 2.8.0, and Werkzeug 3.1.8 to 3.1.9. urllib3 accounts for three of the seven
+
+### Added
+
+- ruff and mypy run in CI alongside the Python 3.10-3.13 test matrix, and pull requests get a template
+- README gains a "Stable vs beta" section describing the two release channels
+
 ## [0.2.1] - 2026-10-29
 
 ### Added

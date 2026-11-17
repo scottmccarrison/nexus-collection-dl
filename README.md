@@ -315,7 +315,7 @@ In addition to `load-order.txt`, Bethesda collections also get:
 
 When libloot is available, LOOT-sorted order takes priority over collection metadata. Enabled/disabled status from the collection is preserved either way.
 
-Supported Bethesda games: Starfield, Skyrim SE, Skyrim, Fallout 4, Fallout NV, Fallout 3, Oblivion, Morrowind, Enderal, plus VR variants.
+Supported Bethesda games: Starfield, Skyrim SE, Skyrim, Fallout 4, Fallout NV, Fallout 3, Oblivion, Morrowind, Enderal, plus VR variants. Enderal and Enderal SE are not LOOT-sorted (libloot has no game type for them), so their `plugins.txt` uses the collection author's order.
 
 ### LOOT integration
 
