@@ -207,6 +207,10 @@ Failure envelope:
 
 - `ok` is true exactly when the process exits 0. Treat a non-zero exit as a
   failure even if you somehow got a partial object.
+- `ok` does **not** mean the work was perfect. `sync`, `update`, `deploy` and
+  `import` exit 0 when the operation ran, and still carry per-item detail in
+  `result.errors`, `result.warnings` or `result.conflicts`. Check those fields
+  as well as `ok` before reporting success to the user.
 - `error.hint` is present only when the command has a specific remedy to
   suggest.
 - A partial failure keeps its `result`: when `add` completes with
