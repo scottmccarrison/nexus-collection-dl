@@ -1,6 +1,7 @@
 """Download manager with progress tracking and integrity verification."""
 
 import hashlib
+import io
 import os
 import re
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from rich.console import Console
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -350,6 +352,7 @@ class Downloader:
         target_dir: Path,
         on_complete: Callable[[dict[str, Any], Path], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        show_progress: bool = True,
     ) -> list[tuple[dict[str, Any], Path]]:
         """
         Download multiple mods with a unified progress display.
@@ -363,12 +366,20 @@ class Downloader:
                          generic progress (passed through to download_mod).
                          When provided, the Rich progress bar is still shown for
                          CLI usage, and the callback fires alongside it.
+            show_progress: Write the Rich progress bar and per-mod lines to
+                         stdout. Pass False for machine-readable output, where
+                         stdout must stay parseable; the loop runs identically
+                         and only the console is redirected away.
 
         Returns list of (mod_info, downloaded_path) tuples.
         """
         results = []
         total_mods = len(mods)
 
+        # The Progress object doubles as the output console (progress.console
+        # is where per-mod lines and errors go), so redirecting its console
+        # suppresses every write while leaving the download loop untouched.
+        progress_console = None if show_progress else Console(file=io.StringIO())
         with Progress(
             TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
             BarColumn(bar_width=30),
@@ -376,6 +387,7 @@ class Downloader:
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
+            console=progress_console,
         ) as progress:
             for i, mod in enumerate(mods, 1):
                 try:

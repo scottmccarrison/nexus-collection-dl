@@ -671,6 +671,15 @@ class CollectionSummary:
 
 
 @dataclass
+class GameSummary:
+    """One game's rollup of collections and mods (see list_games)."""
+
+    game_domain: str
+    collection_count: int
+    mod_count: int
+
+
+@dataclass
 class ModSummary:
     """One tracked mod file from local state (see list_mods)."""
 
@@ -793,6 +802,25 @@ def list_collections(root: Path) -> list[CollectionSummary]:
     the healthy ones. Never touches the network. Sorted by name.
     """
     return scan_collections(root).collections
+
+
+def list_games(root: Path) -> list[GameSummary]:
+    """Roll collections up by game domain (read-only, no network).
+
+    Same scan as list_collections, aggregated so a caller can see what is
+    present per game without reading every collection. Games with no
+    readable collections simply do not appear. Sorted by game domain.
+    """
+    totals: dict[str, list[int]] = {}
+    for c in list_collections(root):
+        domain = _state_text(c.game_domain) or "-"
+        row = totals.setdefault(domain, [0, 0])
+        row[0] += 1
+        row[1] += c.mod_count
+    return [
+        GameSummary(game_domain=domain, collection_count=counts[0], mod_count=counts[1])
+        for domain, counts in sorted(totals.items())
+    ]
 
 
 def list_mods(mods_dir: Path) -> list[ModSummary]:
@@ -1073,6 +1101,7 @@ class ModManagerService:
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
         target_dir: Path | None = None,
+        show_progress: bool = True,
     ) -> SyncResult:
         """Download an entire collection.
 
@@ -1250,6 +1279,7 @@ class ModManagerService:
                     mods=mods_to_download,
                     target_dir=mods_dir,
                     on_progress=on_download_progress,
+                    show_progress=show_progress,
                 )
 
             # Extract archives
@@ -1314,6 +1344,7 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        show_progress: bool = True,
     ) -> UpdateResult:
         """Check for and download updates."""
         progress = on_progress or _noop_progress
@@ -1376,6 +1407,7 @@ class ModManagerService:
                         mods=mods_to_download,
                         target_dir=mods_dir,
                         on_progress=on_download_progress,
+                        show_progress=show_progress,
                     )
 
                     progress("extract", 0.75, "Extracting archives...")
@@ -1444,6 +1476,7 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        show_progress: bool = True,
     ) -> AddResult:
         """Add a single mod by Nexus URL."""
         progress = on_progress or _noop_progress
@@ -1544,6 +1577,7 @@ class ModManagerService:
                 mods=[download_info],
                 target_dir=mods_dir,
                 on_progress=on_download_progress,
+                show_progress=show_progress,
             )
 
             if not results:
