@@ -20,6 +20,7 @@ from .handler import (
     HandlerError,
     NxmRoutingError,
     add_mapping,
+    append_nxm_event,
     append_nxm_log,
     capability_warnings,
     notification_daemon_available,
@@ -1116,6 +1117,42 @@ def _log_nxm(outcome: str, detail: str = "") -> None:
         pass
 
 
+def _record_nxm_event(collection_dir: Path | None, payload: dict) -> None:
+    """Append one click event to a collection's events file; best-effort.
+
+    A running `nexus-dl shell` tails this file to learn that a browser
+    click landed in a collection it has open. Written only when a
+    collection can be named: a parse failure or a routing failure touched
+    no collection and produces no event.
+
+    Same posture as _log_nxm: a broken event file must never fail a
+    download.
+    """
+    if collection_dir is None:
+        return
+    try:
+        append_nxm_event(collection_dir, payload)
+    except Exception:  # noqa: S110 - best-effort: a broken event file must never break nxm
+        pass
+
+
+def _nxm_event_payload(result, outcome: str) -> dict:
+    """Build an event payload from an NxmResult's already-redacted fields."""
+    return {
+        "outcome": outcome,
+        "collection_name": result.collection_dir.name if result.collection_dir else "",
+        "collection_dir": str(result.collection_dir) if result.collection_dir else "",
+        "mod_id": result.mod_id or 0,
+        "file_id": result.file_id or 0,
+        "mod_name": result.mod_name,
+        "filename": result.filename,
+        "extracted": bool(result.extracted),
+        "reason": (
+            "re_click_required" if result.re_click_required else ""
+        ) if outcome == "error" else "",
+    }
+
+
 def _boundary_secrets(ctx: click.Context, uri: str) -> tuple:
     """Literal secrets to redact from text leaving the nxm error boundary.
 
@@ -1280,6 +1317,19 @@ def nxm(
                               min_secret_len=_MIN_REDACT_SECRET_LEN))
     except (NexusAPIError, DownloadError, StateError) as e:
         _log_nxm("error", f"reason={_nxm_reason(e)}")
+        # A target given on the command line is a collection we can name,
+        # so the running shell hears about the failure. A mapped target is
+        # resolved inside the service and is not visible here; that click
+        # reports through nxm.log only.
+        _record_nxm_event(
+            mods_dir,
+            {
+                "outcome": "error",
+                "collection_dir": str(mods_dir) if mods_dir else "",
+                "collection_name": mods_dir.name if mods_dir else "",
+                "reason": _nxm_reason(e),
+            },
+        )
         fail(_boundary_redact(ctx, uri, str(e), strip_uris=False,
                               min_secret_len=_MIN_REDACT_SECRET_LEN))
     except Exception as e:
@@ -1305,6 +1355,16 @@ def nxm(
     if not result.success:
         reason = "re_click_required" if result.re_click_required else "rejected"
         _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
+        # A failed extraction can still leave a recoverable pending entry;
+        # say so rather than reporting a flat failure the user cannot act on.
+        event_outcome = (
+            "pending_download"
+            if result.download_status == "pending_download"
+            else "error"
+        )
+        _record_nxm_event(
+            result.collection_dir, _nxm_event_payload(result, event_outcome)
+        )
         if result.error:
             console.print(f"[red]Error:[/red] {escape(error_text)}")
         if result.re_click_required:
@@ -1356,6 +1416,12 @@ def nxm(
         "warn" if result.warnings else "success",
         f"{_nxm_ids(result)}status={result.status}",
     )
+    # A standalone --output drop changed no collection, so there is
+    # nothing for a running shell to notice.
+    if result.status != "saved_to_output":
+        _record_nxm_event(
+            result.collection_dir, _nxm_event_payload(result, result.status)
+        )
     if want_notify:
         handler_notify("nexus-dl: download complete", summary)
 
