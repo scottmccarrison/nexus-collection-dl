@@ -24,6 +24,7 @@ from nexus_collection_dl import service as service_module
 from nexus_collection_dl import updater as updater_module
 from nexus_collection_dl.service import (
     AddResult,
+    DeployResult,
     HealthProbes,
     ModManagerService,
     NxmResult,
@@ -70,6 +71,9 @@ class FakeShellService:
     sync_error = None
     remove_error = None
     status_error = None
+    deploy_error = None
+    # Canned deploy result.
+    deploy_result = None
 
     def __init__(self, api_key=None, force_free=False):
         self._api_key = api_key
@@ -121,6 +125,19 @@ class FakeShellService:
             raise FakeShellService.remove_error
         return FakeShellService.remove_result
 
+    def deploy(self, mods_dir, game_dir=None, prefix=None, use_copy=False,
+               on_progress=None):
+        FakeShellService.calls.append(
+            {"method": "deploy", "mods_dir": mods_dir,
+             "game_dir": game_dir, "use_copy": use_copy}
+        )
+        if FakeShellService.deploy_error is not None:
+            raise FakeShellService.deploy_error
+        return FakeShellService.deploy_result or DeployResult(
+            deployed_count=3, conflicts=[], errors=[],
+            game_dir=str(game_dir or ""), has_sfse=False,
+        )
+
     def get_status(self, mods_dir):
         FakeShellService.calls.append(
             {"method": "get_status", "mods_dir": mods_dir}
@@ -146,6 +163,8 @@ def shell_env(monkeypatch, tmp_path):
     FakeShellService.sync_error = None
     FakeShellService.remove_error = None
     FakeShellService.status_error = None
+    FakeShellService.deploy_error = None
+    FakeShellService.deploy_result = None
 
     version_checks = []
     updater_checks = []
@@ -2088,3 +2107,326 @@ def test_traversal_shaped_memory_values_are_ignored(
     assert code == 0
     assert prompts[0] == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
+
+
+# ---------------------------------------------------------------------------
+# click-event drain
+# ---------------------------------------------------------------------------
+
+
+def _write_event(coll_dir: Path, **overrides):
+    """Append one event line to a collection's events file."""
+    from nexus_collection_dl.handler import append_nxm_event
+
+    defaults = {
+        "outcome": "downloaded",
+        "collection_name": coll_dir.name,
+        "collection_dir": str(coll_dir),
+        "mod_id": 123,
+        "file_id": 456,
+        "mod_name": "SkyUI",
+        "filename": "SkyUI.7z",
+        "extracted": True,
+    }
+    defaults.update(overrides)
+    append_nxm_event(coll_dir, defaults)
+
+
+def run_events(svc, root, script):
+    """run_shell with prompt recording and callable side effects."""
+    prompts = []
+    buf = io.StringIO()
+    console = Console(file=buf, width=200, force_terminal=False)
+    steps = iter(script)
+
+    def input_fn(prompt):
+        prompts.append(prompt)
+        while True:
+            try:
+                item = next(steps)
+            except StopIteration:
+                raise EOFError from None
+            if isinstance(item, BaseException):
+                raise item
+            if callable(item):
+                item()
+                continue
+            return item
+
+    code = run_shell(svc, root, input_fn=input_fn, console=console)
+    return code, buf.getvalue(), prompts
+
+
+def test_event_reported_at_next_prompt_boundary(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        "",
+        write_ev,
+        "",
+    ])
+    assert code == 0
+    assert "Click activity while the shell was running" in out
+    assert "SkyUI" in out
+
+
+def test_tail_seed_skips_preexisting_events(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+    _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, ["/quit"])
+    assert code == 0
+    assert "Click activity" not in out
+
+
+def test_drained_events_not_re_reported(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",
+        "",
+    ])
+    assert code == 0
+    assert out.count("Click activity") == 1
+    assert out.count("SkyUI") == 1
+
+
+def test_rotation_resets_offset(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_and_rotate():
+        _write_event(coll, mod_name="First")
+        ev_path = coll / ".nexus-events.jsonl"
+        ev_path.rename(ev_path.with_name(ev_path.name + ".1"))
+
+    def write_new():
+        _write_event(coll, mod_name="Second")
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_and_rotate,
+        "",
+        write_new,
+        "",
+    ])
+    assert code == 0
+    assert "Second" in out
+    assert "First" not in out
+
+
+def test_grouping_one_prompt_per_collection(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_three():
+        for i in range(3):
+            _write_event(coll, mod_name=f"Mod{i}")
+
+    code, out, prompts = run_events(FakeShellService(), root, [
+        write_three,
+        "no",
+    ])
+    assert code == 0
+    assert out.count("Click activity") == 1
+    deploy_prompts = [p for p in prompts if "Deploy" in p]
+    assert len(deploy_prompts) == 1
+
+
+def test_non_deployable_outcomes_report_without_prompting(
+    shell_env, tmp_path
+):
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_mixed():
+        _write_event(coll, outcome="error", reason="nope")
+        _write_event(coll, outcome="already_downloaded", mod_name="SKSE64")
+        _write_event(coll, outcome="pending_download", mod_name="SkyUI")
+
+    code, out, prompts = run_events(FakeShellService(), root, [
+        write_mixed,
+        "",
+    ])
+    assert code == 0
+    assert "failed" in out
+    assert "already downloaded" in out
+    assert "awaiting import" in out
+    deploy_prompts = [p for p in prompts if "Deploy" in p]
+    assert len(deploy_prompts) == 0
+
+
+def test_vanished_collection_dir_noted_no_prompt(shell_env, tmp_path):
+    root = make_root(tmp_path, ("CollA", []))
+    coll = root / "CollA"
+
+    def write_then_rename():
+        # The events file moves with the rename, but collection_dir in
+        # the event still points at the old path.
+        _write_event(coll, collection_dir=str(root / "Missing"))
+        coll.rename(root / "CollB")
+
+    code, out, prompts = run_events(FakeShellService(), root, [
+        write_then_rename,
+        "",
+    ])
+    assert code == 0
+    assert "directory gone" in out
+    deploy_prompts = [p for p in prompts if "Deploy" in p]
+    assert len(deploy_prompts) == 0
+
+
+# --- deploy flow -----------------------------------------------------------
+
+
+def _setup_deploy_collection(tmp_path, name="Clean Visuals"):
+    """Root with one collection that has a game_dir and a deployable file."""
+    root = make_root(tmp_path, (name, []))
+    coll = root / name
+    game = tmp_path / "game"
+    game.mkdir()
+    # Give the state a game_dir so _deploy_flow skips find_game_dir.
+    state = CollectionState(coll)
+    state.load()
+    state.game_dir = str(game)
+    state.save()
+    # One deployable file (not hidden).
+    (coll / "Data").mkdir()
+    (coll / "Data" / "test.esp").write_bytes(b"fake")
+    return root, coll, game
+
+
+def test_deploy_dry_run_then_cancel(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _prompts = run_events(FakeShellService(), root, [
+        write_ev,
+        "",       # no-op so the drain fires before the next input
+        "yes",    # drain prompt: enter deploy flow
+        "no",     # deploy confirm: cancel
+    ])
+    assert code == 0
+    assert "Would deploy" in out
+    assert "Deploy cancelled." in out
+    assert FakeShellService.calls == []
+
+
+def test_deploy_dry_run_then_confirm_deploys_once(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",       # no-op so the drain fires
+        "yes",    # drain prompt
+        "yes",    # deploy confirm
+    ])
+    assert code == 0
+    deploy_calls = [c for c in FakeShellService.calls if c["method"] == "deploy"]
+    assert len(deploy_calls) == 1
+    assert "Deployed" in out
+
+
+def test_keyboard_interrupt_at_deploy_prompt_cancels(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",                     # no-op so the drain fires
+        "yes",                  # drain prompt
+        KeyboardInterrupt(),    # deploy confirm
+    ])
+    assert code == 0
+    assert "Deploy cancelled." in out
+    assert FakeShellService.calls == []
+
+
+def test_deploy_no_at_drain_prompt_skips_flow(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",     # no-op so the drain fires
+        "no",   # drain prompt: skip
+    ])
+    assert code == 0
+    assert "Would deploy" not in out
+    assert FakeShellService.calls == []
+
+
+# --- /deploy command -------------------------------------------------------
+
+
+def test_deploy_command_uses_current(shell_env, tmp_path):
+    root, _coll, _game = _setup_deploy_collection(tmp_path)
+    code, _out, _ = run_events(FakeShellService(), root, [
+        "/deploy",
+        "yes",
+    ])
+    assert code == 0
+    deploy_calls = [c for c in FakeShellService.calls if c["method"] == "deploy"]
+    assert len(deploy_calls) == 1
+
+
+def test_deploy_command_no_selection_errors(shell_env, tmp_path):
+    root = make_root(tmp_path, ("Alpha", []), ("Beta", []))
+    code, out, _ = run_events(FakeShellService(), root, ["/deploy"])
+    assert code == 0
+    assert "no collection selected" in out
+
+
+def test_deploy_command_partial_failure_no_success_line(
+    shell_env, tmp_path
+):
+    root, _coll, game = _setup_deploy_collection(tmp_path)
+    FakeShellService.deploy_result = DeployResult(
+        deployed_count=2, conflicts=[], errors=["file locked"],
+        game_dir=str(game), has_sfse=False,
+    )
+    code, out, _ = run_events(FakeShellService(), root, [
+        "/deploy",
+        "yes",
+    ])
+    assert code == 0
+    assert "Deploy incomplete" in out
+    assert "Deployed" not in out
+
+
+def test_deploy_command_conflicts_truncate_at_10(shell_env, tmp_path):
+    root, _coll, game = _setup_deploy_collection(tmp_path)
+    FakeShellService.deploy_result = DeployResult(
+        deployed_count=5,
+        conflicts=[f"conflict-{i}" for i in range(15)],
+        errors=[],
+        game_dir=str(game),
+        has_sfse=False,
+    )
+    code, out, _ = run_events(FakeShellService(), root, [
+        "/deploy",
+        "yes",
+    ])
+    assert code == 0
+    assert "conflict-0" in out
+    assert "conflict-9" in out
+    assert "conflict-10" not in out
+    assert "and 5 more" in out
