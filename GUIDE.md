@@ -570,6 +570,28 @@ Pasting an `nxm://` link on a line by itself is the same as `/add` with that lin
 
 If you're pasting links here because clicking **Mod manager download** in the browser produced nothing visible, that's usually the click-through side rather than the shell: desktop notifications are switched off, or the handler isn't installed. Start with "Clicking a link seems to do nothing" in [Troubleshooting](#troubleshooting); the short version is to check `~/.local/state/nexus-dl/nxm.log` first, because a new line there means the click ran and only the feedback is missing.
 
+### Reacting to clicks from the shell
+
+When `nexus-dl shell` is open and you click **Mod manager download** in your browser, the shell notices at the next prompt. Press Enter (or type any command) and you'll see something like:
+
+```
+Click activity while the shell was running (2 events):
+  'SkyUI' (file 456) downloaded into 'Clean Visuals'
+  'SKSE64' (file 111) is already downloaded in 'Clean Visuals'
+```
+
+Then, for each collection that got a new file, the shell asks once:
+
+```
+Deploy 'Clean Visuals' now? [yes/no]:
+```
+
+Answer `yes` and it shows what would be deployed (file counts and the game directory), asks again, and only then touches the game directory. Answer `no` at any point and nothing happens. Three clicks on the same collection produce one report and one prompt, not three.
+
+The shell reads a small events file each collection keeps at `<collection folder>/.nexus-events.jsonl`. You never need to touch it. Only collections under the shell's root folder are visible: if you clicked a mod into a collection the shell can't see, use `/collections` or `/mods` to check. Events that arrived before the shell started are not replayed; you'll see only clicks that happened while it was running.
+
+You can also deploy at any time without waiting for a click, using `/deploy` (or `/deploy 2` or `/deploy Clean Visuals` to pick a collection). It works the same way: dry-run counts, a confirmation, then the deploy.
+
 ## Using the web UI
 
 If you do not want to memorize terminal commands, the web UI is probably the better option for day-to-day mod management. The CLI is faster for one-off operations and scripting, but the web UI lets you do almost everything from a browser with real-time progress feedback.

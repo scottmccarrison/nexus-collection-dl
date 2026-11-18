@@ -247,6 +247,12 @@ class NxmResult:
     extracted: bool = False
     error: str = ""
     re_click_required: bool = False  # user must re-click on the website
+    # What the collection state says about this file now: "downloaded",
+    # "pending_download", or "" when nothing was recorded. Separate from
+    # `status` because a failed extraction can still leave a recoverable
+    # pending entry, and the caller needs to tell "run import to finish"
+    # apart from "nothing was recorded".
+    download_status: str = ""
     # Non-fatal issues on an otherwise successful run (e.g. load order
     # regeneration failed after the download was already completed and
     # saved). Truthful completion: success stays True, the warning says
@@ -2473,6 +2479,7 @@ class ModManagerService:
                         mod_name=existing.name,
                         filename=existing.filename,
                         collection_dir=target,
+                        download_status="downloaded",
                         warnings=dup_warnings,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
@@ -2585,6 +2592,7 @@ class ModManagerService:
                         filename=existing.filename,
                         collection_dir=target,
                         extracted=True,
+                        download_status="downloaded",
                         warnings=warnings,
                     )
                 # Retained archive failed the sanity checks (missing
@@ -2780,6 +2788,10 @@ class ModManagerService:
                     # (or becomes) pending so `nexus-dl import` can finish
                     # the job without another download.
                     state_note = ""
+                    # Set only when a pending entry actually landed in
+                    # state, so the result can tell "run import to finish"
+                    # apart from "nothing was recorded".
+                    pending_recorded = False
                     if existing is None:
                         download_info["manual"] = True
                         download_info["download_status"] = "pending_download"
@@ -2792,6 +2804,7 @@ class ModManagerService:
                         state.clear_removed(info.mod_id)
                         try:
                             state.save()
+                            pending_recorded = True
                         except (OSError, StateError) as save_exc:
                             # Same honest handling as the sibling branches:
                             # return a failed NxmResult instead of raising
@@ -2834,6 +2847,7 @@ class ModManagerService:
                         state.clear_removed(info.mod_id)
                         try:
                             state.save()
+                            pending_recorded = True
                         except (OSError, StateError) as save_exc:
                             existing.download_status = "downloaded"
                             if removed_snapshot is not None:
@@ -2854,6 +2868,9 @@ class ModManagerService:
                         collection_dir=target,
                         mod_name=mod_name,
                         filename=filename,
+                        download_status=(
+                            "pending_download" if pending_recorded else ""
+                        ),
                     )
 
             if existing is not None:
@@ -2941,6 +2958,7 @@ class ModManagerService:
                 filename=filename,
                 collection_dir=target,
                 extracted=extracted,
+                download_status="downloaded",
                 warnings=warnings,
             )
 
@@ -3071,6 +3089,7 @@ class ModManagerService:
         mod_name: str = "",
         filename: str = "",
         re_click_required: bool = False,
+        download_status: str = "",
     ) -> NxmResult:
         """Build a failed NxmResult from safe components only."""
         return NxmResult(
@@ -3084,6 +3103,7 @@ class ModManagerService:
             collection_dir=collection_dir,
             error=error,
             re_click_required=re_click_required,
+            download_status=download_status,
         )
 
     def _nxm_premium(self, user_info: dict) -> bool:

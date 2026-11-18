@@ -81,7 +81,7 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .downloader import DownloadError
 from .extractor import ExtractionError
-from .handler import HandlerError
+from .handler import EVENTS_FILENAME, HandlerError
 from .nxm import NxmParseError
 from .redaction import (
     MIN_REDACT_SECRET_LEN,
@@ -204,6 +204,16 @@ _COMMAND_HELP = (
         ),
     ),
     _CommandHelp(
+        "/deploy [<index|name>]",
+        "deploy a collection to the game directory (dry-run then "
+        "confirm)",
+        (
+            "/deploy",
+            "/deploy 2",
+            "/deploy Clean Visuals",
+        ),
+    ),
+    _CommandHelp(
         "/status [<index|name>]",
         "tool-wide overview and health report, or one collection vs the "
         "latest revision",
@@ -262,6 +272,10 @@ class _ShellSession:
         self._secrets: tuple = merge_secrets(
             [str(getattr(svc, "_api_key", "") or "")]
         )
+        # Byte offset into each click-events file, so the drain reports
+        # only events that arrived after the last one consumed. Keyed by
+        # the events file path.
+        self._event_offsets: dict[Path, int] = {}
 
     # ------------------------------------------------------------------
     # rendering
@@ -421,8 +435,10 @@ class _ShellSession:
             "nexus-dl shell. Type /help for commands, /quit to exit."
         )
         self._startup_selection()
+        self._init_event_offsets()
         input_failures = 0
         while True:
+            self._drain_events()
             try:
                 line = self.input_fn(self._prompt())
             except EOFError:
@@ -600,6 +616,236 @@ class _ShellSession:
                 "(see /collections)"
             )
         return self.current
+
+    # ------------------------------------------------------------------
+    # click-event drain
+    # ------------------------------------------------------------------
+
+    def _events_files(self) -> list[Path]:
+        """Every click-events file under root: root itself and each subdir."""
+        candidates = [self.root / EVENTS_FILENAME]
+        try:
+            for child in self.root.iterdir():
+                if child.is_dir():
+                    candidates.append(child / EVENTS_FILENAME)
+        except OSError:
+            pass
+        return [p for p in candidates if p.exists()]
+
+    def _init_event_offsets(self) -> None:
+        """Tail-seed: skip events that predate the session."""
+        self._event_offsets = {}
+        for path in self._events_files():
+            try:
+                self._event_offsets[path] = path.stat().st_size
+            except OSError:
+                pass
+
+    def _drain_events(self) -> None:
+        """Read and report click events since the last drain.
+
+        Called once per loop iteration, before the prompt. One report
+        block for the whole drain, then one deploy prompt per collection
+        that saw at least one deployable event.
+        """
+        new_events: list[dict] = []
+        for path in self._events_files():
+            offset = self._event_offsets.get(path, 0)
+            try:
+                size = path.stat().st_size
+                if size < offset:
+                    offset = 0  # rotated or truncated
+                if size == offset:
+                    self._event_offsets[path] = offset
+                    continue
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    raw = f.read()
+            except OSError:
+                continue
+
+            last_nl = raw.rfind(b"\n")
+            if last_nl == -1:
+                continue  # no complete line yet
+            complete_bytes = raw[: last_nl + 1]
+            self._event_offsets[path] = offset + len(complete_bytes)
+
+            for line_bytes in complete_bytes.splitlines():
+                line = line_bytes.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        new_events.append(event)
+                except (json.JSONDecodeError, ValueError):
+                    continue  # skip malformed lines silently
+
+        if not new_events:
+            return
+
+        count = len(new_events)
+        header = "Click activity while the shell was running"
+        if count > 1:
+            header += f" ({count} events)"
+        self._emit(header + ":")
+
+        deployable: dict[str, list[dict]] = {}
+        for event in new_events:
+            self._emit(f"  {self._format_event_line(event)}")
+            outcome = str(event.get("outcome", ""))
+            if outcome in ("downloaded", "extracted_from_archive"):
+                coll = str(event.get("collection_name", ""))
+                deployable.setdefault(coll, []).append(event)
+
+        for coll_name, events in deployable.items():
+            # One prompt per collection regardless of how many events.
+            # The event's own collection_dir is authoritative; a vanished
+            # directory is noted and skipped.
+            sample = events[0]
+            coll_dir = sample.get("collection_dir", "")
+            if coll_dir and not Path(coll_dir).is_dir():
+                self._emit(
+                    f"'{_safe_text(coll_name)}' (directory gone; "
+                    "nothing to deploy)"
+                )
+                continue
+            answer = self._confirm(
+                f"Deploy '{_safe_text(coll_name)}' now? [yes/no]: "
+            )
+            if answer == _CONFIRM_YES:
+                self._deploy_by_path(Path(coll_dir))
+
+    def _format_event_line(self, event: dict) -> str:
+        """One human line for a click event; all values display-safe."""
+        mod = _safe_text(event.get("mod_name", ""))
+        fid = event.get("file_id", 0)
+        coll = _safe_text(event.get("collection_name", ""))
+        outcome = str(event.get("outcome", ""))
+        if outcome == "downloaded":
+            return f"'{mod}' (file {fid}) downloaded into '{coll}'"
+        if outcome == "extracted_from_archive":
+            return f"'{mod}' (file {fid}) extracted into '{coll}'"
+        if outcome == "already_downloaded":
+            return f"'{mod}' (file {fid}) is already downloaded in '{coll}'"
+        if outcome == "pending_download":
+            return f"'{mod}' (file {fid}) is awaiting import in '{coll}'"
+        # error
+        reason = _safe_text(event.get("reason", ""))
+        if mod and fid:
+            return f"'{mod}' (file {fid}) failed ({reason})"
+        return f"download failed ({reason})"
+
+    def _deploy_by_path(self, coll_dir: Path) -> None:
+        """Deploy a collection by its directory (from an event line)."""
+        colls = self._collection_listing()
+        for c in colls:
+            if c.path == coll_dir:
+                self._deploy_flow(c)
+                return
+        self._emit_failure(
+            f"collection directory not found under root: "
+            f"{_safe_text(str(coll_dir))}"
+        )
+
+    # ------------------------------------------------------------------
+    # deploy
+    # ------------------------------------------------------------------
+
+    def _deploy_flow(self, target: CollectionSummary) -> None:
+        """Dry-run, confirm, deploy. Shared by /deploy and the event drain.
+
+        Nothing touches the game directory until the user answers yes to
+        the second prompt. add_nxm's guarantee stands: nothing is ever
+        deployed automatically.
+        """
+        from .deploy import DeployError, classify_files
+        from .state import CollectionState
+        from .steam import find_game_dir
+
+        try:
+            state = CollectionState(target.path)
+            state.load()
+        except StateError as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        game_dir: Path | None = None
+        if state.game_dir:
+            game_dir = Path(state.game_dir)
+        if game_dir is None:
+            game_dir = find_game_dir(state.game_domain)
+        if game_dir is None:
+            self._emit_error("Could not find game directory.")
+            return
+
+        manifest_choices: dict = {}
+        if state.manifest_data:
+            from .manifest import CollectionManifest
+
+            manifest = CollectionManifest.from_dict(state.manifest_data)
+            manifest_choices = manifest.mod_choices
+
+        try:
+            plan = classify_files(
+                target.path, state.game_domain, mod_choices=manifest_choices
+            )
+        except (StateError, OSError, ValueError) as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        self._emit(
+            f"Would deploy {plan.total_files} files to "
+            f"{_safe_text(str(game_dir))} "
+            f"({len(plan.game_root_files)} game root, "
+            f"{len(plan.data_files)} data, {len(plan.skipped)} skipped)."
+        )
+
+        answer = self._confirm(
+            f"Deploy '{_safe_text(target.name)}' now? [yes/no]: "
+        )
+        if answer != _CONFIRM_YES:
+            self._emit("Deploy cancelled.")
+            return
+
+        try:
+            result = self.svc.deploy(target.path, game_dir=game_dir, use_copy=False)
+        except DeployError as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        if result.errors:
+            for err in result.errors:
+                self._emit_error(err)
+        if result.conflicts:
+            self._emit(f"Conflicts ({len(result.conflicts)}):")
+            for conflict in result.conflicts[:10]:
+                self._emit(f"  ! {_safe_text(str(conflict))}")
+            if len(result.conflicts) > 10:
+                self._emit(
+                    f"  ... and {len(result.conflicts) - 10} more"
+                )
+        if result.warnings:
+            for w in result.warnings:
+                self._emit_warning(str(w))
+
+        if result.errors:
+            self._emit_error(
+                f"Deploy incomplete: {result.deployed_count} file(s) "
+                f"deployed, {len(result.errors)} error(s)."
+            )
+        else:
+            self._emit(
+                f"Deployed {result.deployed_count} files "
+                f"({len(result.conflicts)} conflicts, "
+                f"{len(result.errors)} errors)"
+            )
+
+    def _cmd_deploy(self, rest: str) -> None:
+        target = (
+            self._resolve_collection(rest) if rest else self._require_current()
+        )
+        self._deploy_flow(target)
 
     # ------------------------------------------------------------------
     # commands
@@ -1199,6 +1445,7 @@ class _ShellSession:
         "/add": _cmd_add,
         "/sync": _cmd_sync,
         "/remove": _cmd_remove,
+        "/deploy": _cmd_deploy,
         "/status": _cmd_status,
     }
 
