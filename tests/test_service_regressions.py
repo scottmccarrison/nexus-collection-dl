@@ -105,7 +105,7 @@ def test_add_mod_premium_registers_state_under_file_id(svc, tmp_path, monkeypatc
     svc._api = FakeNexusAPI(is_premium=True)
 
     def fake_download_mods(self, game_domain, mods, target_dir,
-                           on_complete=None, on_progress=None):
+                           on_complete=None, on_progress=None, show_progress=True):
         out = []
         for m in mods:
             p = Path(target_dir) / m["filename"]
@@ -263,7 +263,7 @@ def test_sync_first_run_prefetches_manifest_for_md5(svc, tmp_path, monkeypatch):
     captured = {}
 
     def fake_download_mods(self, game_domain, mods, target_dir,
-                           on_complete=None, on_progress=None):
+                           on_complete=None, on_progress=None, show_progress=True):
         captured["mods"] = [dict(m) for m in mods]
         return []
 
@@ -304,7 +304,8 @@ def test_cli_pending_instructions_point_at_collection_dir(tmp_path, monkeypatch)
             pass
 
         def sync(self, collection_url, mods_dir, skip_optional=False,
-                 no_load_order=False, no_extract=False, on_progress=None):
+                 no_load_order=False, no_extract=False, on_progress=None,
+                 target_dir=None, show_progress=True):
             return SyncResult(
                 mods_downloaded=0, mods_extracted=0, errors=[],
                 load_order_files=[],
@@ -372,7 +373,7 @@ def test_sync_target_dir_honored_on_the_premium_path(svc, tmp_path, monkeypatch)
     captured = {}
 
     def fake_download_mods(self, game_domain, mods, target_dir,
-                           on_complete=None, on_progress=None):
+                           on_complete=None, on_progress=None, show_progress=True):
         captured["target_dir"] = target_dir
         return []
 

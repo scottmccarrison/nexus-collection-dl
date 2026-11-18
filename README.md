@@ -25,6 +25,8 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 **`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly, with the web UI planned for deprecation once the shell covers the workflows people use. Beta points are tagged as `v0.3.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
 
+For AI harnesses, the repo ships an agent skill at [`.agents/skills/nexus-dl/`](.agents/skills/nexus-dl/). It teaches the command surface, the safe defaults (read before write, dry-run before deploy), and the [`--json` machine-readable output](#machine-readable-output), so a harness can drive the same CLI the shell wraps.
+
 Switch channels by checking out the branch before the install steps below. Stay on `main` for stable:
 
 ```bash
@@ -365,6 +367,64 @@ Matches files you downloaded through the browser to pending mods, extracts archi
 ```bash
 nexus-dl status ~/mods/starfield
 ```
+
+### Remove a mod
+
+```bash
+# See what is tracked, with the ids remove takes
+nexus-dl mods ~/mods/starfield/My\ Collection
+
+# Preview: list what would go, change nothing
+nexus-dl remove ~/mods/starfield/My\ Collection --file-id 12345 --dry-run
+
+# Remove by file id (or --mod-id 123 to drop the whole mod page)
+nexus-dl remove ~/mods/starfield/My\ Collection --file-id 12345
+```
+
+Drops the mod from the collection's state and records a tombstone so `sync`/`update` skip it from then on (the shell's `/remove` is the same operation). Exactly one of `--file-id`/`--mod-id` is required; look ids up with `mods` rather than guessing. `--file-id` resolves to its mod page, so every tracked file of that mod goes, not just the one file. It never deletes files from disk (a collection's extraction tree is merged, so payload files cannot be attributed back to one mod), and re-adding the mod clears the tombstone and restores it. `--no-load-order` skips the load order regeneration.
+
+### List collections
+
+```bash
+nexus-dl collections ~/mods
+```
+
+Lists collections under a directory (default: the current directory): the directory itself and its immediate subfolders holding `.nexus-state.json`, with game, mod count, and pending count for each. Read-only and offline; unreadable collections are skipped.
+
+### List games
+
+```bash
+nexus-dl games ~/mods
+```
+
+The same scan rolled up per game domain: collection count and total mods per game. Read-only and offline.
+
+### List tracked mods
+
+```bash
+nexus-dl mods ~/mods/starfield/My\ Collection
+```
+
+Lists a collection's tracked mod files from local state only (no network): name, version, download status, and the `file_id`/`mod_id` values that `remove` takes.
+
+### Health check
+
+```bash
+nexus-dl health
+```
+
+Local health checks for the tool installation: where the API key comes from (never the value), nxm handler state, desktop notification capability, unreadable state files, and write-lock state. This is a report, not a gate: it exits 0 even when a check reports WARN or ERROR, so read the per-check statuses.
+
+### Machine-readable output
+
+`--json` goes **before** the subcommand and switches every non-interactive command to a single JSON object on stdout (human diagnostics move to stderr):
+
+```bash
+nexus-dl --json status ~/mods/starfield/My\ Collection | jq .ok
+nexus-dl --json update ~/mods/starfield/My\ Collection --dry-run | jq '.result.updates'
+```
+
+The envelope is `{"ok", "result", "error"}`: `ok` is true exactly when the command exits 0; on failure `error` carries a stable `code`, the exception type, the message, and an optional `hint`; a partial failure (an `add` that reports `success: false`, say) keeps its `result` alongside the error under `code` `operation_failed`. Flag placement matters: `nexus-dl --json status <dir>`, not `nexus-dl status --json <dir>`, and a wrong invocation is a plain-text usage error on stderr with exit code 2, not JSON. `serve`, `shell`, `nxm`, and `handler` do not support `--json`. The [agent skill](.agents/skills/nexus-dl/) carries the per-command result shapes and the error-code reference.
 
 ### Interactive shell
 

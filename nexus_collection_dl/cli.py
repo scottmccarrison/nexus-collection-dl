@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
 from rich.console import Console
@@ -79,10 +80,34 @@ _QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
     hidden=True,
     help="Skip automatic version check",
 )
+@click.option(
+    "--json",
+    "json_mode",
+    is_flag=True,
+    help="Emit machine-readable JSON on stdout (must come before the subcommand)",
+)
 @click.pass_context
-def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check: bool) -> None:
+def main(
+    ctx: click.Context,
+    api_key: str | None,
+    free: bool,
+    skip_update_check: bool,
+    json_mode: bool,
+) -> None:
     """Download mod collections from Nexus Mods."""
-    quiet = ctx.invoked_subcommand in _QUIET_SUBCOMMANDS
+    global console
+    if json_mode:
+        # stdout belongs to the JSON envelope and nothing else. Every human
+        # diagnostic (banner, update notice, warnings, progress prose) moves
+        # to stderr so a caller can pipe stdout straight into a parser.
+        console = Console(stderr=True)
+        if ctx.invoked_subcommand in {"serve", "shell", "nxm", "handler"}:
+            raise click.UsageError(
+                "--json is not supported for "
+                f"'{ctx.invoked_subcommand}': it is interactive or config-only, "
+                "not a result-producing command"
+            )
+    quiet = json_mode or ctx.invoked_subcommand in _QUIET_SUBCOMMANDS
     if not quiet:
         update_msg = check_for_update()
         if update_msg:
@@ -114,6 +139,7 @@ def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check:
     ctx.obj["api_key"] = resolved_key
     ctx.obj["api_key_source"] = key_source
     ctx.obj["force_free"] = free
+    ctx.obj["json_mode"] = json_mode
     if ctx.invoked_subcommand == "nxm":
         # Deferred construction: the nxm command builds the service inside
         # its own guarded flow, so a construction-time failure also writes
@@ -130,6 +156,48 @@ def main(ctx: click.Context, api_key: str | None, free: bool, skip_update_check:
     if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
         check_and_prompt_update(console)
+
+
+def _is_json(ctx: click.Context) -> bool:
+    return bool(ctx.obj and ctx.obj.get("json_mode"))
+
+
+def _fail(
+    ctx: click.Context,
+    exc: BaseException,
+    hint: str | None = None,
+    result: Any = None,
+    code: str | None = None,
+) -> None:
+    """Report a failure and exit 1.
+
+    In JSON mode this is the only thing written to stdout: an error envelope
+    carrying a stable ``code``, the exception's real class name, its message,
+    and an optional remedy. ``result`` is kept when an operation partially
+    completed, so a caller gets the outcome and the detail together.
+
+    In human mode this preserves the existing red error line plus hint.
+    Never raises: this always exits.
+    """
+    if _is_json(ctx):
+        from .jsonout import emit_failure
+
+        emit_failure(exc, hint=hint, result=result, code=code)
+    else:
+        console.print(f"[red]Error:[/red] {escape(str(exc))}")
+        if hint:
+            console.print(hint)
+    sys.exit(1)
+
+
+def _emit_result(ctx: click.Context, result: Any) -> bool:
+    """Emit a JSON envelope if JSON mode is on. Returns True when it did."""
+    if not _is_json(ctx):
+        return False
+    from .jsonout import emit_result
+
+    emit_result(result)
+    return True
 
 
 def _cli_progress(event: str, pct: float, msg: str) -> None:
@@ -200,10 +268,13 @@ def sync(
             no_load_order=no_load_order,
             no_extract=no_extract,
             on_progress=_cli_progress,
+            show_progress=not _is_json(ctx),
         )
     except (NexusAPIError, CollectionParseError, StateError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, result):
+        return
 
     if result.collection_dir:
         console.print(f"[dim]Collection directory: {result.collection_dir}[/dim]")
@@ -266,8 +337,7 @@ def update(
         try:
             status = svc.get_status(mods_dir)
         except (NexusAPIError, StateError) as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+            _fail(ctx, e)
 
         console.print(f"[bold]Collection:[/bold] {status.collection_name}")
         console.print(f"[bold]Current revision:[/bold] {status.installed_revision}")
@@ -277,6 +347,15 @@ def update(
         updates = [m for m in status.mods if m.status == "update_available"]
         new = [m for m in status.mods if m.status == "not_installed"]
         removed = [m for m in status.mods if m.status == "removed"]
+
+        if _emit_result(ctx, {
+            "dry_run": True,
+            "status": status,
+            "new": [m.name for m in new],
+            "updates": [m.name for m in updates],
+            "removed": [m.name for m in removed],
+        }):
+            return
 
         if not updates and not new:
             console.print("[green]Everything is up to date![/green]")
@@ -305,10 +384,13 @@ def update(
             no_load_order=no_load_order,
             no_extract=no_extract,
             on_progress=_cli_progress,
+            show_progress=not _is_json(ctx),
         )
     except (NexusAPIError, CollectionParseError, StateError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, result):
+        return
 
     if not result.to_install and not result.to_update:
         console.print("[green]Everything is up to date![/green]")
@@ -340,9 +422,10 @@ def status(ctx: click.Context, mods_dir: Path) -> None:
     try:
         result = svc.get_status(mods_dir)
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        console.print("Run 'sync' first to download a collection.")
-        sys.exit(1)
+        _fail(ctx, e, hint="Run 'sync' first to download a collection.")
+
+    if _emit_result(ctx, result):
+        return
 
     console.print(f"[bold]Collection:[/bold] {result.collection_name}")
     console.print(f"[bold]URL:[/bold] {result.collection_url}")
@@ -390,8 +473,10 @@ def load_order(ctx: click.Context, mods_dir: Path) -> None:
     try:
         files = svc.regenerate_load_order(mods_dir)
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"load_order_files": files}):
+        return
 
     for f in files:
         console.print(f"  [green]Wrote[/green] {f}")
@@ -436,16 +521,14 @@ def deploy(
         try:
             state.load()
         except StateError as e:
-            console.print(f"[red]Error:[/red] {e}")
-            sys.exit(1)
+            _fail(ctx, e)
 
         if game_dir is None and state.game_dir:
             game_dir = Path(state.game_dir)
         if game_dir is None:
             game_dir = find_game_dir(state.game_domain)
         if game_dir is None:
-            console.print("[red]Error:[/red] Could not find game directory.")
-            sys.exit(1)
+            _fail(ctx, FileNotFoundError("Could not find game directory."))
 
         # Load manifest choices for FOMOD filtering
         manifest_choices = {}
@@ -454,6 +537,14 @@ def deploy(
             manifest = CollectionManifest.from_dict(state.manifest_data)
             manifest_choices = manifest.mod_choices
         plan = classify_files(mods_dir, state.game_domain, mod_choices=manifest_choices)
+        if _emit_result(ctx, {
+            "dry_run": True,
+            "game_root_files": len(plan.game_root_files),
+            "data_files": len(plan.data_files),
+            "skipped": len(plan.skipped),
+            "total_files": plan.total_files,
+        }):
+            return
         console.print(f"  Game root files: {len(plan.game_root_files)}")
         console.print(f"  Data files: {len(plan.data_files)}")
         console.print(f"  Skipped: {len(plan.skipped)}")
@@ -470,8 +561,10 @@ def deploy(
             on_progress=_cli_progress,
         )
     except (StateError, NexusAPIError, DeployError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, result):
+        return
 
     if result.errors:
         for err in result.errors:
@@ -524,11 +617,12 @@ def undeploy(ctx: click.Context, mods_dir: Path) -> None:
     except UndeployError as e:
         # Partial undeploy: show exactly what was refused/failed. State keeps
         # those entries, so undeploy can be re-run after fixing them.
-        console.print(f"[red]{e}[/red]")
-        sys.exit(1)
+        _fail(ctx, e)
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"removed": removed}):
+        return
 
     if removed == 0:
         console.print("[yellow]No deployment found. Nothing to undeploy.[/yellow]")
@@ -565,14 +659,21 @@ def add(
             no_load_order=no_load_order,
             no_extract=no_extract,
             on_progress=_cli_progress,
+            show_progress=not _is_json(ctx),
         )
     except (NexusAPIError, ModParseError, StateError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
 
     if not result.success:
-        console.print(f"[red]Error:[/red] {result.error}")
-        sys.exit(1)
+        _fail(
+            ctx,
+            RuntimeError(result.error or "add failed"),
+            result=result,
+            code="operation_failed",
+        )
+
+    if _emit_result(ctx, result):
+        return
 
     if result.pending_download:
         p = result.pending_download
@@ -605,8 +706,10 @@ def add_local(
     try:
         synthetic_id = svc.add_local(name, mods_dir, no_load_order=no_load_order)
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"mod_id": synthetic_id, "name": name}):
+        return
 
     console.print(
         f"[green]Registered '{name}' as manual mod "
@@ -639,8 +742,10 @@ def import_cmd(
             on_progress=_cli_progress,
         )
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, result):
+        return
 
     if result.errors:
         for err in result.errors:
@@ -674,11 +779,13 @@ def enable(ctx: click.Context, mods_dir: Path) -> None:
     svc = ctx.obj["service"]
     try:
         tracked, untracked = svc.track_sync_enable(mods_dir)
-        console.print("[green]Track sync enabled.[/green]")
-        console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
     except (NexusAPIError, StateError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"tracked": tracked, "untracked": untracked}):
+        return
+    console.print("[green]Track sync enabled.[/green]")
+    console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
 
 
 @track_sync_group.command()
@@ -689,10 +796,12 @@ def disable(ctx: click.Context, mods_dir: Path) -> None:
     svc = ctx.obj["service"]
     try:
         svc.track_sync_disable(mods_dir)
-        console.print("[green]Track sync disabled.[/green] Existing tracked mods on Nexus are unchanged.")
     except StateError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"enabled": False}):
+        return
+    console.print("[green]Track sync disabled.[/green] Existing tracked mods on Nexus are unchanged.")
 
 
 @track_sync_group.command()
@@ -703,10 +812,224 @@ def push(ctx: click.Context, mods_dir: Path) -> None:
     svc = ctx.obj["service"]
     try:
         tracked, untracked = svc.track_sync_push(mods_dir)
-        console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
     except (NexusAPIError, StateError) as e:
-        console.print(f"[red]Error:[/red] {e}")
-        sys.exit(1)
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"tracked": tracked, "untracked": untracked}):
+        return
+    console.print(f"Tracked {tracked}, untracked {untracked} on Nexus.")
+
+
+@main.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--file-id", type=int, default=None, help="Remove by Nexus file id")
+@click.option("--mod-id", type=int, default=None, help="Remove by Nexus mod id")
+@click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
+@click.option("--dry-run", is_flag=True, help="Show what would be removed, change nothing")
+@click.pass_context
+def remove(
+    ctx: click.Context,
+    mods_dir: Path,
+    file_id: int | None,
+    mod_id: int | None,
+    no_load_order: bool,
+    dry_run: bool,
+) -> None:
+    """
+    Remove a mod from the collection state.
+
+    Exactly one of --file-id or --mod-id is required. Look ids up with
+    'nexus-dl mods MODS_DIR' rather than guessing. Removal is state-only:
+    it does not delete files from disk, and re-adding the mod restores it.
+    """
+    from .service import list_mods
+
+    svc = ctx.obj["service"]
+
+    if (file_id is None) == (mod_id is None):
+        _fail(
+            ctx,
+            ValueError("exactly one of --file-id or --mod-id is required"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+
+    if dry_run:
+        try:
+            candidates = [
+                m for m in list_mods(mods_dir)
+                if (file_id is not None and m.file_id == file_id)
+                or (mod_id is not None and m.mod_id == mod_id)
+            ]
+        except StateError as e:
+            _fail(ctx, e)
+        if not candidates:
+            _fail(
+                ctx,
+                StateError("no matching mod found"),
+                hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+            )
+        if _emit_result(ctx, {"dry_run": True, "mods": candidates}):
+            return
+        console.print(f"[yellow]Dry run:[/yellow] would remove {len(candidates)} mod(s):")
+        for m in candidates:
+            console.print(f"  {m.name} (file_id={m.file_id}, mod_id={m.mod_id})")
+        return
+
+    try:
+        result = svc.remove_mod(
+            mods_dir, file_id=file_id, mod_id=mod_id, no_load_order=no_load_order
+        )
+    except (StateError, ValueError) as e:
+        _fail(ctx, e)
+
+    if _emit_result(ctx, result):
+        return
+
+    removed = len(result.removed_file_ids) or len(result.removed_mod_ids)
+    if not removed:
+        console.print("[yellow]Nothing removed:[/yellow] no matching mod found.")
+    else:
+        console.print(f"[green]Removed {removed} mod(s).[/green]")
+    for w in result.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+
+
+@main.command()
+@click.argument(
+    "root_dir",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.pass_context
+def collections(ctx: click.Context, root_dir: Path | None) -> None:
+    """List collections under ROOT_DIR (default: current directory).
+
+    Read-only and offline: reflects local state only, never contacts the
+    Nexus API. Unreadable collections are skipped.
+    """
+    from .service import list_collections
+
+    root = root_dir or Path.cwd()
+    found = list_collections(root)
+
+    if _emit_result(ctx, {"root": root, "collections": found}):
+        return
+
+    if not found:
+        console.print(f"[dim]No collections found under {escape(str(root))}.[/dim]")
+        return
+    table = Table(title="Collections")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Name", style="cyan")
+    table.add_column("Game", style="green")
+    table.add_column("Mods", justify="right")
+    table.add_column("Pending", justify="right")
+    for i, c in enumerate(found, 1):
+        table.add_row(str(i), c.name, c.game_domain, str(c.mod_count), str(c.pending_count))
+    console.print(table)
+
+
+@main.command()
+@click.argument(
+    "root_dir",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.pass_context
+def games(ctx: click.Context, root_dir: Path | None) -> None:
+    """Summarise collections and mods per game under ROOT_DIR.
+
+    Read-only and offline. See 'nexus-dl collections' for the per-collection
+    view.
+    """
+    from .service import list_games
+
+    root = root_dir or Path.cwd()
+    found = list_games(root)
+
+    if _emit_result(ctx, {"root": root, "games": found}):
+        return
+
+    if not found:
+        console.print(f"[dim]No collections found under {escape(str(root))}.[/dim]")
+        return
+    table = Table(title="Games")
+    table.add_column("Game", style="green")
+    table.add_column("Collections", justify="right")
+    table.add_column("Total mods", justify="right")
+    for g in found:
+        table.add_row(g.game_domain, str(g.collection_count), str(g.mod_count))
+    console.print(table)
+
+
+@main.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.pass_context
+def mods(ctx: click.Context, mods_dir: Path) -> None:
+    """List tracked mods from local state (read-only, no network).
+
+    Reflects exactly what .nexus-state.json tracks right now. Use this to
+    find the --file-id/--mod-id values that 'nexus-dl remove' needs.
+    """
+    from .service import list_mods
+
+    try:
+        found = list_mods(mods_dir)
+    except StateError as e:
+        _fail(ctx, e, hint="Run 'sync' first to download a collection.")
+
+    if _emit_result(ctx, {"mods": found}):
+        return
+
+    if not found:
+        console.print("[dim]No mods tracked.[/dim]")
+        return
+    table = Table(title="Mods")
+    table.add_column("Name", style="cyan")
+    table.add_column("Version", style="green")
+    table.add_column("file_id", justify="right")
+    table.add_column("mod_id", justify="right")
+    table.add_column("Status", style="dim")
+    for m in found:
+        table.add_row(m.name, m.version or "-", str(m.file_id), str(m.mod_id), m.download_status)
+    console.print(table)
+
+
+@main.command()
+@click.argument(
+    "root_dir",
+    required=False,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
+@click.pass_context
+def health(ctx: click.Context, root_dir: Path | None) -> None:
+    """Run local health checks for the tool installation.
+
+    Read-only and offline. Reports API key source (never the value), nxm
+    handler state, desktop notification capability, and lock state.
+
+    This is a report, not a gate: it exits 0 even when a check reports WARN
+    or ERROR. Read the per-check status rather than the exit code.
+    """
+    from .service import collect_health
+
+    root = root_dir or Path.cwd()
+    try:
+        checks = collect_health(root, api_key_present=bool(ctx.obj.get("api_key")))
+    except Exception as e:  # a failing check must not hide the rest
+        _fail(ctx, e)
+
+    if _emit_result(ctx, {"root": root, "checks": checks}):
+        return
+
+    if not checks:
+        console.print("[dim]No checks ran.[/dim]")
+        return
+    for c in checks:
+        style = {"OK": "green", "WARN": "yellow", "ERROR": "red"}.get(c.status, "dim")
+        console.print(f"[{style}]{c.status}[/{style}] {c.label}: {escape(c.detail)}")
+        if c.remedy:
+            console.print(f"      [dim]{escape(c.remedy)}[/dim]")
 
 
 @main.command()
@@ -1049,13 +1372,13 @@ def handler_group():
     metavar="COLLECTION_DIR",
     type=click.Path(exists=True, file_okay=False, path_type=Path),
 )
-def handler_map(game: str, collection_dir: Path) -> None:
+@click.pass_context
+def handler_map(ctx: click.Context, game: str, collection_dir: Path) -> None:
     """Map GAME to a synced COLLECTION_DIR for nxm:// downloads."""
     try:
         add_mapping(game, collection_dir)
     except HandlerError as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     console.print(
         f"[green]Mapped '{escape(game.strip().lower())}' to "
         f"{escape(str(collection_dir))}[/green]"
@@ -1064,13 +1387,13 @@ def handler_map(game: str, collection_dir: Path) -> None:
 
 @handler_group.command(name="unmap")
 @click.argument("game")
-def handler_unmap(game: str) -> None:
+@click.pass_context
+def handler_unmap(ctx: click.Context, game: str) -> None:
     """Remove all mappings for GAME."""
     try:
         removed = remove_mapping(game)
     except HandlerError as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     if removed:
         console.print(f"[green]Removed mapping for '{escape(game.strip().lower())}'.[/green]")
     else:
@@ -1078,7 +1401,8 @@ def handler_unmap(game: str) -> None:
 
 
 @handler_group.command(name="set-api-key")
-def handler_set_api_key() -> None:
+@click.pass_context
+def handler_set_api_key(ctx: click.Context) -> None:
     """Store the Nexus API key for browser-launched downloads.
 
     The key is read from hidden input (never a command-line argument,
@@ -1092,8 +1416,7 @@ def handler_set_api_key() -> None:
     try:
         path = store_api_key(key)
     except KeyStoreError as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     console.print(f"[green]API key stored in {escape(str(path))} (0600).[/green]")
     console.print(
         "[dim]'Mod manager download' clicks now authenticate with this "
@@ -1103,7 +1426,8 @@ def handler_set_api_key() -> None:
 
 
 @handler_group.command(name="remove-api-key")
-def handler_remove_api_key() -> None:
+@click.pass_context
+def handler_remove_api_key(ctx: click.Context) -> None:
     """Delete the stored API key.
 
     Removes only the key file; game mappings and the desktop handler
@@ -1112,8 +1436,7 @@ def handler_remove_api_key() -> None:
     try:
         removed = remove_api_key()
     except KeyStoreError as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     if removed:
         console.print(
             f"[green]Removed the stored API key from "
@@ -1130,8 +1453,7 @@ def handler_status(ctx: click.Context) -> None:
     try:
         info = DesktopInstaller().status()
     except HandlerError as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
 
     if info["mappings"]:
         table = Table(title="Game mappings")
@@ -1208,7 +1530,8 @@ def handler_status(ctx: click.Context) -> None:
 
 
 @handler_group.command(name="install")
-def handler_install() -> None:
+@click.pass_context
+def handler_install(ctx: click.Context) -> None:
     """Install the user desktop entry so nxm:// links open nexus-dl.
 
     User-level only (XDG applications dir); remembers the previous
@@ -1226,8 +1549,7 @@ def handler_install() -> None:
     try:
         entry = DesktopInstaller().install()
     except (HandlerError, OSError) as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     console.print(f"[green]NXM handler installed: {escape(str(entry))}[/green]")
     console.print(
         "[dim]'Mod manager download' links on Nexus Mods now open nexus-dl. "
@@ -1247,13 +1569,13 @@ def handler_install() -> None:
 
 
 @handler_group.command(name="uninstall")
-def handler_uninstall() -> None:
+@click.pass_context
+def handler_uninstall(ctx: click.Context) -> None:
     """Remove the desktop entry; restores the previous default if ours."""
     try:
         message = DesktopInstaller().uninstall()
     except (HandlerError, OSError) as e:
-        console.print(f"[red]Error:[/red] {escape(str(e))}")
-        sys.exit(1)
+        _fail(ctx, e)
     console.print(f"[green]{escape(message)}[/green]")
 
 

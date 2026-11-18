@@ -276,6 +276,45 @@ To preview what would change without actually downloading:
 nexus-dl update --dry-run ~/mods/bg3
 ```
 
+## Removing a mod
+
+Want a mod out of your collection? For example one that conflicts, or one you simply do not want.
+
+The commands below work on the collection folder: the named subfolder the download created inside `~/mods/bg3`, the one with the `.nexus-state.json` file in it. To avoid retyping it, point a variable at it once (use `$HOME`, and replace `My Collection` with your folder's name):
+
+```bash
+COLL=$HOME/mods/bg3/"My Collection"
+```
+
+First, see what is tracked and find the mod's `file_id`:
+
+```bash
+nexus-dl mods "$COLL"
+```
+
+You get a table of name, version, `file_id`, `mod_id`, and download status. Note the `file_id` of the mod you want to remove.
+
+Preview the removal. This shows what would go and changes nothing:
+
+```bash
+nexus-dl remove "$COLL" --file-id 12345 --dry-run
+```
+
+When that is the right mod, remove it:
+
+```bash
+nexus-dl remove "$COLL" --file-id 12345
+```
+
+What this does:
+- Removes the mod from the collection's records (every tracked file of that mod at once)
+- Keeps it gone: later `sync` or `update` runs will not bring it back
+- Leaves downloaded files on disk (to clean files out of your game folder, see [Removing deployed mods](#removing-deployed-mods))
+
+Changed your mind? Re-add the mod with `nexus-dl add` (or a "Mod manager download" link) and it comes back into the collection.
+
+You can also target the whole mod page with `--mod-id 123` instead of `--file-id 12345`. Pass exactly one of the two.
+
 ## Deploying to your game
 
 Downloading mods is only half the job - the game needs to find them. The `deploy` command puts the mod files where the game expects them.
