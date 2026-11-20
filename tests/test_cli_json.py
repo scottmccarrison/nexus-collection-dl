@@ -281,7 +281,7 @@ def test_human_mode_still_prints_the_red_line(tmp_path):
 # --- the flag is refused where it cannot apply ------------------------------
 
 
-@pytest.mark.parametrize("cmd", ["shell", "serve", "handler", "nxm"])
+@pytest.mark.parametrize("cmd", ["shell", "handler", "nxm"])
 def test_json_refused_for_interactive_commands(cmd):
     r = CliRunner().invoke(cli_module.main, ["--json", cmd])
     assert r.exit_code == 2

@@ -17,7 +17,7 @@ Global options (before the subcommand):
 | `--api-key KEY` | Nexus Mods API key for this run. Resolution order is `--api-key`, then the `NEXUS_API_KEY` environment variable, then the stored key (`nexus-dl handler set-api-key`). |
 | `--json` | Emit the machine-readable envelope on stdout and nothing else. Human diagnostics move to stderr. Must come **before** the subcommand. |
 
-**JSON mode is not available** for `serve`, `shell`, `nxm`, or `handler`.
+**JSON mode is not available** for `shell`, `nxm`, or `handler`.
 Passing `--json` to them (or to any command in the wrong position) is a usage
 error: text on stderr, exit code 2, no JSON.
 
@@ -310,12 +310,11 @@ rather than the exit code.
 | `root` | str | The root directory scanned |
 | `checks` | list of HealthCheck | One entry per check |
 
-### serve, shell, nxm, handler (no JSON)
+### shell, nxm, handler (no JSON)
 
 These do not accept `--json`. Signatures for completeness:
 
 ```
-nexus-dl serve MODS_DIR [--port N]        # local web UI
 nexus-dl shell [ROOT_DIR]                 # interactive REPL
 nexus-dl nxm NXM_URI [--mods-dir D] [--output D] [--no-extract] [--no-load-order] [--notify/--no-notify]
 nexus-dl handler map GAME COLLECTION_DIR

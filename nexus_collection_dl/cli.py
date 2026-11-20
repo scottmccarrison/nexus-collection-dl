@@ -102,7 +102,7 @@ def main(
         # diagnostic (banner, update notice, warnings, progress prose) moves
         # to stderr so a caller can pipe stdout straight into a parser.
         console = Console(stderr=True)
-        if ctx.invoked_subcommand in {"serve", "shell", "nxm", "handler"}:
+        if ctx.invoked_subcommand in {"shell", "nxm", "handler"}:
             raise click.UsageError(
                 "--json is not supported for "
                 f"'{ctx.invoked_subcommand}': it is interactive or config-only, "
@@ -1031,23 +1031,6 @@ def health(ctx: click.Context, root_dir: Path | None) -> None:
         console.print(f"[{style}]{c.status}[/{style}] {c.label}: {escape(c.detail)}")
         if c.remedy:
             console.print(f"      [dim]{escape(c.remedy)}[/dim]")
-
-
-@main.command()
-@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
-@click.option("--port", type=int, default=5000, help="Port to serve on")
-@click.pass_context
-def serve(ctx: click.Context, mods_dir: Path, port: int) -> None:
-    """Launch the web UI for managing mods."""
-    from .web import create_and_run
-
-    api_key = ctx.obj["api_key"]
-    force_free = ctx.obj.get("force_free", False)
-    console.print(f"[bold]Starting web UI on http://127.0.0.1:{port}[/bold]")
-    console.print(f"[dim]Mods directory: {mods_dir}[/dim]")
-    if force_free:
-        console.print("[yellow]Free-user mode forced[/yellow]")
-    create_and_run(api_key=api_key, mods_dir=mods_dir, port=port, force_free=force_free)
 
 
 @main.command(name="shell")

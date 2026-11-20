@@ -87,9 +87,8 @@ def to_jsonable(value: Any) -> Any:
     """Convert a service result to something json.dumps accepts.
 
     `dataclasses.asdict` leaves `Path` objects intact (SyncResult.collection_dir,
-    CollectionSummary.path, NxmResult and friends), which is why the web layer
-    only works today for results that happen to be all strings. Coerce
-    explicitly so every result serializes.
+    CollectionSummary.path, NxmResult and friends), which `json.dumps`
+    refuses. Coerce explicitly so every result serializes.
     """
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return to_jsonable(dataclasses.asdict(value))

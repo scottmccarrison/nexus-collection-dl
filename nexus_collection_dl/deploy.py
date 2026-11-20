@@ -424,7 +424,7 @@ class DeployError(Exception):
 class UndeployError(DeployError):
     """Raised when undeploy could not safely remove everything.
 
-    Carries structured detail so CLI/web callers can show exactly which
+    Carries structured detail so callers can show exactly which
     paths were refused or failed instead of reporting a clean success.
     """
 
