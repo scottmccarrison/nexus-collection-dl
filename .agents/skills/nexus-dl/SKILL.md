@@ -57,7 +57,7 @@ other command). Never pass the parent to `status`/`update`/`deploy`/`remove`.
 | "the load order is stale" | `nexus-dl --json load-order <dir>` |
 | "I downloaded the files by hand (free account)" | save the archives into `<dir>`, then `nexus-dl --json import <dir>` |
 
-`serve`, `shell`, `nxm`, and `handler` exist but do not accept `--json`, and
+`shell`, `nxm`, and `handler` exist but do not accept `--json`, and
 `shell` is interactive. An agent should not use them; see
 [references/commands.md](references/commands.md) for their signatures.
 
@@ -218,7 +218,7 @@ Failure envelope:
   `error.code: "operation_failed"`, and the `AddResult` object in `result`, so
   you get both the outcome and the detail. Exit code is 1.
 - **Wrong invocation is not JSON.** Misusing the CLI (unknown flag, missing
-  argument, `--json` after the subcommand, `--json` on `serve`/`shell`/`nxm`/
+  argument, `--json` after the subcommand, `--json` on `shell`/`nxm`/
   `handler`) is a usage error: plain text on stderr, exit code 2. Read stderr;
   exit 2 means you called it wrong, not that the operation failed.
 - `result` is always an object, never a bare list.

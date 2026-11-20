@@ -41,8 +41,9 @@ not in the envelope at all: they exit 2 with plain text on stderr.
 A result's `errors`/`warnings`/`error` fields are a diagnostic record, not
 the `error.code` above. They carry the deliberate part: which path, which
 refusal reason. The exception suffix beside it is a short category, never
-raw OS or unexpected-exception text, because those fields also reach a
-browser through the web UI's task view.
+raw OS or unexpected-exception text, because those fields get copied into
+whatever output a caller builds (`--json` envelopes, logs, harness
+transcripts) and arbitrary exception text should not travel with them.
 
 - `OSError` becomes the fixed OS phrase plus the symbolic errno name, for
   example `no such file or directory (ENOENT)`. No filename, no

@@ -1,6 +1,6 @@
 # nexus-collection-dl
 
-A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. Comes with a local web UI and a CLI.
+A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. A CLI, with an interactive shell on top.
 
 > [!IMPORTANT]
 > **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
@@ -23,7 +23,7 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 **`main` is stable.** It gets bug fixes and the features that have proven out. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
 
-**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly, with the web UI planned for deprecation once the shell covers the workflows people use. Beta points are tagged as `v0.3.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
 
 For AI harnesses, the repo ships an agent skill at [`.agents/skills/nexus-dl/`](.agents/skills/nexus-dl/). It teaches the command surface, the safe defaults (read before write, dry-run before deploy), and the [`--json` machine-readable output](#machine-readable-output), so a harness can drive the same CLI the shell wraps.
 
@@ -92,29 +92,6 @@ export NEXUS_API_KEY="your-api-key-here"
 Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
 
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
-
-## Web UI
-
-Launch the local web interface for day-to-day mod management:
-
-```bash
-nexus-dl serve ~/mods/starfield
-
-# Custom port
-nexus-dl serve ~/mods/starfield --port 8080
-```
-
-Opens a dark-themed dashboard at `http://127.0.0.1:5000` with:
-
-- **Dashboard** - collection info, deployment status, quick action buttons (sync, update, deploy, undeploy)
-- **Mods** - full mod table with status badges, add mod by URL, register local mods
-- **Background tasks** - long-running operations (sync, update, deploy) stream progress in real time
-
-There's also a standalone entry point:
-
-```bash
-nexus-dl-web ~/mods/starfield
-```
 
 ## CLI Usage
 
@@ -424,7 +401,7 @@ nexus-dl --json status ~/mods/starfield/My\ Collection | jq .ok
 nexus-dl --json update ~/mods/starfield/My\ Collection --dry-run | jq '.result.updates'
 ```
 
-The envelope is `{"ok", "result", "error"}`: `ok` is true exactly when the command exits 0; on failure `error` carries a stable `code`, the exception type, the message, and an optional `hint`; a partial failure (an `add` that reports `success: false`, say) keeps its `result` alongside the error under `code` `operation_failed`. Flag placement matters: `nexus-dl --json status <dir>`, not `nexus-dl status --json <dir>`, and a wrong invocation is a plain-text usage error on stderr with exit code 2, not JSON. `serve`, `shell`, `nxm`, and `handler` do not support `--json`. The [agent skill](.agents/skills/nexus-dl/) carries the per-command result shapes and the error-code reference.
+The envelope is `{"ok", "result", "error"}`: `ok` is true exactly when the command exits 0; on failure `error` carries a stable `code`, the exception type, the message, and an optional `hint`; a partial failure (an `add` that reports `success: false`, say) keeps its `result` alongside the error under `code` `operation_failed`. Flag placement matters: `nexus-dl --json status <dir>`, not `nexus-dl status --json <dir>`, and a wrong invocation is a plain-text usage error on stderr with exit code 2, not JSON. `shell`, `nxm`, and `handler` do not support `--json`. The [agent skill](.agents/skills/nexus-dl/) carries the per-command result shapes and the error-code reference.
 
 ### Interactive shell
 
@@ -476,8 +453,6 @@ The `import` command matches downloaded files by filename (case-insensitive), ex
 
 Re-running `sync` or `update` as a free user won't regress mods you've already imported - only new or changed mods show as pending.
 
-The web UI also supports this workflow: the dashboard shows a "Pending Downloads" card with clickable links, and an "Import Downloads" button.
-
 ## Load order
 
 `nexus-dl` generates load order files automatically during `sync` and `update`. The approach differs by game type:
@@ -517,7 +492,6 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 ## How it works
 
-- **serve** - Launches a local web UI for managing mods from your browser.
 - **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod (skipping any already downloaded), extracts archives into per-collection subdirectories, generates load order, and reports file conflicts. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
 - **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
@@ -528,9 +502,9 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
-- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/status`) over the same commands.
+- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/deploy`, `/status`) over the same commands.
 
-Both the web UI and CLI share the same service layer, so all operations behave identically regardless of interface.
+Everything runs through the same service layer, so a CLI call and a shell command behave identically.
 
 State is tracked in a `.nexus-state.json` file inside your mods directory, including the cached collection manifest for offline load order regeneration.
 
