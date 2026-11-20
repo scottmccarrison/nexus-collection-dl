@@ -536,6 +536,50 @@ def test_service_rejects_staging_inside_game(svc, tmp_path):
     assert any("inside the game directory" in e for e in result.errors)
 
 
+def test_first_deploy_honours_game_dir_and_prefix_params(svc, tmp_path):
+    """--game-dir and --prefix must satisfy the checks on a first deploy.
+
+    State has recorded neither and the game is not in the auto-detect
+    list (Cyberpunk via Heroic is the reported case). The checks used to
+    read state instead of the effective values, error out on
+    "not in auto-detect list", and stop the deploy.
+    """
+    mods, game, prefix = _svc_env(tmp_path)
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/cyberpunk2077/collections/test",
+        "Test Collection", 1, "cyberpunk2077",
+    )
+    state.game_dir = ""
+    state.proton_prefix = ""
+    state.save()
+
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
+
+    assert result.errors == []
+    assert result.deployed_count == 1
+    assert not any("not in auto-detect" in w for w in result.warnings)
+    assert not any("Proton prefix not found" in w for w in result.warnings)
+
+
+def test_pre_deploy_checks_still_report_a_missing_prefix(svc, tmp_path):
+    """The warning is right when nothing resolved a prefix; it is only
+    wrong when one was passed in."""
+    mods, game, _prefix = _svc_env(tmp_path)
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/cyberpunk2077/collections/test",
+        "Test Collection", 1, "cyberpunk2077",
+    )
+    state.game_dir = ""
+    state.proton_prefix = ""
+    state.save()
+
+    warnings = svc.pre_deploy_checks(state, game, mods, "copy", None)
+    assert [w.code for w in warnings] == ["no_prefix"]
+    assert not any(w.severity == "error" for w in warnings)
+
+
 def test_busy_lock_serializes_deploy_and_undeploy(svc, tmp_path):
     mods, game, _prefix = _svc_env(tmp_path)
     with CollectionLock(mods):

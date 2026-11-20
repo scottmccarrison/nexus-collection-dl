@@ -1833,13 +1833,23 @@ class ModManagerService:
         ]
 
     def pre_deploy_checks(
-        self, state: "CollectionState", game_dir: Path, mods_dir: Path, method: str
+        self, state: "CollectionState", game_dir: Path, mods_dir: Path, method: str,
+        prefix: Path | None = None,
     ) -> list["DeployWarning"]:
-        """Run pre-deployment validation checks."""
+        """Run pre-deployment validation checks.
+
+        Checks report on the effective values for this deploy (the
+        ``game_dir`` and ``prefix`` the caller resolved), not on what
+        happens to be recorded in state. A first deploy of a game the
+        auto-detect list does not know, with ``--game-dir`` and
+        ``--prefix`` given on the command line, must pass: the user did
+        set them.
+        """
         warnings: list[DeployWarning] = []
 
-        # 1. Proton prefix missing
-        if find_proton_prefix(state.game_domain) is None and not state.proton_prefix:
+        # 1. Proton prefix missing (None means nothing resolved one: not
+        # the parameter, not state, not auto-detection).
+        if prefix is None:
             warnings.append(DeployWarning(
                 "no_prefix", "Proton prefix not found - plugins.txt and INI won't be written", "warning"
             ))
@@ -1883,8 +1893,8 @@ class ModManagerService:
                 "warning",
             ))
 
-        # 6. Game not in auto-detect
-        if state.game_domain not in STEAM_APP_IDS and not state.game_dir:
+        # 6. Game not in auto-detect, and no game dir from any source
+        if state.game_domain not in STEAM_APP_IDS and not game_dir:
             warnings.append(DeployWarning(
                 "unknown_game",
                 f"Game '{state.game_domain}' not in auto-detect list - game dir must be set manually",
@@ -1892,8 +1902,8 @@ class ModManagerService:
             ))
 
         # 7. Stale deployment
-        if state.deployed_at and state.game_dir:
-            game_path = Path(state.game_dir)
+        if state.deployed_at and game_dir:
+            game_path = Path(game_dir)
             # Check common game executables
             for exe_name in ["Starfield.exe", "SkyrimSE.exe", "Fallout4.exe"]:
                 exe = game_path / exe_name
@@ -1973,9 +1983,17 @@ class ModManagerService:
                 state.save()
                 journal.clear()
 
+            # Resolve Proton prefix before the checks, so they report on
+            # the value this deploy will actually use. The parameter wins
+            # over state, and auto-detection is the last resort.
+            if prefix is None and state.proton_prefix:
+                prefix = Path(state.proton_prefix)
+            if prefix is None:
+                prefix = find_proton_prefix(game_domain)
+
             # Pre-deploy validation
             method = "copy" if use_copy else "symlink"
-            check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method)
+            check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
             deploy_warnings = [w.message for w in check_warnings]
             deploy_warnings.extend(reports)
 
@@ -1986,12 +2004,6 @@ class ModManagerService:
                     0, [], [w.message for w in errors_found], str(game_dir), False,
                     warnings=deploy_warnings,
                 )
-
-            # Resolve Proton prefix
-            if prefix is None and state.proton_prefix:
-                prefix = Path(state.proton_prefix)
-            if prefix is None:
-                prefix = find_proton_prefix(game_domain)
 
             # Preflight: classify BEFORE any destructive removal of the old
             # deployment, so a staging directory with nothing deployable
