@@ -25,8 +25,11 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from .fomod_plan import InstallPlan
 
 from .errmsg import exception_reason
 
@@ -332,14 +335,103 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     return ("data", rel_path)
 
 
+def _fomod_plans(
+    mods_dir: Path, mod_choices: dict[int, dict]
+) -> list[tuple[Path, "InstallPlan | None", tuple[str, ...]]]:
+    """Install plans for every readable ModuleConfig in the tree.
+
+    Each plan carries the directory its sources are relative to (the
+    config's own position decides that, see ``plan_source_root``) and the
+    source paths the config mentions at all, selected or not. The latter
+    is ownership: a file under one of them belongs to this mod, and a
+    file outside all of them belongs to whatever else shares the tree.
+
+    A plan is ``None`` when its conditions could not all be evaluated.
+    Those mods keep the legacy folder heuristic rather than shipping a
+    guessed install.
+    """
+    from .fomod_plan import (
+        load_module_config,
+        plan_source_root,
+        resolve_install_plan,
+        selections_from_manifest,
+    )
+
+    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
+    for config_path in sorted(mods_dir.rglob("*")):
+        if not config_path.is_file() or config_path.name.lower() != "moduleconfig.xml":
+            continue
+        rel = config_path.relative_to(mods_dir)
+        if len(rel.parts) > 3:
+            continue
+        config = load_module_config(config_path)
+        if config is None:
+            continue
+
+        selections: dict = {}
+        for choices in mod_choices.values():
+            matched = selections_from_manifest(choices, config)
+            if matched:
+                selections = matched
+                break
+
+        resolved = resolve_install_plan(config, selections)
+        owned = tuple(entry.source.lower() for entry in config.all_entries())
+        plans.append(
+            (
+                plan_source_root(config_path),
+                None if resolved.indeterminate else resolved,
+                owned,
+            )
+        )
+    return plans
+
+
+def _plan_lookup(
+    file_path: Path,
+    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...]]],
+) -> tuple["InstallPlan | None", str, bool] | None:
+    """Locate ``file_path`` in a FOMOD plan.
+
+    Returns ``(plan, path under the source root, owned)`` when the file
+    falls under some config's source root. ``owned`` is False when the
+    path is under the root but under none of the config's own entries,
+    which is how another mod's files escape being claimed by a config
+    that sits at the shared root.
+
+    ``file_path`` must be absolute: source roots come from the config's
+    own location and are absolute too, and a relative path silently
+    matches nothing.
+    """
+    for source_root, plan, owned_prefixes in plans:
+        try:
+            under = file_path.relative_to(source_root)
+        except ValueError:
+            continue
+        under_s = under.as_posix()
+        owned = any(
+            under_s.lower() == prefix or under_s.lower().startswith(prefix + "/")
+            for prefix in owned_prefixes
+        )
+        return plan, under_s, owned
+    return None
+
+
 def classify_files(
     mods_dir: Path,
     game_domain: str,
     mod_choices: dict[int, dict] | None = None,
 ) -> DeploymentPlan:
-    """Walk the staging directory and classify all files for deployment."""
+    """Walk the staging directory and classify all files for deployment.
+
+    Files a FOMOD config claims are installed from its install plan, at
+    the destination the config names. Everything else keeps the folder
+    heuristics: numbered option wrappers, SFSE version directories, and
+    the top-level skip set for mods whose config could not be read.
+    """
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
+    fomod_plans = _fomod_plans(mods_dir, mod_choices or {})
 
     plan = DeploymentPlan()
 
@@ -354,6 +446,22 @@ def classify_files(
         if parts[0].startswith("."):
             plan.skipped.append((rel, "hidden file"))
             continue
+
+        # Files a readable FOMOD config claims follow its install plan.
+        hit = _plan_lookup(file_path, fomod_plans)
+        if hit is not None:
+            fomod_plan, under, owned = hit
+            if fomod_plan is not None and owned:
+                found = fomod_plan.lookup(under)
+                if found is None:
+                    plan.skipped.append((rel, "not in the FOMOD install plan"))
+                    continue
+                plan_dest, _priority = found
+                if not plan_dest:
+                    plan.skipped.append((rel, "empty FOMOD destination"))
+                    continue
+                plan.data_files.append((file_path, Path(plan_dest)))
+                continue
 
         # Skip unselected FOMOD option folders
         if parts[0] in fomod_skip:

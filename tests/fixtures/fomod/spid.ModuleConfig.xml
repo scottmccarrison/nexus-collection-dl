@@ -1,0 +1,66 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+    <moduleName>Spell Perk Item Distributor</moduleName>
+    <installSteps order="Explicit">
+        <installStep name="Main">
+            <optionalFileGroups order="Explicit">
+                <group name="DLL" type="SelectExactlyOne">
+                    <plugins order="Explicit">
+                        <plugin name="SSE v1.6.629+ (&quot;Anniversary Edition&quot;)">
+                            <description>Select this if you are using Skyrim Anniversary Edition v1.6.629 or higher.</description>
+                            <image path="fomod/images/cover.png" />
+                            <files>
+                                <folder source="AE/SKSE/Plugins" destination="SKSE/Plugins" priority="0" />
+                            </files>
+                            <typeDescriptor>
+                                <dependencyType>
+                                    <defaultType name="Optional" />
+                                    <patterns>
+                                        <pattern>
+                                            <dependencies>
+                                                <gameDependency version="1.6" />
+                                            </dependencies>
+                                            <type name="Recommended" />
+                                        </pattern>
+                                        <pattern>
+                                            <dependencies>
+                                                <gameDependency version="1.5" />
+                                            </dependencies>
+                                            <type name="Optional" />
+                                        </pattern>
+                                    </patterns>
+                                </dependencyType>
+                            </typeDescriptor>
+                        </plugin>
+                        <plugin name="SSE v1.5.97 (&quot;Special Edition&quot;)">
+                            <description>Select this if you are using Skyrim Special Edition v1.5.97.</description>
+                            <image path="fomod/images/cover.png" />
+                            <files>
+                                <folder source="SE/SKSE/Plugins" destination="SKSE/Plugins" priority="0" />
+                            </files>
+                            <typeDescriptor>
+                                <dependencyType>
+                                    <defaultType name="Optional" />
+                                    <patterns>
+                                        <pattern>
+                                            <dependencies>
+                                                <gameDependency version="1.6" />
+                                            </dependencies>
+                                            <type name="Optional" />
+                                        </pattern>
+                                        <pattern>
+                                            <dependencies>
+                                                <gameDependency version="1.5" />
+                                            </dependencies>
+                                            <type name="Recommended" />
+                                        </pattern>
+                                    </patterns>
+                                </dependencyType>
+                            </typeDescriptor>
+                        </plugin>
+                    </plugins>
+                </group>
+            </optionalFileGroups>
+        </installStep>
+    </installSteps>
+</config>
