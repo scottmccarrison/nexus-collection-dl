@@ -161,6 +161,37 @@ def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
     return config
 
 
+def _nxm_fomod_blocker(archive_path: Path) -> str | None:
+    """A message when this archive must not be extracted without choices.
+
+    Only a positively identified FOMOD is blocked. An archive this tool
+    cannot enumerate at all returns None: extraction has its own honest
+    failure for that, and refusing every uninspectable archive would stop
+    downloads that are not FOMOD at all.
+
+    Extracting a FOMOD without its option choices installs the wrong
+    content, and for the common all-Optional installer that content is
+    nothing at all, which looks exactly like success. This is the click
+    path's half of the rule ``add`` and ``import`` already follow.
+    """
+    try:
+        config = _fomod_config_for_archive(archive_path)
+    except FomodInstallerError as e:
+        return exception_reason(e)
+    except ExtractionError:
+        return None
+    if config is None:
+        return None
+    parent = archive_path.parent
+    return (
+        f"{archive_path.name} is a FOMOD mod and needs option choices before "
+        f"it can be extracted; extracting it now would install the wrong "
+        f"content. Run 'nexus-dl import {parent} --fomod-option "
+        f"\"Group:Option\"' to install it with your choices. The archive is "
+        f"kept at {archive_path}."
+    )
+
+
 def _resolve_fomod_picks(
     config: "ModuleConfig",
     archive_name: str,
@@ -2689,6 +2720,32 @@ class ModManagerService:
 
             if (
                 existing is not None
+                and existing.download_status == "pending_choices"
+                and existing.filename
+                and not no_extract
+                and (target / existing.filename).exists()
+            ):
+                # A FOMOD waiting on its option choices: a re-click must
+                # not extract it, and there is nothing to download either.
+                retained = target / existing.filename
+                message = _nxm_fomod_blocker(retained) or (
+                    f"{existing.filename} is a FOMOD mod that still needs "
+                    f"option choices before it can be extracted. Run "
+                    f"'nexus-dl import {target} --fomod-option "
+                    f"\"Group:Option\"' to install it with your choices. "
+                    f"The archive is kept at {retained}."
+                )
+                return self._nxm_failure(
+                    info,
+                    message,
+                    collection_dir=target,
+                    mod_name=existing.name,
+                    filename=existing.filename,
+                    download_status="pending_choices",
+                )
+
+            if (
+                existing is not None
                 and existing.download_status == "pending_download"
                 and existing.filename
                 and not no_extract
@@ -2974,6 +3031,44 @@ class ModManagerService:
 
             extracted = False
             if not no_extract and is_archive(path):
+                blocker = _nxm_fomod_blocker(path)
+                if blocker is not None:
+                    # A FOMOD with no option choices: never extract it.
+                    # Registering the entry as needing choices is what
+                    # lets `import` finish the job with the user's picks.
+                    pending_recorded = False
+                    if existing is None:
+                        download_info["manual"] = True
+                        download_info["download_status"] = "pending_choices"
+                        state.add_mod(download_info)
+                        state.mods[info.file_id].phase = 999
+                        # Same explicit re-add intent as the failed-
+                        # extraction branch below.
+                        state.clear_removed(info.mod_id)
+                        try:
+                            state.save()
+                            pending_recorded = True
+                        except (OSError, StateError):
+                            pending_recorded = False
+                    else:
+                        previous_status = existing.download_status
+                        existing.download_status = "pending_choices"
+                        state.clear_removed(info.mod_id)
+                        try:
+                            state.save()
+                            pending_recorded = True
+                        except (OSError, StateError):
+                            existing.download_status = previous_status
+                    return self._nxm_failure(
+                        info,
+                        blocker,
+                        collection_dir=target,
+                        mod_name=mod_name,
+                        filename=filename,
+                        download_status=(
+                            "pending_choices" if pending_recorded else ""
+                        ),
+                    )
                 try:
                     extract_archive(path, target)
                     extracted = True

@@ -118,6 +118,7 @@ _EVENTS_OUTCOMES = frozenset(
         "extracted_from_archive",
         "already_downloaded",
         "pending_download",
+        "pending_choices",
         "error",
     }
 )
