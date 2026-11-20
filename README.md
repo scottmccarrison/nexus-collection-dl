@@ -494,7 +494,7 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 - **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod (skipping any already downloaded), extracts archives into per-collection subdirectories, generates load order, and reports file conflicts. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
-- **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
+- **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal). If the archive carries a FOMOD installer (it needs option choices like a body type before anything is extracted), `add` refuses rather than installing every option folder at once, names what it found, and keeps the archive.
 - **add-local** - Registers an already-present mod in the state without downloading anything.
 - **import** - Matches manually downloaded files to pending mods, extracts archives, and regenerates load order. Used with free accounts after downloading files through the browser.
 - **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files. Backs up any pre-existing destination file first and journals every mutation for crash recovery.

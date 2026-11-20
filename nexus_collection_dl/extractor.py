@@ -16,6 +16,31 @@ class ExtractionError(Exception):
     """Raised when archive extraction fails."""
 
 
+class FomodInstallerError(ExtractionError):
+    """The archive carries a FOMOD installer and cannot be extracted safely.
+
+    FOMOD installers need option choices (body type, texture set, and so
+    on) before anything is extracted, and extracting one without making
+    those choices installs every option folder at once, including options
+    the installer marks as mutually exclusive. Rather than guess, callers
+    refuse and keep the archive.
+    """
+
+    def __init__(self, member: str, archive_path: Path) -> None:
+        self.member = member
+        self.archive_path = archive_path
+        super().__init__(
+            f"{member} marks this archive as a FOMOD mod. FOMOD installers "
+            f"need option choices before extraction (body type, texture "
+            f"set, that sort of thing), and nexus-dl does not make those "
+            f"choices yet. Extracting it now would install every option "
+            f"folder at once, including options that are meant to be "
+            f"mutually exclusive. The archive is kept at "
+            f"{archive_path}. Install it with a tool that supports FOMOD, "
+            f"or wait for option support in nexus-dl."
+        )
+
+
 def sniff_archive_magic(filepath: Path) -> str | None:
     """Detect archive type by magic bytes alone.
 
@@ -258,6 +283,90 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
         f"Cannot extract RAR: {archive_path.name}. "
         "Install unar (apt install unar / dnf install unar) for RAR5 support."
     )
+
+
+# FOMOD installer markers. A `fomod` folder alone is not proof: a mod may
+# ship only `fomod/header.png`, which is not an installer and must not be
+# refused. Requiring a known filename means an exotic installer can slip
+# through, and that is the cheaper error of the two.
+_FOMOD_MARKER_NAMES = frozenset({"moduleconfig.xml", "script.lua", "info.xml"})
+
+
+def find_fomod_installer(archive_path: Path) -> str | None:
+    """Return the member path proving this archive is a FOMOD mod, else None.
+
+    Enumeration only; nothing is written and nothing is extracted. A
+    member counts when its path has a ``fomod`` segment (any case, any
+    depth) and its basename is one of ``ModuleConfig.xml``, ``script.lua``,
+    or ``info.xml`` (any case). So ``fomod/ModuleConfig.xml``,
+    ``Some Mod/fomod/script.lua`` and ``FOMOD/Info.XML`` all count.
+
+    Returns None in two different situations and callers must tell them
+    apart: None when the archive was read and carries no installer, and
+    None when the archive could not be enumerated at all. Use
+    ``can_enumerate_members`` before relying on the negative.
+    """
+    names = _list_archive_members(archive_path)
+    if names is None:
+        return None
+    for name in names:
+        if _fomod_marker_from_name(name) is not None:
+            return name
+    return None
+
+
+def _fomod_marker_from_name(name: str) -> str | None:
+    """Return ``name`` when it is a FOMOD installer member, else None.
+
+    A member counts when its path has a ``fomod`` segment (any case, any
+    depth) and its basename is one of ``ModuleConfig.xml``, ``script.lua``,
+    or ``info.xml`` (any case). Separators may be ``/`` or ``\\``; real
+    FOMOD configs use backslashes in their own ``source`` paths and
+    archives carry both.
+    """
+    parts = [p for p in name.replace("\\", "/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    if parts[-2].lower() != "fomod":
+        return None
+    if parts[-1].lower() in _FOMOD_MARKER_NAMES:
+        return name
+    return None
+
+
+def can_enumerate_members(archive_path: Path) -> bool:
+    """True when the archive's member list can be read at all.
+
+    The library path (zipfile, py7zr, rarfile) always can. The subprocess
+    extraction fallbacks cannot be listed with what this module has, and
+    those callers should warn rather than pretend the check ran.
+    """
+    return _list_archive_members(archive_path) is not None
+
+
+def _list_archive_members(archive_path: Path) -> list[str] | None:
+    """Member names without extracting, or None when enumeration fails.
+
+    Returns None rather than raising because a failure here is not an
+    extraction failure: it means we could not look, and the caller decides
+    whether that is fatal. An empty list is a real answer (an empty
+    archive) and is not the same as None.
+    """
+    archive_type = detect_archive_type(archive_path)
+    try:
+        if archive_type == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                return list(zf.namelist())
+        if archive_type == "7z":
+            with py7zr.SevenZipFile(archive_path, "r") as szf:
+                return list(szf.getnames())
+        if archive_type == "rar":
+            with rarfile.RarFile(archive_path, "r") as rf:
+                return list(rf.namelist())
+    except Exception:
+        return None
+    # Unknown type, or one only the subprocess fallbacks can open.
+    return None
 
 
 def is_archive(filepath: Path) -> bool:

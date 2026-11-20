@@ -14,6 +14,7 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
+from .extractor import ExtractionError
 from .handler import (
     DESKTOP_ENTRY_NAME,
     DesktopInstaller,
@@ -662,7 +663,7 @@ def add(
             on_progress=_cli_progress,
             show_progress=not _is_json(ctx),
         )
-    except (NexusAPIError, ModParseError, StateError) as e:
+    except (NexusAPIError, ModParseError, StateError, ExtractionError) as e:
         _fail(ctx, e)
 
     if not result.success:

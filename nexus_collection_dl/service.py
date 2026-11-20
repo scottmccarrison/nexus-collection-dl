@@ -40,7 +40,15 @@ from .downloader import (
     validate_download_filename,
 )
 from .errmsg import exception_reason
-from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
+from .extractor import (
+    ExtractionError,
+    FomodInstallerError,
+    can_enumerate_members,
+    extract_archive,
+    find_fomod_installer,
+    is_archive,
+    sniff_archive_magic,
+)
 from .handler import (
     DesktopInstaller,
     NxmRoutingError,
@@ -105,6 +113,34 @@ def _state_text(value: Any, fallback: str = "") -> str:
         return str(value)
     except Exception:
         return fallback
+
+
+def _check_not_fomod(archive_path: Path) -> None:
+    """Raise if this archive must not be extracted without option choices.
+
+    Two refusals for two different reasons. A detected FOMOD installer
+    raises FomodInstallerError (error code ``fomod_installer``), because
+    extracting it installs every option folder at once, including options
+    the installer marks as mutually exclusive. An archive we cannot
+    enumerate at all is refused too: we cannot tell whether it is FOMOD,
+    and extracting on a guess is the harm this exists to stop. ``--no-extract``
+    is the escape hatch for a mod the caller knows is safe.
+
+    Call this before extracting, on the paths where a user asked for one
+    mod and no option choices exist (add, import). The collection path
+    (sync, update) supplies choices from the manifest and is not covered.
+    """
+    if not can_enumerate_members(archive_path):
+        raise ExtractionError(
+            f"could not inspect {archive_path.name} for a FOMOD installer: "
+            f"this archive format cannot be listed here. Extracting on a "
+            f"guess could install every option of a FOMOD mod at once. If "
+            f"you know it is not a FOMOD mod, use --no-extract and extract "
+            f"it yourself."
+        )
+    marker = find_fomod_installer(archive_path)
+    if marker is not None:
+        raise FomodInstallerError(marker, archive_path)
 
 
 @dataclass
@@ -1592,6 +1628,14 @@ class ModManagerService:
                 )
 
             progress("extract", 0.85, "Extracting...")
+            # Refuse before extracting anything. A FOMOD archive needs
+            # option choices, and extracting it installs every option
+            # folder at once. Checking every file first means a multi-file
+            # add extracts nothing when any one of them is a FOMOD mod.
+            if not no_extract:
+                for _mod, file_path in results:
+                    if is_archive(file_path):
+                        _check_not_fomod(file_path)
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
@@ -2295,8 +2339,15 @@ class ModManagerService:
                 is_arch = is_archive(match)
                 try:
                     if not no_extract and is_arch:
+                        _check_not_fomod(match)
                         extract_archive(match, mods_dir)
                         extracted += 1
+                except FomodInstallerError as e:
+                    # Same contract as a failed extraction: report it and
+                    # leave the item pending rather than abort the batch.
+                    # The message is self-contained, so it is the report.
+                    errors.append(f"{mod_state.name}: {exception_reason(e)}")
+                    continue
                 except ExtractionError as e:
                     # A failed extraction must never mark the mod downloaded.
                     # The archive stays on disk and the item stays pending;
