@@ -492,7 +492,7 @@ Items of `StatusResult.mods`.
 | `name` | str | Mod name |
 | `version` | str | Version |
 | `filename` | str | File name |
-| `download_status` | str | `downloaded` or `pending_download` |
+| `download_status` | str | `downloaded`, `pending_download` (nothing usable on disk), or `pending_choices` (the FOMOD archive is on disk and needs `import --fomod-option` before it can be extracted) |
 
 ### HealthCheck
 

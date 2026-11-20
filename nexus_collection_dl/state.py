@@ -335,8 +335,19 @@ class CollectionState:
         )
 
     def get_pending_mods(self) -> list[ModState]:
-        """Return mods with pending_download status."""
-        return [ms for ms in self.mods.values() if ms.download_status == "pending_download"]
+        """Return mods that are not installed yet and still need work.
+
+        Two flavours: ``pending_download`` (nothing usable on disk yet)
+        and ``pending_choices`` (the FOMOD archive is on disk but needs
+        option choices before it can be extracted). Both are what
+        ``import`` finishes, and both count as pending everywhere a
+        "you still have work to do" number is reported.
+        """
+        return [
+            ms
+            for ms in self.mods.values()
+            if ms.download_status in ("pending_download", "pending_choices")
+        ]
 
     def remove_mod_file(self, file_id: int) -> None:
         """Remove a specific file from the state."""

@@ -730,6 +730,11 @@ class _ShellSession:
             return f"'{mod}' (file {fid}) is already downloaded in '{coll}'"
         if outcome == "pending_download":
             return f"'{mod}' (file {fid}) is awaiting import in '{coll}'"
+        if outcome == "pending_choices":
+            return (
+                f"'{mod}' (file {fid}) needs FOMOD option choices in "
+                f"'{coll}' (run import --fomod-option to install it)"
+            )
         # error
         reason = _safe_text(event.get("reason", ""))
         if mod and fid:

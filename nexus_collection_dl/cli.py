@@ -1526,8 +1526,8 @@ def nxm(
         # A failed extraction can still leave a recoverable pending entry;
         # say so rather than reporting a flat failure the user cannot act on.
         event_outcome = (
-            "pending_download"
-            if result.download_status == "pending_download"
+            result.download_status
+            if result.download_status in ("pending_download", "pending_choices")
             else "error"
         )
         _record_nxm_event(
