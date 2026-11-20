@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Required</moduleName>
+  <requiredInstallFiles>
+    <file source="core.txt" destination="core.txt" priority="0"/>
+  </requiredInstallFiles>
+  <installSteps>
+    <installStep name="More">
+      <optionalFileGroups>
+        <group name="Extra" type="SelectAny">
+          <plugins>
+            <plugin name="Addon">
+              <description>Optional addon.</description>
+              <files>
+                <file source="addon.txt" destination="addon.txt" priority="1"/>
+              </files>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>
