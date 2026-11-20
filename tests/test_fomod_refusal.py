@@ -22,6 +22,7 @@ import pytest
 
 from nexus_collection_dl.extractor import (
     ExtractionError,
+    FomodChoicesError,
     FomodInstallerError,
     can_enumerate_members,
     find_fomod_installer,
@@ -119,14 +120,23 @@ def test_detection_works_on_7z(tmp_path):
 
 
 def test_exception_message_names_the_member_and_the_kept_path(tmp_path):
-    z = make_zip(tmp_path / "m.zip", {"fomod/ModuleConfig.xml": b"<config/>"})
-    exc = FomodInstallerError("fomod/ModuleConfig.xml", z)
+    z = make_zip(tmp_path / "m.zip", {"fomod/script.cs": b"// script"})
+    exc = FomodInstallerError("fomod/script.cs", z)
     text = str(exc)
-    assert "fomod/ModuleConfig.xml" in text
+    assert "fomod/script.cs" in text
     assert str(z) in text
-    assert "every option folder" in text
+    assert "script" in text
     assert "mutually exclusive" in text
     # No em dashes, no AI-tell words, per the writing rules.
+    assert "\u2014" not in text
+
+
+def test_choices_error_names_the_flags_to_pass(tmp_path):
+    exc = FomodChoicesError("TestMod-1.0.zip")
+    text = str(exc)
+    assert "TestMod-1.0.zip" in text
+    assert "--fomod-option" in text
+    assert "--fomod-config" in text
     assert "\u2014" not in text
 
 
@@ -175,7 +185,8 @@ def _fake_download_writing(payloads: dict[str, dict[str, bytes]]):
 MOD_URL = "https://www.nexusmods.com/skyrimspecialedition/mods/100"
 
 
-def test_add_refuses_a_fomod_archive(tmp_path, monkeypatch):
+def test_add_needs_choices_for_a_fomod_archive(tmp_path, monkeypatch):
+    """No picks and nobody to ask: refused, not extracted to every option."""
     from nexus_collection_dl import service as service_module
 
     svc = _svc(tmp_path, monkeypatch)
@@ -188,10 +199,10 @@ def test_add_refuses_a_fomod_archive(tmp_path, monkeypatch):
             },
         }),
     )
-    with pytest.raises(FomodInstallerError) as excinfo:
+    with pytest.raises(FomodChoicesError) as excinfo:
         svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
 
-    assert "fomod/ModuleConfig.xml" in str(excinfo.value)
+    assert "--fomod-option" in str(excinfo.value)
     # Nothing extracted.
     assert not (tmp_path / "Data").exists()
     # The archive is kept.
@@ -206,7 +217,7 @@ def test_add_refuses_without_ever_calling_extract(tmp_path, monkeypatch):
 
     add_mod downloads exactly one file today, so a multi-file pre-pass is
     defensive; what is load-bearing is that extract_archive is never
-    reached when a FOMOD installer is present.
+    reached when a FOMOD installer's choices cannot be settled.
     """
     from nexus_collection_dl import service as service_module
 
@@ -224,9 +235,32 @@ def test_add_refuses_without_ever_calling_extract(tmp_path, monkeypatch):
         raise AssertionError("extract_archive must not be reached")
 
     monkeypatch.setattr(service_module, "extract_archive", recording_extract)
-    with pytest.raises(FomodInstallerError):
+    with pytest.raises(FomodChoicesError):
         svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
     assert calls == []
+
+
+def test_add_refuses_a_script_based_installer(tmp_path, monkeypatch):
+    """Script installers have no groups to pick from and still refuse."""
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader, "download_mods",
+        _fake_download_writing({
+            "TestMod-1.0.zip": {
+                "fomod/info.xml": b"<fomod/>",
+                "fomod/script.cs": b"// script",
+                "Data/thing.esp": b"x",
+            },
+        }),
+    )
+    with pytest.raises(FomodInstallerError) as excinfo:
+        svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
+
+    assert "script" in str(excinfo.value)
+    assert (tmp_path / "TestMod-1.0.zip").exists()
+    assert not (tmp_path / "Data").exists()
 
 
 def test_add_extracts_a_plain_archive_unchanged(tmp_path, monkeypatch):
@@ -343,7 +377,7 @@ def test_import_records_the_refusal_and_leaves_the_item_pending(
 # --- the CLI surface -------------------------------------------------------
 
 
-def test_cli_add_reports_fomod_installer_code(tmp_path, monkeypatch):
+def test_cli_add_reports_fomod_choices_code(tmp_path, monkeypatch):
     import json
 
     from click.testing import CliRunner
@@ -377,5 +411,5 @@ def test_cli_add_reports_fomod_installer_code(tmp_path, monkeypatch):
 
     envelope = json.loads(stdout_of(r))
     assert envelope["ok"] is False
-    assert envelope["error"]["code"] == "fomod_installer"
-    assert "fomod/ModuleConfig.xml" in envelope["error"]["message"]
+    assert envelope["error"]["code"] == "fomod_choices"
+    assert "--fomod-option" in envelope["error"]["message"]

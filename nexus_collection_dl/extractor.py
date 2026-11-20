@@ -17,27 +17,45 @@ class ExtractionError(Exception):
 
 
 class FomodInstallerError(ExtractionError):
-    """The archive carries a FOMOD installer and cannot be extracted safely.
+    """The archive carries a FOMOD installer this tool cannot read.
 
-    FOMOD installers need option choices (body type, texture set, and so
-    on) before anything is extracted, and extracting one without making
-    those choices installs every option folder at once, including options
-    the installer marks as mutually exclusive. Rather than guess, callers
-    refuse and keep the archive.
+    Script-based installers (``fomod/script.cs``, ``fomod/script.lua``)
+    compute their own install from game state; there are no option groups
+    to present and nothing to parse. Rather than extract every file the
+    script might or might not want, callers refuse and keep the archive.
     """
 
     def __init__(self, member: str, archive_path: Path) -> None:
         self.member = member
         self.archive_path = archive_path
         super().__init__(
-            f"{member} marks this archive as a FOMOD mod. FOMOD installers "
-            f"need option choices before extraction (body type, texture "
-            f"set, that sort of thing), and nexus-dl does not make those "
-            f"choices yet. Extracting it now would install every option "
-            f"folder at once, including options that are meant to be "
-            f"mutually exclusive. The archive is kept at "
-            f"{archive_path}. Install it with a tool that supports FOMOD, "
-            f"or wait for option support in nexus-dl."
+            f"{member} marks this archive as a FOMOD mod with a script-based "
+            f"installer. Script installers decide what to install themselves "
+            f"and nexus-dl cannot read them, so there are no options to pick "
+            f"and extracting now would install every file the script might "
+            f"want, including ones meant to be mutually exclusive. The "
+            f"archive is kept at {archive_path}. Install it with a tool that "
+            f"runs FOMOD scripts, or extract it yourself with --no-extract."
+        )
+
+
+class FomodChoicesError(ExtractionError):
+    """The archive carries a readable installer and no choices were given.
+
+    Distinct from :class:`FomodInstallerError` on purpose: that one means
+    we cannot read the installer at all, this one means the caller has
+    not said which options to install. A harness can branch on the code.
+    """
+
+    def __init__(self, archive_name: str) -> None:
+        self.archive_name = archive_name
+        super().__init__(
+            f"{archive_name} is a FOMOD mod and needs option choices before "
+            f"it can be extracted. Pass --fomod-option 'Group:Option' "
+            f"(repeatable) or --fomod-config <file.json>, or run this "
+            f"interactively and answer the prompts. Extracting without a "
+            f"choice would install every option at once, including options "
+            f"meant to be mutually exclusive."
         )
 
 
@@ -312,6 +330,50 @@ def find_fomod_installer(archive_path: Path) -> str | None:
     for name in names:
         if _fomod_marker_from_name(name) is not None:
             return name
+    return None
+
+
+def find_module_config(archive_path: Path) -> str | None:
+    """The member path of this archive's ``ModuleConfig.xml``, or None.
+
+    Narrower than :func:`find_fomod_installer`: an archive can carry a
+    marker we cannot read (``script.cs``, ``info.xml`` alone) and that
+    case must be told apart from one whose option groups we can parse.
+    The two are different refusals with different remedies.
+    """
+    members = _list_archive_members(archive_path)
+    if members is None:
+        return None
+    for name in members:
+        marker = _fomod_marker_from_name(name)
+        if marker is not None and marker.replace("\\", "/").rsplit("/", 1)[-1].lower() == "moduleconfig.xml":
+            return marker
+    return None
+
+
+def read_archive_member(archive_path: Path, member: str) -> bytes | None:
+    """Read one member's bytes without extracting the archive."""
+    archive_type = detect_archive_type(archive_path)
+    try:
+        if archive_type == "zip":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                return zf.read(member)
+        if archive_type == "7z":
+            with py7zr.SevenZipFile(archive_path, "r") as szf:
+                got = szf.read([member])
+                target = got.get(member)
+                if target is None:
+                    wanted = member.lower()
+                    for key, value in got.items():
+                        if key.lower() == wanted:
+                            target = value
+                            break
+                return target.read() if target is not None else None
+        if archive_type == "rar":
+            with rarfile.RarFile(archive_path, "r") as rf:
+                return rf.read(member)
+    except Exception:
+        return None
     return None
 
 

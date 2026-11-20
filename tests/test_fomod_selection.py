@@ -1,0 +1,300 @@
+"""Option selection for standalone FOMOD installs.
+
+The refusal used to be the whole answer to a FOMOD archive. Now the
+installer's groups are read, the picks come from flags, a JSON file, or
+an interactive prompt, and the picks are stored so a later deploy
+installs exactly what was chosen.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from nexus_collection_dl.deploy import classify_files
+from nexus_collection_dl.fomod_plan import load_module_config_bytes
+from nexus_collection_dl.fomod_select import (
+    Pick,
+    PickError,
+    load_picks_file,
+    parse_option_flags,
+    picks_for_file,
+    picks_to_selections,
+)
+from tests.test_fomod_refusal import (
+    MOD_URL,
+    _fake_download_writing,
+    _reload,
+    _svc,
+)
+
+# Two mutually exclusive options, one group, one step. Small on purpose:
+# the shape is what matters, not the content.
+CONFIG = b"""<config>
+  <moduleName>Test</moduleName>
+  <installSteps>
+    <installStep name="Step1">
+      <optionalFileGroups>
+        <group name="G" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="OptA">
+              <files><file source="a/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+            <plugin name="OptB">
+              <files><file source="b/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"""
+
+
+def _payload() -> dict[str, bytes]:
+    return {
+        "fomod/ModuleConfig.xml": CONFIG,
+        "a/thing.esp": b"a",
+        "b/thing.esp": b"b",
+    }
+
+
+# ── the pick input layer ────────────────────────────────────────────────
+
+
+def test_parse_option_flags_takes_two_and_three_part_forms():
+    assert parse_option_flags(["G:OptA"]) == [Pick("", "G", "OptA")]
+    assert parse_option_flags(["Step1:G:OptB"]) == [Pick("Step1", "G", "OptB")]
+
+
+def test_parse_option_flags_rejects_a_value_without_a_separator():
+    with pytest.raises(PickError):
+        parse_option_flags(["OptA"])
+
+
+def test_load_picks_file_reads_scoped_and_unscoped_picks(tmp_path):
+    path = tmp_path / "picks.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"group": "G", "option": "OptA"},
+                {"file": "mod-b.zip", "step": "Step1", "group": "G", "option": "OptB"},
+            ]
+        )
+    )
+    picks = load_picks_file(path)
+    assert picks == [
+        Pick("", "G", "OptA"),
+        Pick("Step1", "G", "OptB", file="mod-b.zip"),
+    ]
+    # An unscoped pick applies to every archive; a scoped one only to its own.
+    assert picks_for_file(picks, "MOD-B.ZIP") == picks
+    assert picks_for_file(picks, "other.zip") == [Pick("", "G", "OptA")]
+
+
+def test_load_picks_file_rejects_junk(tmp_path):
+    path = tmp_path / "picks.json"
+    path.write_text("{not a list}")
+    with pytest.raises(PickError):
+        load_picks_file(path)
+    path.write_text(json.dumps([{"group": "G"}]))
+    with pytest.raises(PickError):
+        load_picks_file(path)
+
+
+def test_picks_to_selections_matches_names_and_reports_the_rest():
+    config = load_module_config_bytes(CONFIG)
+    assert config is not None
+    picked, unmatched = picks_to_selections([Pick("", "G", "optb")], config)
+    assert picked == {("Step1", "G"): ("optb",)}
+    assert unmatched == []
+
+    picked, unmatched = picks_to_selections([Pick("", "G", "Nope")], config)
+    assert picked == {}
+    assert unmatched == [Pick("", "G", "Nope")]
+
+
+def test_picks_to_selections_rejects_an_ambiguous_group_name():
+    config = load_module_config_bytes(CONFIG)
+    assert config is not None
+    # 'G' lives in one step here, so make it ambiguous with a step name
+    # that does not exist: the pick names no group at all.
+    picked, unmatched = picks_to_selections([Pick("Nope", "G", "OptA")], config)
+    assert picked == {}
+    assert unmatched == [Pick("Nope", "G", "OptA")]
+
+
+# ── the service flow ────────────────────────────────────────────────────
+
+
+def test_add_with_picks_extracts_and_stores_them(tmp_path, monkeypatch):
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    result = svc.add_mod(
+        MOD_URL,
+        tmp_path,
+        no_load_order=True,
+        fomod_picks=[Pick("", "G", "OptB")],
+    )
+    assert result.success, result.error
+    assert (tmp_path / "b" / "thing.esp").exists()
+
+    state = _reload(tmp_path)
+    entry = next(iter(state.mods.values()))
+    assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptB"}]
+
+
+def test_add_rejects_a_pick_the_installer_does_not_offer(tmp_path, monkeypatch):
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    with pytest.raises(PickError) as excinfo:
+        svc.add_mod(
+            MOD_URL, tmp_path, no_load_order=True, fomod_picks=[Pick("", "G", "Nope")]
+        )
+    assert "G:Nope" in str(excinfo.value)
+    # Nothing extracted and the archive is kept.
+    assert not (tmp_path / "a").exists()
+    assert (tmp_path / "TestMod-1.0.zip").exists()
+
+
+def test_add_prompts_when_there_is_somebody_to_ask(tmp_path, monkeypatch):
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    asked: list = []
+
+    def prompt(config, archive_name, kept):
+        asked.append((archive_name, list(kept)))
+        return [Pick("Step1", "G", "OptA")]
+
+    result = svc.add_mod(
+        MOD_URL, tmp_path, no_load_order=True, on_fomod_prompt=prompt
+    )
+    assert result.success, result.error
+    assert asked == [("TestMod-1.0.zip", [])]
+    assert (tmp_path / "a" / "thing.esp").exists()
+
+    state = _reload(tmp_path)
+    entry = next(iter(state.mods.values()))
+    assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptA"}]
+
+
+def test_re_add_keeps_matching_picks_and_only_asks_about_the_rest(
+    tmp_path, monkeypatch
+):
+    """The keep-matching-picks rule from the design."""
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    svc.add_mod(MOD_URL, tmp_path, no_load_order=True, fomod_picks=[Pick("", "G", "OptB")])
+
+    asked: list = []
+
+    def prompt(config, archive_name, kept):
+        # The stored pick still matches, so it arrives as kept and there
+        # is nothing left to ask about.
+        asked.append(list(kept))
+        return []
+
+    result = svc.add_mod(MOD_URL, tmp_path, no_load_order=True, on_fomod_prompt=prompt)
+    assert result.success, result.error
+    assert asked == [[Pick("Step1", "G", "OptB")]]
+    state = _reload(tmp_path)
+    entry = next(iter(state.mods.values()))
+    assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptB"}]
+
+
+def test_state_round_trips_fomod_picks(tmp_path):
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "M",
+            "file_id": 11,
+            "filename": "m.zip",
+            "version": "1",
+            "optional": False,
+            "manual": True,
+        }
+    )
+    state.mods[11].fomod_picks = [{"step": "S", "group": "G", "option": "O"}]
+    state.save()
+
+    again = CollectionState(mods)
+    again.load()
+    assert again.mods[11].fomod_picks == [{"step": "S", "group": "G", "option": "O"}]
+
+
+# ── the end-to-end effect: deploy installs what was picked ──────────────
+
+
+def test_deploy_installs_the_stored_picks_and_skips_the_rest(tmp_path, monkeypatch):
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    svc.add_mod(MOD_URL, tmp_path, no_load_order=True, fomod_picks=[Pick("", "G", "OptB")])
+
+    state = _reload(tmp_path)
+    picks_by_mod = {
+        mod.mod_id: mod.fomod_picks for mod in state.mods.values() if mod.fomod_picks
+    }
+    plan = classify_files(tmp_path, "skyrimspecialedition", fomod_picks=picks_by_mod)
+    deployed = {dest.as_posix() for _src, dest in plan.data_files}
+    skipped = {rel.as_posix(): reason for rel, reason in plan.skipped}
+
+    assert "thing.esp" in deployed
+    assert skipped.get("a/thing.esp") == "not in the FOMOD install plan"
+    assert "b/thing.esp" not in skipped
+
+
+def test_deploy_without_picks_falls_back_to_the_installer_defaults(tmp_path):
+    """No picks anywhere: the schema defaults, not every option."""
+
+    mods = tmp_path / "mods"
+    (mods / "fomod").mkdir(parents=True)
+    (mods / "fomod" / "ModuleConfig.xml").write_bytes(CONFIG)
+    (mods / "a").mkdir()
+    (mods / "a" / "thing.esp").write_text("a")
+    (mods / "b").mkdir()
+    (mods / "b" / "thing.esp").write_text("b")
+
+    plan = classify_files(mods, "skyrimspecialedition")
+    skipped = {rel.as_posix(): reason for rel, reason in plan.skipped}
+    # Nothing was picked and both options are Optional: neither installs.
+    assert skipped.get("a/thing.esp") == "not in the FOMOD install plan"
+    assert skipped.get("b/thing.esp") == "not in the FOMOD install plan"

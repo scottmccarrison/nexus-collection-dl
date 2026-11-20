@@ -104,6 +104,7 @@ class ModState:
         manual: bool = False,
         download_status: str = "downloaded",
         browser_url: str = "",
+        fomod_picks: list[dict[str, str]] | None = None,
     ):
         self.file_id = file_id
         self.mod_id = mod_id
@@ -118,6 +119,11 @@ class ModState:
         self.manual = manual
         self.download_status = download_status
         self.browser_url = browser_url
+        # FOMOD option picks, as {"step", "group", "option"} triples.
+        # Stored so a later deploy installs the same options the user
+        # chose instead of the schema defaults, and so a re-add can tell
+        # which picks still name real options in a changed installer.
+        self.fomod_picks = list(fomod_picks or [])
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -133,6 +139,7 @@ class ModState:
             "manual": self.manual,
             "download_status": self.download_status,
             "browser_url": self.browser_url,
+            "fomod_picks": self.fomod_picks,
         }
 
     @classmethod
@@ -151,6 +158,7 @@ class ModState:
             manual=data.get("manual", False),
             download_status=data.get("download_status", "downloaded"),
             browser_url=data.get("browser_url", ""),
+            fomod_picks=data.get("fomod_picks"),
         )
 
 
