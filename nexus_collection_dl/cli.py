@@ -664,6 +664,19 @@ def _ask_many(prompt_text: str, maximum: int, at_least_one: bool) -> list[int]:
             return nums
 
 
+class _ClickAsker:
+    """The picker's front-end on click prompts (the `add`/`import` CLI)."""
+
+    def tell(self, text: str) -> None:
+        click.echo(text)
+
+    def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None:
+        return _ask_int(prompt, count, allow_none=allow_none)
+
+    def choose_many(self, prompt: str, count: int, at_least_one: bool) -> list[int]:
+        return _ask_many(prompt, count, at_least_one=at_least_one)
+
+
 def _fomod_prompt(config: Any, archive_name: str, kept: Any) -> list[Any]:
     """Ask for the FOMOD options ``kept`` does not already cover.
 
@@ -672,83 +685,9 @@ def _fomod_prompt(config: Any, archive_name: str, kept: Any) -> list[Any]:
     asked. This is never installed for ``--json`` or a non-tty, which
     pass no callback at all and get a refusal instead.
     """
-    from .fomod_plan import GameState, evaluate
-    from .fomod_select import Pick, picks_to_selections
+    from .fomod_select import prompt_for_picks
 
-    resolved, _ = picks_to_selections(kept, config) if kept else ({}, [])
-    flags: dict[str, str] = {}
-    picks: list[Any] = []
-    header_shown = False
-
-    def record(option: Any, step_name: str, group_name: str) -> None:
-        picks.append(Pick(step=step_name, group=group_name, option=option.name))
-        flags.update(option.flags)
-
-    def header() -> None:
-        nonlocal header_shown
-        if not header_shown:
-            header_shown = True
-            click.echo()
-            click.echo(f"FOMOD options for {archive_name}")
-
-    # Ask as we walk, because an answer sets flags and later steps can be
-    # gated on them. Asking everything first would evaluate a step's
-    # visibility before the flags that show it exist.
-    for step in config.steps:
-        if evaluate(step.visible, flags, GameState()) is False:
-            continue
-        for group in step.groups:
-            if (step.name, group.name) in resolved:
-                wanted = {n.strip().lower() for n in resolved[(step.name, group.name)]}
-                for option in group.options:
-                    if option.name.strip().lower() in wanted:
-                        record(option, step.name, group.name)
-                continue
-            if group.group_type == "SelectAll":
-                for option in group.options:
-                    record(option, step.name, group.name)
-                continue
-
-            for option in group.options:
-                if option.option_type == "Required":
-                    record(option, step.name, group.name)
-            askable = [
-                o
-                for o in group.options
-                if o.option_type not in ("Required", "NotUsable")
-            ]
-            if not askable:
-                continue
-
-            header()
-            click.echo()
-            click.echo(f"{step.name} / {group.name} ({group.group_type})")
-            for i, option in enumerate(askable, 1):
-                hint = " [recommended]" if option.option_type == "Recommended" else ""
-                click.echo(f"  {i}. {option.name}{hint}")
-                if option.description:
-                    click.echo(f"     {option.description}")
-
-            if group.group_type in ("SelectExactlyOne", "SelectAtMostOne"):
-                allow_none = group.group_type == "SelectAtMostOne"
-                n = _ask_int(
-                    "  Pick one" + (", or press Enter for none" if allow_none else ""),
-                    len(askable),
-                    allow_none=allow_none,
-                )
-                if n is not None:
-                    record(askable[n - 1], step.name, group.name)
-            else:
-                at_least_one = group.group_type == "SelectAtLeastOne"
-                nums = _ask_many(
-                    "  Pick any, comma separated"
-                    + (" (at least one)" if at_least_one else ""),
-                    len(askable),
-                    at_least_one=at_least_one,
-                )
-                for n in nums:
-                    record(askable[n - 1], step.name, group.name)
-    return picks
+    return prompt_for_picks(config, archive_name, kept, _ClickAsker())
 
 
 def _collect_fomod_picks(

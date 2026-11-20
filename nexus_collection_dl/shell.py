@@ -238,6 +238,64 @@ _HELP_BY_NAME = {spec.name: spec for spec in _COMMAND_HELP}
 # and Ctrl-C, aborts with no change.
 _CONFIRM_YES = "yes"
 
+
+class _ShellAsker:
+    """The picker's front-end on the shell's plain ``input()`` lines.
+
+    Mirrors the CLI's click prompts so a click-driven pick and an
+    ``add``-time pick run the same walk and see the same questions.
+    Ctrl-C, Ctrl-D, and any other input failure give no answer rather
+    than a guessed one: a broken stream must not select an option.
+    """
+
+    def __init__(self, shell: "_ShellSession") -> None:
+        self._shell = shell
+
+    def tell(self, text: str) -> None:
+        self._shell._emit(f"  {text}")
+
+    def _read(self, prompt: str) -> str | None:
+        try:
+            return self._shell.input_fn(prompt)
+        except (KeyboardInterrupt, EOFError):
+            return None
+        except Exception:
+            return None
+
+    def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None:
+        while True:
+            raw = self._read(prompt + ": ")
+            if raw is None:
+                return None
+            raw = raw.strip()
+            if not raw:
+                if allow_none:
+                    return None
+                continue
+            try:
+                n = int(raw)
+            except ValueError:
+                continue
+            if 1 <= n <= count:
+                return n
+
+    def choose_many(self, prompt: str, count: int, at_least_one: bool) -> list[int]:
+        while True:
+            raw = self._read(prompt + ": ")
+            if raw is None:
+                return []
+            parts = [p.strip() for p in raw.strip().split(",") if p.strip()]
+            if not parts:
+                if not at_least_one:
+                    return []
+                continue
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                continue
+            if all(1 <= n <= count for n in nums):
+                return nums
+
 # Consecutive input-read failures tolerated before the shell gives up on
 # its input stream. One bad read is recoverable (a non-UTF-8 byte on
 # piped stdin, a hiccuping tty); a stream that cannot produce a single
@@ -691,12 +749,41 @@ class _ShellSession:
         self._emit(header + ":")
 
         deployable: dict[str, list[dict]] = {}
+        need_choices: dict[str, list[dict]] = {}
         for event in new_events:
             self._emit(f"  {self._format_event_line(event)}")
             outcome = str(event.get("outcome", ""))
             if outcome in ("downloaded", "extracted_from_archive"):
                 coll = str(event.get("collection_name", ""))
                 deployable.setdefault(coll, []).append(event)
+            elif outcome == "pending_choices":
+                coll = str(event.get("collection_name", ""))
+                need_choices.setdefault(coll, []).append(event)
+
+        # FOMOD mods waiting on their option choices, before the deploy
+        # question: what they install is only known once the picks are in,
+        # and a collection that just gained files should be offered the
+        # deploy that would place them.
+        for coll_name, events in need_choices.items():
+            sample = events[0]
+            coll_dir = sample.get("collection_dir", "")
+            if coll_dir and not Path(coll_dir).is_dir():
+                self._emit(
+                    f"'{_safe_text(coll_name)}' (directory gone; "
+                    "nothing to choose for)"
+                )
+                continue
+            count = len(events)
+            plural = "s" if count != 1 else ""
+            answer = self._confirm(
+                f"{count} FOMOD mod{plural} in '{_safe_text(coll_name)}' "
+                f"need option choices. Choose now? [yes/no]: "
+            )
+            if answer != _CONFIRM_YES:
+                continue
+            for event in events:
+                if self._offer_fomod_choices(Path(coll_dir), event):
+                    deployable.setdefault(coll_name, []).append(event)
 
         for coll_name, events in deployable.items():
             # One prompt per collection regardless of how many events.
@@ -715,6 +802,36 @@ class _ShellSession:
             )
             if answer == _CONFIRM_YES:
                 self._deploy_by_path(Path(coll_dir))
+
+    def _offer_fomod_choices(self, coll_dir: Path, event: dict) -> bool:
+        """Prompt for one clicked FOMOD mod's options and install it.
+
+        Returns True when it installed, so the caller can offer the
+        deploy that places the new files. Nothing is installed without an
+        explicit pick; a mod with no answers stays pending.
+        """
+        from .fomod_select import prompt_for_picks
+
+        mod_name = _safe_text(str(event.get("mod_name", "")))
+        file_id = event.get("file_id", 0)
+        try:
+            file_id = int(file_id)
+        except (TypeError, ValueError):
+            self._emit_failure(f"cannot pick options for '{mod_name}': no file id")
+            return False
+
+        def ask(config, archive_name, kept):
+            return prompt_for_picks(config, archive_name, kept, _ShellAsker(self))
+
+        try:
+            report = self.svc.install_fomod_picks(
+                coll_dir, file_id, on_fomod_prompt=ask
+            )
+        except Exception as e:
+            self._emit_failure(f"'{mod_name}': {_safe_text(str(e))}")
+            return False
+        self._emit(f"  {_safe_text(report)}")
+        return True
 
     def _format_event_line(self, event: dict) -> str:
         """One human line for a click event; all values display-safe."""

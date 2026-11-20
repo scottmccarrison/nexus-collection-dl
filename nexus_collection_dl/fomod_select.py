@@ -18,17 +18,20 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
-from .fomod_plan import ModuleConfig
+from .fomod_plan import ModuleConfig, Option
 
 __all__ = [
     "Pick",
+    "PickAsker",
     "PickError",
     "load_picks_file",
     "normalize_picks",
     "parse_option_flags",
     "picks_for_file",
     "picks_to_selections",
+    "prompt_for_picks",
 ]
 
 
@@ -206,3 +209,114 @@ def picks_to_selections(
         chosen.setdefault((step_name, group_name), []).append(pick.option.strip())
 
     return {key: tuple(names) for key, names in chosen.items()}, unmatched
+
+
+# ── the interactive walk ────────────────────────────────────────────────
+
+
+class PickAsker(Protocol):
+    """How the picker talks to a human.
+
+    Two front-ends drive the same walk: the CLI's click prompts and the
+    shell's plain ``input()`` lines. Both implement these three methods;
+    the walk below never touches a terminal itself.
+
+    ``choose_one`` returns a 1-based index into the options, or None when
+    the question allows no answer. ``choose_many`` returns 1-based
+    indices. Both re-ask on bad input until they get something valid.
+    """
+
+    def tell(self, text: str) -> None: ...
+
+    def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None: ...
+
+    def choose_many(
+        self, prompt: str, count: int, at_least_one: bool
+    ) -> list[int]: ...
+
+
+def prompt_for_picks(
+    config: ModuleConfig, archive_name: str, kept: Sequence[Pick], asker: PickAsker
+) -> list[Pick]:
+    """Walk the installer's groups and collect the picks ``kept`` lacks.
+
+    Asks in install order because an answer sets flags and a later step's
+    ``visible`` condition can depend on them: asking everything up front
+    would evaluate a step's visibility before the flags that reveal it
+    exist. Groups already covered by ``kept`` are not asked again, which
+    is the keep-matching-picks rule on the interactive path.
+    """
+    from .fomod_plan import GameState, evaluate
+
+    resolved, _ = picks_to_selections(kept, config) if kept else ({}, [])
+    flags: dict[str, str] = {}
+    picks: list[Pick] = []
+    header_shown = False
+
+    def record(option: Option, step_name: str, group_name: str) -> None:
+        picks.append(Pick(step=step_name, group=group_name, option=option.name))
+        flags.update(option.flags)
+
+    def header() -> None:
+        nonlocal header_shown
+        if not header_shown:
+            header_shown = True
+            asker.tell(f"FOMOD options for {archive_name}")
+
+    for step in config.steps:
+        if evaluate(step.visible, flags, GameState()) is False:
+            continue
+        for group in step.groups:
+            if (step.name, group.name) in resolved:
+                # Already chosen: absorb its flags for the steps below,
+                # but do not return it again. The caller owns the kept
+                # picks and prepends them to what this walk returns.
+                wanted = {n.strip().lower() for n in resolved[(step.name, group.name)]}
+                for option in group.options:
+                    if option.name.strip().lower() in wanted:
+                        flags.update(option.flags)
+                continue
+            if group.group_type == "SelectAll":
+                for option in group.options:
+                    record(option, step.name, group.name)
+                continue
+
+            for option in group.options:
+                if option.option_type == "Required":
+                    record(option, step.name, group.name)
+            askable = [
+                o
+                for o in group.options
+                if o.option_type not in ("Required", "NotUsable")
+            ]
+            if not askable:
+                continue
+
+            header()
+            asker.tell(f"{step.name} / {group.name} ({group.group_type})")
+            for i, option in enumerate(askable, 1):
+                hint = " [recommended]" if option.option_type == "Recommended" else ""
+                asker.tell(f"  {i}. {option.name}{hint}")
+                if option.description:
+                    asker.tell(f"     {option.description}")
+
+            if group.group_type in ("SelectExactlyOne", "SelectAtMostOne"):
+                allow_none = group.group_type == "SelectAtMostOne"
+                n = asker.choose_one(
+                    "  Pick one" + (", or press Enter for none" if allow_none else ""),
+                    len(askable),
+                    allow_none=allow_none,
+                )
+                if n is not None:
+                    record(askable[n - 1], step.name, group.name)
+            else:
+                at_least_one = group.group_type == "SelectAtLeastOne"
+                nums = asker.choose_many(
+                    "  Pick any, comma separated"
+                    + (" (at least one)" if at_least_one else ""),
+                    len(askable),
+                    at_least_one=at_least_one,
+                )
+                for n in nums:
+                    record(askable[n - 1], step.name, group.name)
+    return picks

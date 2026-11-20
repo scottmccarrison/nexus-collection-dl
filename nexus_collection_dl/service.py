@@ -2342,6 +2342,72 @@ class ModManagerService:
         state.load()
         return self._sync_tracked_mods(state)
 
+    def install_fomod_picks(
+        self,
+        mods_dir: Path,
+        file_id: int,
+        picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
+    ) -> str:
+        """Install a FOMOD archive that is waiting on its option choices.
+
+        This is how a ``pending_choices`` entry gets finished: the archive
+        the click kept is extracted with the given picks (or the ones the
+        prompt callback collects) and the mod is recorded as downloaded
+        with those picks stored. Returns a one-line human report.
+
+        Raises the same errors the ``add`` path does: ``PickError`` for a
+        pick the installer does not offer, ``FomodChoicesError`` when
+        there is nothing to pick from and nobody to ask, ``StateError``
+        when the entry or its archive is gone.
+        """
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+            mod = state.mods.get(file_id)
+            if mod is None:
+                raise StateError(
+                    f"no tracked mod with file id {file_id} in this collection"
+                )
+            archive = mods_dir / mod.filename
+            if not mod.filename or not archive.exists():
+                raise StateError(
+                    f"the archive for {mod.name or mod.filename} is not in "
+                    f"{mods_dir}; click the download link again to fetch it"
+                )
+
+            config = _fomod_config_for_archive(archive)
+            if config is None:
+                raise StateError(f"{archive.name} is not a FOMOD mod")
+
+            resolved = _resolve_fomod_picks(
+                config, archive.name, picks, mod.fomod_picks, on_fomod_prompt
+            )
+            if not resolved:
+                raise FomodChoicesError(archive.name)
+
+            extract_archive(archive, mods_dir)
+            mod.download_status = "downloaded"
+            mod.browser_url = ""
+            mod.installed_at = datetime.now(timezone.utc).isoformat()
+            mod.fomod_picks = [
+                {"step": p.step, "group": p.group, "option": p.option}
+                for p in resolved
+            ]
+            # Finishing the install is explicit re-add intent, so any
+            # removal tombstone for the page goes with the same commit.
+            state.clear_removed(mod.mod_id)
+            state.save()
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+
+        return (
+            f"{mod.name or mod.filename} installed with "
+            f"{len(resolved)} option choice(s)"
+        )
+
     def import_downloads(
         self,
         mods_dir: Path,
