@@ -140,7 +140,7 @@ GAME_APPDATA_NAMES = {
 }
 
 # Pattern for numbered option folders (e.g., "00 - Base", "01 - Main Files")
-NUMBERED_OPTION_RE = re.compile(r"^\d{2,3}\s*[-_]\s*")
+NUMBERED_OPTION_RE = re.compile(r"^\d{2,3}[\s\-_]+")
 
 # Pattern for versioned SFSE directories (e.g., "sfse_0_2_18")
 SFSE_VERSION_DIR_RE = re.compile(r"^sfse_[\d_]+$", re.IGNORECASE)
