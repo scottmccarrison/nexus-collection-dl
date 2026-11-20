@@ -250,24 +250,3 @@ def test_no_exception_interpolation_escapes_exception_reason():
         "exception text interpolated without exception_reason:\n"
         + "\n".join(offenders)
     )
-
-
-def test_web_serializers_do_not_str_a_result():
-    """The web fallback must be a category, not str(task.result)."""
-    app_src = (PKG / "web" / "app.py").read_text()
-    tasks_src = (PKG / "web" / "tasks.py").read_text()
-    assert "str(task.result)" not in _code_only(app_src)
-    assert "str(data)" not in _code_only(tasks_src)
-    assert "internal error" in app_src
-    assert "internal error" in tasks_src
-
-
-def _code_only(src: str) -> str:
-    """Source with comments stripped, so a docstring mention is not a hit."""
-    out = []
-    for line in src.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("#"):
-            continue
-        out.append(line.split("  #")[0])
-    return "\n".join(out)

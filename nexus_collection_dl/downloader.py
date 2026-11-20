@@ -196,7 +196,7 @@ class Downloader:
 
         Args:
             on_progress: Optional callback(bytes_downloaded, total_bytes) for
-                         generic progress reporting (used by web UI / service layer).
+                         generic progress reporting (used by the service layer).
             signed: Optional website-issued key/expires pair (free-account
                     nxm:// links). Transient: forwarded to the download-link
                     request only, never persisted.

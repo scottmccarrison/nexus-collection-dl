@@ -34,7 +34,7 @@ class LoadOrderRegenError(StateError):
     The underlying state change (a removal, an import, a download) is
     already persisted when this fires: callers report it as a warning or
     error on their result instead of rolling back. Subclasses StateError
-    so every CLI/web surface that already handles state failures handles
+    so every surface that already handles state failures handles
     regeneration failures cleanly too.
     """
 

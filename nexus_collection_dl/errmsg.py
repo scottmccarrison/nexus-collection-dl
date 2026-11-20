@@ -1,17 +1,16 @@
 """Bounded, safe text for exceptions embedded in result strings.
 
 Result ``errors``/``warnings``/``error`` fields are a diagnostic record:
-the deploy report renders them, and ``web/app.py`` serializes them
-verbatim to a browser. They carry the deliberate part (which path, which
-refusal reason) and must not carry arbitrary exception text. An
-unexpected exception's message can include absolute filesystem paths and
-reflected request detail, and the web UI is the one boundary with no
-``boundary_redact`` layer.
+the deploy report renders them, ``--json`` envelopes carry them, and they
+get copied into whatever output a caller builds. They carry the
+deliberate part (which path, which refusal reason) and must not carry
+arbitrary exception text. An unexpected exception's message can include
+absolute filesystem paths and reflected request detail, and that should
+not travel with the record into a caller's logs, a harness transcript,
+or anything else that is not this process's own terminal.
 
 This module is the single place that turns an exception into the short
-category that goes in its place. It is not a logging helper and not the
-web error boundary (``web/errors.py::client_error_message`` handles
-raised exceptions; this handles text already inside a result).
+category that goes in its place. It is not a logging helper.
 """
 
 import errno as _errno

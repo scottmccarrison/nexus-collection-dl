@@ -14,7 +14,6 @@ dependencies = [
     "rich>=13.0.0",
     "py7zr>=0.20.0",
     "rarfile>=4.0",
-    "flask>=3.0.0",
     "packaging>=21.0",
     # state.py uses typing.Self via typing_extensions, which is not in the
     # stdlib until 3.11 and is not guaranteed to arrive transitively.
@@ -31,16 +30,12 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 nexus-dl = "nexus_collection_dl.cli:main"
-nexus-dl-web = "nexus_collection_dl.web:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 # Scope discovery to the package itself so tests/ is never packaged into
 # wheels or sdists.
 include = ["nexus_collection_dl*"]
-
-[tool.setuptools.package-data]
-"nexus_collection_dl.web" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
