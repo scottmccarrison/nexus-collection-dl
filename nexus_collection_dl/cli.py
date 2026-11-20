@@ -15,6 +15,7 @@ from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
 from .extractor import ExtractionError
+from .fomod_select import PickError
 from .handler import (
     DESKTOP_ENTRY_NAME,
     DesktopInstaller,
@@ -632,12 +633,164 @@ def undeploy(ctx: click.Context, mods_dir: Path) -> None:
         console.print(f"\n[green]Removed {removed} files. Game directory restored.[/green]")
 
 
+def _ask_int(prompt_text: str, maximum: int, allow_none: bool) -> int | None:
+    while True:
+        raw = click.prompt(prompt_text, default="", show_default=False).strip()
+        if not raw:
+            if allow_none:
+                return None
+            continue
+        try:
+            n = int(raw)
+        except ValueError:
+            continue
+        if 1 <= n <= maximum:
+            return n
+
+
+def _ask_many(prompt_text: str, maximum: int, at_least_one: bool) -> list[int]:
+    while True:
+        raw = click.prompt(prompt_text, default="", show_default=False).strip()
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if not parts:
+            if not at_least_one:
+                return []
+            continue
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            continue
+        if all(1 <= n <= maximum for n in nums):
+            return nums
+
+
+def _fomod_prompt(config: Any, archive_name: str, kept: Any) -> list[Any]:
+    """Ask for the FOMOD options ``kept`` does not already cover.
+
+    Wired in as the service's prompt callback. The service has kept
+    whatever still names a real option; only groups without a pick are
+    asked. This is never installed for ``--json`` or a non-tty, which
+    pass no callback at all and get a refusal instead.
+    """
+    from .fomod_plan import GameState, evaluate
+    from .fomod_select import Pick, picks_to_selections
+
+    resolved, _ = picks_to_selections(kept, config) if kept else ({}, [])
+    flags: dict[str, str] = {}
+    picks: list[Any] = []
+    header_shown = False
+
+    def record(option: Any, step_name: str, group_name: str) -> None:
+        picks.append(Pick(step=step_name, group=group_name, option=option.name))
+        flags.update(option.flags)
+
+    def header() -> None:
+        nonlocal header_shown
+        if not header_shown:
+            header_shown = True
+            click.echo()
+            click.echo(f"FOMOD options for {archive_name}")
+
+    # Ask as we walk, because an answer sets flags and later steps can be
+    # gated on them. Asking everything first would evaluate a step's
+    # visibility before the flags that show it exist.
+    for step in config.steps:
+        if evaluate(step.visible, flags, GameState()) is False:
+            continue
+        for group in step.groups:
+            if (step.name, group.name) in resolved:
+                wanted = {n.strip().lower() for n in resolved[(step.name, group.name)]}
+                for option in group.options:
+                    if option.name.strip().lower() in wanted:
+                        record(option, step.name, group.name)
+                continue
+            if group.group_type == "SelectAll":
+                for option in group.options:
+                    record(option, step.name, group.name)
+                continue
+
+            for option in group.options:
+                if option.option_type == "Required":
+                    record(option, step.name, group.name)
+            askable = [
+                o
+                for o in group.options
+                if o.option_type not in ("Required", "NotUsable")
+            ]
+            if not askable:
+                continue
+
+            header()
+            click.echo()
+            click.echo(f"{step.name} / {group.name} ({group.group_type})")
+            for i, option in enumerate(askable, 1):
+                hint = " [recommended]" if option.option_type == "Recommended" else ""
+                click.echo(f"  {i}. {option.name}{hint}")
+                if option.description:
+                    click.echo(f"     {option.description}")
+
+            if group.group_type in ("SelectExactlyOne", "SelectAtMostOne"):
+                allow_none = group.group_type == "SelectAtMostOne"
+                n = _ask_int(
+                    "  Pick one" + (", or press Enter for none" if allow_none else ""),
+                    len(askable),
+                    allow_none=allow_none,
+                )
+                if n is not None:
+                    record(askable[n - 1], step.name, group.name)
+            else:
+                at_least_one = group.group_type == "SelectAtLeastOne"
+                nums = _ask_many(
+                    "  Pick any, comma separated"
+                    + (" (at least one)" if at_least_one else ""),
+                    len(askable),
+                    at_least_one=at_least_one,
+                )
+                for n in nums:
+                    record(askable[n - 1], step.name, group.name)
+    return picks
+
+
+def _collect_fomod_picks(
+    option_values: tuple[str, ...], config_path: Path | None
+) -> list[Any] | None:
+    """Combine ``--fomod-option`` flags and a ``--fomod-config`` file."""
+    from .fomod_select import load_picks_file, parse_option_flags
+
+    picks: list[Any] = []
+    if option_values:
+        picks.extend(parse_option_flags(option_values))
+    if config_path is not None:
+        picks.extend(load_picks_file(config_path))
+    return picks or None
+
+
+def _fomod_prompter(ctx: click.Context, picks: list[Any] | None) -> Any:
+    """The prompt callback, only when there is somebody to answer."""
+    if picks or _is_json(ctx) or not sys.stdin.isatty():
+        return None
+    return _fomod_prompt
+
+
 @main.command()
 @click.argument("mod_url")
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option("--file-id", type=int, default=None, help="Specific file ID to download")
 @click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
 @click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
+@click.option(
+    "--fomod-option",
+    "fomod_options",
+    multiple=True,
+    help="FOMOD choice as 'Group:Option' or 'Step:Group:Option' (repeatable)",
+)
+@click.option(
+    "--fomod-config",
+    "fomod_config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file of FOMOD picks for names that need quoting",
+)
 @click.pass_context
 def add(
     ctx: click.Context,
@@ -646,15 +799,23 @@ def add(
     file_id: int | None,
     no_load_order: bool,
     no_extract: bool,
+    fomod_options: tuple[str, ...],
+    fomod_config_path: Path | None,
 ) -> None:
     """
     Add a single mod by URL.
 
     MOD_URL: Nexus Mods mod page URL (e.g. https://www.nexusmods.com/starfield/mods/123)
     MODS_DIR: Directory containing a previously synced collection
+
+    A FOMOD mod asks which of its options to install. Pass the picks with
+    --fomod-option/--fomod-config, or run this at a terminal and answer
+    the prompts; with neither, the mod is refused rather than installed
+    with every option at once.
     """
     svc = ctx.obj["service"]
     try:
+        picks = _collect_fomod_picks(fomod_options, fomod_config_path)
         result = svc.add_mod(
             mod_url, mods_dir,
             file_id=file_id,
@@ -662,8 +823,10 @@ def add(
             no_extract=no_extract,
             on_progress=_cli_progress,
             show_progress=not _is_json(ctx),
+            fomod_picks=picks,
+            on_fomod_prompt=_fomod_prompter(ctx, picks),
         )
-    except (NexusAPIError, ModParseError, StateError, ExtractionError) as e:
+    except (NexusAPIError, ModParseError, StateError, ExtractionError, PickError) as e:
         _fail(ctx, e)
 
     if not result.success:
@@ -723,27 +886,48 @@ def add_local(
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
 @click.option("--no-extract", is_flag=True, help="Keep downloaded archives without extracting")
+@click.option(
+    "--fomod-option",
+    "fomod_options",
+    multiple=True,
+    help="FOMOD choice as 'Group:Option' or 'Step:Group:Option' (repeatable)",
+)
+@click.option(
+    "--fomod-config",
+    "fomod_config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="JSON file of FOMOD picks; add \"file\" to scope a pick to one archive",
+)
 @click.pass_context
 def import_cmd(
     ctx: click.Context,
     mods_dir: Path,
     no_load_order: bool,
     no_extract: bool,
+    fomod_options: tuple[str, ...],
+    fomod_config_path: Path | None,
 ) -> None:
     """
     Import manually downloaded files for pending mods.
 
     MODS_DIR: Directory containing previously synced mods and downloaded files
+
+    FOMOD mods in the batch need option choices. Use --fomod-config with a
+    "file" key per pick when the batch holds more than one of them.
     """
     svc = ctx.obj["service"]
     try:
+        picks = _collect_fomod_picks(fomod_options, fomod_config_path)
         result = svc.import_downloads(
             mods_dir,
             no_load_order=no_load_order,
             no_extract=no_extract,
             on_progress=_cli_progress,
+            fomod_picks=picks,
+            on_fomod_prompt=_fomod_prompter(ctx, picks),
         )
-    except StateError as e:
+    except (StateError, ExtractionError, PickError) as e:
         _fail(ctx, e)
 
     if _emit_result(ctx, result):

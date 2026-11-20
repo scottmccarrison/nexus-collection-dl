@@ -50,6 +50,7 @@ __all__ = [
     "Option",
     "Pattern",
     "load_module_config",
+    "load_module_config_bytes",
     "plan_source_root",
     "resolve_install_plan",
     "selections_from_manifest",
@@ -278,18 +279,21 @@ def _strip_ns(tag: str) -> str:
     return tag.split("}", 1)[1] if tag.startswith("{") else tag
 
 
-def _parse_xml(config_path: Path) -> ET.Element | None:
-    """UTF-8 first, UTF-16 fallback. Real configs are UTF-16LE with BOM."""
-    try:
-        raw = config_path.read_bytes()
-    except OSError:
-        return None
+def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
+    """UTF-8 first, UTF-16 then cp1252 fallback. Real configs are UTF-16LE."""
     for encoding in ("utf-8-sig", "utf-16", "cp1252"):
         try:
             return ET.fromstring(raw.decode(encoding))
         except (UnicodeDecodeError, ET.ParseError):
             continue
     return None
+
+
+def _parse_xml(config_path: Path) -> ET.Element | None:
+    try:
+        return _parse_xml_bytes(config_path.read_bytes())
+    except OSError:
+        return None
 
 
 def _child_elements(elem: ET.Element, name: str) -> Iterator[ET.Element]:
@@ -465,12 +469,7 @@ def _parse_pattern(pattern: ET.Element) -> Pattern:
     )
 
 
-def load_module_config(config_path: Path) -> ModuleConfig | None:
-    """Parse a ``ModuleConfig.xml`` into the full model, or None if unreadable."""
-    root = _parse_xml(config_path)
-    if root is None:
-        return None
-
+def _build_config(root: ET.Element) -> ModuleConfig:
     module_name = ""
     name_elem = _first_child(root, "moduleName")
     if name_elem is not None and name_elem.text:
@@ -505,6 +504,18 @@ def load_module_config(config_path: Path) -> ModuleConfig | None:
         steps=steps,
         patterns=patterns,
     )
+
+
+def load_module_config(config_path: Path) -> ModuleConfig | None:
+    """Parse a ``ModuleConfig.xml`` into the full model, or None if unreadable."""
+    root = _parse_xml(config_path)
+    return None if root is None else _build_config(root)
+
+
+def load_module_config_bytes(raw: bytes) -> ModuleConfig | None:
+    """Parse config bytes straight out of an archive, without extracting it."""
+    root = _parse_xml_bytes(raw)
+    return None if root is None else _build_config(root)
 
 
 def plan_source_root(config_path: Path) -> Path:

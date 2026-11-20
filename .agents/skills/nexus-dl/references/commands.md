@@ -159,19 +159,27 @@ nexus-dl add MOD_URL MODS_DIR [--file-id N] [--no-load-order] [--no-extract]
 | `--file-id N` | Specific file id to download (omit to auto-select the main file) |
 | `--no-load-order` | Skip load order regeneration |
 | `--no-extract` | Keep the archive without extracting |
+| `--fomod-option 'Group:Option'` | One FOMOD choice, repeatable. `'Step:Group:Option'` when a group name appears in more than one step |
+| `--fomod-config FILE` | JSON list of picks (`{"group", "option", "step"?, "file"?}`), for names with a colon or for batch imports |
 
 Registers the mod as a manual mod (phase 999): `update` never flags it as
 removed from the collection. `result`: AddResult. When the run itself fails
 partway (`success: false`), the envelope reports `ok: false` with
 `error.code` `operation_failed` and still carries the AddResult in `result`.
 
-**FOMOD archives are refused, not extracted.** If the archive carries a
-FOMOD installer (`fomod/ModuleConfig.xml` and similar) it needs option
-choices first, and extracting it without them installs every option folder
-at once. `add` raises `fomod_installer` and keeps the archive; `import`
-records it per file and leaves that item pending. Use `--no-extract` to
-register the mod and handle the extraction yourself. Picking options inside
-nexus-dl is not supported yet.
+**FOMOD archives need option choices.** If the archive carries a
+FOMOD installer (`fomod/ModuleConfig.xml`) it needs option choices first,
+and extracting it without them installs every option folder at once. Pass
+the picks with `--fomod-option`/`--fomod-config`, or run at a terminal and
+answer the prompts. The picks are stored in state and a later `deploy`
+installs exactly those options. With no picks and nobody to ask (`--json`,
+a pipe), `add` raises `fomod_choices` and keeps the archive; `import`
+records it per file and leaves that item pending. A pick that names
+nothing the installer offers is `fomod_choices` too, and is never silently
+matched onto something similar. Script-based installers (FOMOD 1.0,
+`fomod/script.cs`) have no groups to choose from and raise
+`fomod_installer`. `--no-extract` still registers the mod and leaves the
+extraction to you.
 
 ### add-local
 

@@ -5,11 +5,15 @@ import hashlib
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .fomod_plan import ModuleConfig
+    from .fomod_select import Pick
 
 from .api import NexusAPI, NexusAPIError
 from .collection import (
@@ -42,13 +46,18 @@ from .downloader import (
 from .errmsg import exception_reason
 from .extractor import (
     ExtractionError,
+    FomodChoicesError,
     FomodInstallerError,
     can_enumerate_members,
     extract_archive,
     find_fomod_installer,
+    find_module_config,
     is_archive,
+    read_archive_member,
     sniff_archive_magic,
 )
+from .fomod_plan import load_module_config_bytes
+from .fomod_select import PickError
 from .handler import (
     DesktopInstaller,
     NxmRoutingError,
@@ -115,20 +124,15 @@ def _state_text(value: Any, fallback: str = "") -> str:
         return fallback
 
 
-def _check_not_fomod(archive_path: Path) -> None:
-    """Raise if this archive must not be extracted without option choices.
+def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
+    """Read an archive's FOMOD installer config without extracting it.
 
-    Two refusals for two different reasons. A detected FOMOD installer
-    raises FomodInstallerError (error code ``fomod_installer``), because
-    extracting it installs every option folder at once, including options
-    the installer marks as mutually exclusive. An archive we cannot
-    enumerate at all is refused too: we cannot tell whether it is FOMOD,
-    and extracting on a guess is the harm this exists to stop. ``--no-extract``
-    is the escape hatch for a mod the caller knows is safe.
-
-    Call this before extracting, on the paths where a user asked for one
-    mod and no option choices exist (add, import). The collection path
-    (sync, update) supplies choices from the manifest and is not covered.
+    Returns None for an archive that is not a FOMOD mod. Raises for the
+    two refusals: an archive this tool cannot enumerate at all (we do not
+    know whether it is FOMOD, and extracting on a guess is the harm this
+    exists to stop), and a script-based installer whose options are
+    computed rather than declared. ``--no-extract`` is the escape hatch
+    for a mod the caller knows is safe.
     """
     if not can_enumerate_members(archive_path):
         raise ExtractionError(
@@ -138,9 +142,71 @@ def _check_not_fomod(archive_path: Path) -> None:
             f"you know it is not a FOMOD mod, use --no-extract and extract "
             f"it yourself."
         )
-    marker = find_fomod_installer(archive_path)
-    if marker is not None:
-        raise FomodInstallerError(marker, archive_path)
+    member = find_module_config(archive_path)
+    if member is None:
+        marker = find_fomod_installer(archive_path)
+        if marker is not None:
+            raise FomodInstallerError(marker, archive_path)
+        return None
+
+    raw = read_archive_member(archive_path, member)
+    config = load_module_config_bytes(raw) if raw is not None else None
+    if config is None:
+        raise ExtractionError(
+            f"found {member} in {archive_path.name} but could not read it, "
+            f"so its option groups are unknown. Extracting without them "
+            f"could install every option at once. The archive is kept at "
+            f"{archive_path}."
+        )
+    return config
+
+
+def _resolve_fomod_picks(
+    config: "ModuleConfig",
+    archive_name: str,
+    provided: "Sequence[Pick] | None",
+    stored: "Sequence[dict[str, str]] | None",
+    on_fomod_prompt: "Callable[..., Sequence[Pick]] | None",
+) -> "list[Pick]":
+    """Decide which options a FOMOD archive installs.
+
+    Command-line picks win outright, and a pick that names nothing in the
+    installer is an error rather than a silent mismatch. Without them, the
+    picks stored from a previous install are kept as far as they still
+    name real options and the rest is asked again when there is somebody
+    to ask; with nobody to ask, the kept picks stand and the groups they
+    no longer cover fall back to the installer's own defaults. With
+    nothing at all, refuse: guessing is the harm this exists to stop.
+    """
+    from .fomod_select import Pick, PickError, normalize_picks, picks_to_selections
+
+    if provided:
+        return normalize_picks(provided, config)
+
+    kept: list[Pick] = []
+    if stored:
+        stored_picks = [
+            Pick(step=str(d.get("step", "")), group=str(d.get("group", "")),
+                 option=str(d.get("option", "")))
+            for d in stored
+        ]
+        try:
+            selections, _unmatched = picks_to_selections(stored_picks, config)
+        except PickError:
+            # A name that became ambiguous when the installer changed is
+            # dropped; anything unambiguous is still kept below.
+            selections = {}
+        for (step_name, group_name), option_names in selections.items():
+            for option in option_names:
+                kept.append(Pick(step=step_name, group=group_name, option=option))
+
+    if on_fomod_prompt is not None:
+        asked = on_fomod_prompt(config, archive_name, kept)
+        return kept + list(asked)
+
+    if kept or stored:
+        return kept
+    raise FomodChoicesError(archive_name)
 
 
 @dataclass
@@ -1518,8 +1584,17 @@ class ModManagerService:
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
         show_progress: bool = True,
+        fomod_picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
     ) -> AddResult:
-        """Add a single mod by Nexus URL."""
+        """Add a single mod by Nexus URL.
+
+        ``fomod_picks`` are the FOMOD option choices to install, when the
+        caller already has them (a flag or a choices file). Without them
+        and with ``on_fomod_prompt`` set, the installer's groups are
+        handed to that callback to ask about. Without either, a FOMOD
+        archive is refused rather than extracted to every option at once.
+        """
         progress = on_progress or _noop_progress
 
         mod_info = parse_mod_url(mod_url)
@@ -1628,14 +1703,28 @@ class ModManagerService:
                 )
 
             progress("extract", 0.85, "Extracting...")
-            # Refuse before extracting anything. A FOMOD archive needs
-            # option choices, and extracting it installs every option
-            # folder at once. Checking every file first means a multi-file
-            # add extracts nothing when any one of them is a FOMOD mod.
+            # Read the FOMOD installer (if any) and settle the option
+            # choices BEFORE extracting anything, so a multi-file add
+            # extracts nothing when one file's choices cannot be
+            # resolved. Picks recorded by a previous install are kept as
+            # far as they still name real options.
+            resolved_picks: list = []
             if not no_extract:
+                previous = state.mods.get(selected_file_id)
+                stored_picks = previous.fomod_picks if previous is not None else None
                 for _mod, file_path in results:
-                    if is_archive(file_path):
-                        _check_not_fomod(file_path)
+                    if not is_archive(file_path):
+                        continue
+                    config = _fomod_config_for_archive(file_path)
+                    if config is None:
+                        continue
+                    resolved_picks = _resolve_fomod_picks(
+                        config,
+                        file_path.name,
+                        fomod_picks,
+                        stored_picks,
+                        on_fomod_prompt,
+                    )
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
@@ -1652,6 +1741,11 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            if resolved_picks:
+                state.mods[selected_file_id].fomod_picks = [
+                    {"step": p.step, "group": p.group, "option": p.option}
+                    for p in resolved_picks
+                ]
             # Registering this mod is an explicit re-add, so its removal
             # tombstone (if any) is cleared with the same commit.
             state.clear_removed(mod_info.mod_id)
@@ -2013,7 +2107,18 @@ class ModManagerService:
             if state.manifest_data:
                 manifest = CollectionManifest.from_dict(state.manifest_data)
                 manifest_choices = manifest.mod_choices
-            plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
+            # FOMOD option picks recorded by standalone adds and imports.
+            fomod_picks = {
+                mod.mod_id: mod.fomod_picks
+                for mod in state.mods.values()
+                if mod.fomod_picks
+            }
+            plan = classify_files(
+                mods_dir,
+                game_domain,
+                mod_choices=manifest_choices,
+                fomod_picks=fomod_picks,
+            )
 
             if plan.total_files == 0:
                 errors: list[str] = []
@@ -2212,6 +2317,8 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        fomod_picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
     ) -> ImportResult:
         """Match manually downloaded files to pending mods, extract, and update state.
 
@@ -2349,15 +2456,36 @@ class ModManagerService:
                 matched += 1
 
                 is_arch = is_archive(match)
+                resolved_picks: list = []
                 try:
                     if not no_extract and is_arch:
-                        _check_not_fomod(match)
+                        config = _fomod_config_for_archive(match)
+                        if config is not None:
+                            from .fomod_select import picks_for_file
+
+                            scoped = (
+                                picks_for_file(fomod_picks, match.name)
+                                if fomod_picks
+                                else None
+                            )
+                            resolved_picks = _resolve_fomod_picks(
+                                config,
+                                match.name,
+                                scoped,
+                                mod_state.fomod_picks,
+                                on_fomod_prompt,
+                            )
                         extract_archive(match, mods_dir)
                         extracted += 1
                 except FomodInstallerError as e:
                     # Same contract as a failed extraction: report it and
                     # leave the item pending rather than abort the batch.
                     # The message is self-contained, so it is the report.
+                    errors.append(f"{mod_state.name}: {exception_reason(e)}")
+                    continue
+                except (FomodChoicesError, PickError) as e:
+                    # Choices we cannot settle are the same shape of
+                    # refusal: report, keep the archive, leave pending.
                     errors.append(f"{mod_state.name}: {exception_reason(e)}")
                     continue
                 except ExtractionError as e:
@@ -2370,6 +2498,11 @@ class ModManagerService:
                 mod_state.download_status = "downloaded"
                 mod_state.browser_url = ""
                 mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+                if resolved_picks:
+                    mod_state.fomod_picks = [
+                        {"step": p.step, "group": p.group, "option": p.option}
+                        for p in resolved_picks
+                    ]
                 # Importing this mod's file is an explicit re-add of the mod
                 # page, so any tombstone for it is cleared with the commit.
                 state.clear_removed(mod_state.mod_id)

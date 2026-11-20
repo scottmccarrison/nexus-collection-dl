@@ -336,7 +336,9 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
 
 
 def _fomod_plans(
-    mods_dir: Path, mod_choices: dict[int, dict]
+    mods_dir: Path,
+    mod_choices: dict[int, dict],
+    fomod_picks: dict[int, list[dict]] | None = None,
 ) -> list[tuple[Path, "InstallPlan | None", tuple[str, ...]]]:
     """Install plans for every readable ModuleConfig in the tree.
 
@@ -345,6 +347,11 @@ def _fomod_plans(
     source paths the config mentions at all, selected or not. The latter
     is ownership: a file under one of them belongs to this mod, and a
     file outside all of them belongs to whatever else shares the tree.
+
+    Choices come from two places: ``fomod_picks`` are the (step, group,
+    option) triples a standalone install stored, and ``mod_choices`` is
+    the collection manifest's structure. Picks win, because they are the
+    more specific record.
 
     A plan is ``None`` when its conditions could not all be evaluated.
     Those mods keep the legacy folder heuristic rather than shipping a
@@ -356,6 +363,7 @@ def _fomod_plans(
         resolve_install_plan,
         selections_from_manifest,
     )
+    from .fomod_select import Pick, PickError, picks_to_selections
 
     plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
     for config_path in sorted(mods_dir.rglob("*")):
@@ -369,11 +377,30 @@ def _fomod_plans(
             continue
 
         selections: dict = {}
-        for choices in mod_choices.values():
-            matched = selections_from_manifest(choices, config)
-            if matched:
+        for stored in (fomod_picks or {}).values():
+            try:
+                matched, unmatched = picks_to_selections(
+                    [
+                        Pick(
+                            step=str(d.get("step", "")),
+                            group=str(d.get("group", "")),
+                            option=str(d.get("option", "")),
+                        )
+                        for d in stored
+                    ],
+                    config,
+                )
+            except PickError:
+                continue
+            if matched and not unmatched:
                 selections = matched
                 break
+        if not selections:
+            for choices in mod_choices.values():
+                matched = selections_from_manifest(choices, config)
+                if matched:
+                    selections = matched
+                    break
 
         resolved = resolve_install_plan(config, selections)
         owned = tuple(entry.source.lower() for entry in config.all_entries())
@@ -421,17 +448,20 @@ def classify_files(
     mods_dir: Path,
     game_domain: str,
     mod_choices: dict[int, dict] | None = None,
+    fomod_picks: dict[int, list[dict]] | None = None,
 ) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment.
 
     Files a FOMOD config claims are installed from its install plan, at
-    the destination the config names. Everything else keeps the folder
-    heuristics: numbered option wrappers, SFSE version directories, and
-    the top-level skip set for mods whose config could not be read.
+    the destination the config names. ``fomod_picks`` carries the option
+    choices a standalone install recorded; ``mod_choices`` is the
+    collection manifest's. Everything else keeps the folder heuristics:
+    numbered option wrappers, SFSE version directories, and the top-level
+    skip set for mods whose config could not be read.
     """
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
-    fomod_plans = _fomod_plans(mods_dir, mod_choices or {})
+    fomod_plans = _fomod_plans(mods_dir, mod_choices or {}, fomod_picks)
 
     plan = DeploymentPlan()
 
