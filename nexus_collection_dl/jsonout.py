@@ -26,14 +26,15 @@ from typing import Any
 # Error codes, most-derived first. This is an ordered isinstance walk rather
 # than a dict lookup because several of these subclass one another
 # (StateBusyError is a StateError, UndeployError is a DeployError,
-# NexusPremiumRequired is a NexusAPIError) and the more specific code must win.
+# NexusPremiumRequired is a NexusAPIError, FomodInstallerError is an
+# ExtractionError) and the more specific code must win.
 def _build_error_codes() -> tuple[tuple[type[BaseException], str], ...]:
     # Imported here so importing this module never drags in the whole package.
     from .api import NexusAPIError, NexusPremiumRequired, NexusRateLimited
     from .collection import CollectionParseError, ModParseError
     from .deploy import DeployError, UndeployError
     from .downloader import DownloadError
-    from .extractor import ExtractionError
+    from .extractor import ExtractionError, FomodInstallerError
     from .handler import DesktopEntryError, HandlerError, NxmRoutingError
     from .keystore import KeyStoreError
     from .loadorder import LoadOrderError
@@ -57,6 +58,7 @@ def _build_error_codes() -> tuple[tuple[type[BaseException], str], ...]:
         (DesktopEntryError, "desktop_entry_error"),
         (HandlerError, "handler_error"),
         (DownloadError, "download_error"),
+        (FomodInstallerError, "fomod_installer"),
         (ExtractionError, "extraction_error"),
         (ManifestError, "manifest_error"),
         (LoadOrderError, "load_order_error"),
