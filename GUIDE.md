@@ -588,6 +588,16 @@ Deploy 'Clean Visuals' now? [yes/no]:
 
 Answer `yes` and it shows what would be deployed (file counts and the game directory), asks again, and only then touches the game directory. Answer `no` at any point and nothing happens. Three clicks on the same collection produce one report and one prompt, not three.
 
+A click on a **FOMOD mod** is different: those need option choices before anything can be extracted, so the mod waits and the shell offers the choices instead:
+
+```
+Click activity while the shell was running (1 events):
+  'XPMSE' (file 456) needs FOMOD option choices in 'Clean Visuals' (run import --fomod-option to install it)
+1 FOMOD mod in 'Clean Visuals' need option choices. Choose now? [yes/no]:
+```
+
+Answer `yes` and the installer's groups are shown one at a time, exactly as `add` shows them at a terminal (numbered options, the recommended one marked, Enter for none where a group allows it). The picks are recorded and the mod installs right there, then the deploy question follows as usual. Answer `no` and the mod stays waiting: `nexus-dl import <collection> --fomod-option 'Group:Option'` picks it up later, and nothing is ever installed from a guess.
+
 The shell reads a small events file each collection keeps at `<collection folder>/.nexus-events.jsonl`. You never need to touch it. Only collections under the shell's root folder are visible: if you clicked a mod into a collection the shell can't see, use `/collections` or `/mods` to check. Events that arrived before the shell started are not replayed; you'll see only clicks that happened while it was running.
 
 You can also deploy at any time without waiting for a click, using `/deploy` (or `/deploy 2` or `/deploy Clean Visuals` to pick a collection). It works the same way: dry-run counts, a confirmation, then the deploy.
