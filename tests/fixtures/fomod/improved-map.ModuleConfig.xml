@@ -1,0 +1,99 @@
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+
+<moduleName>Improved Map with Visible Roads Installation</moduleName>
+
+<installSteps order="Explicit">
+
+	<installStep name="Install Improved Map with Visible Roads">
+
+	<optionalFileGroups order="Explicit">
+
+		<group name="Improved Map with Visible Roads" type="SelectExactlyOne">
+		<plugins order="Explicit">
+
+			<plugin name="Default">
+			<description>
+		Default brightness, no regions or numbers
+			</description>
+			<image path="fomod\images\b.jpg"/>
+			<files>
+				<file source="01 Improved Map with Visible Roads - Default\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+			
+					<plugin name="Default with Regions and Grid">
+			<description>
+		Default brightness, numbered grid and regions
+			</description>
+			<image path="fomod\images\b.jpg"/>
+			<files>
+				<file source="01 Improved Map with Visible Roads - Default - Regions and Grid\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+	
+	<plugin name="Darker">
+			<description>
+		Darker, no regions or numbers. Approximately vanilla brightness.
+			</description>
+			<image path="fomod\images\d.jpg"/>
+			<files>
+				<file source="02 Improved Map with Visible Roads - Darker\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+			
+					<plugin name="Darker with Regions and Grid">
+			<description>
+		Darker, numbered grid and regions.  Approximately vanilla brightness.
+			</description>
+			<image path="fomod\images\d.jpg"/>
+			<files>
+				<file source="02 Improved Map with Visible Roads - Darker - Regions and Grid\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+			
+	<plugin name="Even Darker">
+			<description>
+		Even Darker, no regions or numbers. Recommended for frequent Power Armor users.
+			</description>
+			<image path="fomod\images\e.jpg"/>
+			<files>
+				<file source="03 Improved Map with Visible Roads - Even Darker\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+			
+			<plugin name="Even Darker with Regions and Grid">
+			<description>
+		Even Darker, numbered grid and regions.  Recommended for frequent Power Armor users.
+			</description>
+			<image path="fomod\images\e.jpg"/>
+			<files>
+				<file source="03 Improved Map with Visible Roads - Even Darker - Regions and Grid\Textures\interface\pip-boy\worldmap_d.dds" destination="Textures\interface\pip-boy\worldmap_d.dds"/>
+			</files>
+			<typeDescriptor>
+				<type name="Optional"/>
+			</typeDescriptor>
+			</plugin>
+	
+
+		</plugins>
+		
+		</group>
+	</optionalFileGroups>
+	</installStep>
+</installSteps>
+</config>
