@@ -265,7 +265,15 @@ def create_app(api_key: str | None = None, mods_dir: Path | None = None, force_f
             try:
                 result_data = asdict(task.result)
             except (TypeError, Exception):
-                result_data = task.result if isinstance(task.result, dict) else str(task.result)
+                # A result that is not a dataclass has no bounded repr.
+                # The CLI is the diagnostic surface; the web gets a
+                # category rather than str(task.result), which can carry
+                # arbitrary exception text.
+                result_data = (
+                    task.result
+                    if isinstance(task.result, dict)
+                    else {"detail": "internal error"}
+                )
 
         return jsonify({
             "id": task.id,

@@ -117,7 +117,9 @@ class TaskManager:
                     from dataclasses import asdict
                     yield f"event: {event_type}\ndata: {json.dumps(asdict(data))}\n\n"
                 except (TypeError, Exception):
-                    yield f"event: {event_type}\ndata: {json.dumps({'msg': str(data)})}\n\n"
+                    # No bounded repr for a non-dataclass result; the web
+                    # gets a category rather than str(data).
+                    yield f"event: {event_type}\ndata: {json.dumps({'detail': 'internal error'})}\n\n"
 
             if event_type in ("complete", "error"):
                 break

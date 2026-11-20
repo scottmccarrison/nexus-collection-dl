@@ -9,6 +9,8 @@ from pathlib import Path
 import py7zr
 import rarfile
 
+from .errmsg import exception_reason
+
 
 class ExtractionError(Exception):
     """Raised when archive extraction fails."""
@@ -146,7 +148,7 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         return final_files
 
     except Exception as e:
-        raise ExtractionError(f"Failed to extract {archive_path}: {e}")
+        raise ExtractionError(f"Failed to extract {archive_path}: {exception_reason(e)}")
     finally:
         if staging_dir is not None:
             shutil.rmtree(staging_dir, ignore_errors=True)
