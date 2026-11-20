@@ -165,6 +165,14 @@ removed from the collection. `result`: AddResult. When the run itself fails
 partway (`success: false`), the envelope reports `ok: false` with
 `error.code` `operation_failed` and still carries the AddResult in `result`.
 
+**FOMOD archives are refused, not extracted.** If the archive carries a
+FOMOD installer (`fomod/ModuleConfig.xml` and similar) it needs option
+choices first, and extracting it without them installs every option folder
+at once. `add` raises `fomod_installer` and keeps the archive; `import`
+records it per file and leaves that item pending. Use `--no-extract` to
+register the mod and handle the extraction yourself. Picking options inside
+nexus-dl is not supported yet.
+
 ### add-local
 
 ```
