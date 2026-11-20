@@ -39,6 +39,7 @@ from .downloader import (
     SignedLink,
     validate_download_filename,
 )
+from .errmsg import exception_reason
 from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
 from .handler import (
     DesktopInstaller,
@@ -767,11 +768,9 @@ def scan_collections(root: Path) -> CollectionScan:
             # StateError, OSError, or int()/type errors on bad keys.)
             # The safe stringify pattern keeps a whitespace-only
             # message from raising here and hiding every collection.
-            lines = (str(e) or "").strip().splitlines()
-            summary = f"{lines[0][:60]}" if lines else ""
-            reason = (
-                f"{type(e).__name__}: {summary}" if summary else type(e).__name__
-            )
+            # exception_reason never returns blank and never raises, so
+            # there is no empty-list indexing to guard against here.
+            reason = exception_reason(e)[:120]
             skipped.append(
                 SkippedCollection(
                     name=cdir.name,
@@ -1316,7 +1315,7 @@ class ModManagerService:
                     pct = 0.75 + 0.15 * ((i + 1) / len(results))
                     progress("extract", pct, f"Extracted {mod_info['mod_name']}")
                 except ExtractionError as e:
-                    errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                    errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
 
             # Generate load order
             if not no_load_order:
@@ -1425,7 +1424,7 @@ class ModManagerService:
                             state.add_mod(mod_info)
                             downloaded += 1
                         except ExtractionError as e:
-                            errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                            errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
                 else:
                     # Free user: register as pending
                     game_domain = collection_data["game_domain"]
@@ -1601,7 +1600,7 @@ class ModManagerService:
                 except ExtractionError as e:
                     return AddResult(
                         mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                        success=False, error=f"Extraction error: {e}"
+                        success=False, error=f"Extraction error: {exception_reason(e)}"
                     )
 
             # Register in state as manual
@@ -1750,7 +1749,7 @@ class ModManagerService:
                 # the prior state file stands unchanged on any failure.
                 raise StateError(
                     f"Failed to save state after removing mod "
-                    f"{target_mod_id}: {e}"
+                    f"{target_mod_id}: {exception_reason(e)}"
                 ) from e
 
             if not no_load_order:
@@ -1762,7 +1761,7 @@ class ModManagerService:
                     warnings.append(
                         f"Mod {target_mod_id} was removed and the removal "
                         f"was saved, but load order regeneration failed: "
-                        f"{e}. Run 'nexus-dl load-order {mods_dir}' to "
+                        f"{exception_reason(e)}. Run 'nexus-dl load-order {mods_dir}' to "
                         f"retry."
                     )
 
@@ -2023,7 +2022,7 @@ class ModManagerService:
                             ownership=ownership,
                         )
                     except (DeployError, OSError) as e:
-                        result.errors.append(f"plugins.txt: {e}")
+                        result.errors.append(f"plugins.txt: {exception_reason(e)}")
                 ini_path = get_game_ini_path(prefix, game_domain)
                 if ini_path:
                     try:
@@ -2033,7 +2032,7 @@ class ModManagerService:
                             ownership=ownership,
                         )
                     except (DeployError, OSError) as e:
-                        result.errors.append(f"game INI: {e}")
+                        result.errors.append(f"game INI: {exception_reason(e)}")
 
             # Save state
             state.game_dir = str(game_dir)
@@ -2302,7 +2301,7 @@ class ModManagerService:
                     # A failed extraction must never mark the mod downloaded.
                     # The archive stays on disk and the item stays pending;
                     # partially moved content cannot be rolled back.
-                    errors.append(f"Extraction error for {mod_state.name}: {e}")
+                    errors.append(f"Extraction error for {mod_state.name}: {exception_reason(e)}")
                     continue
 
                 mod_state.download_status = "downloaded"
@@ -2321,7 +2320,7 @@ class ModManagerService:
                     except OSError as e:
                         # The import itself succeeded and is persisted; a leftover
                         # archive is reported but does not roll back the success.
-                        errors.append(f"Could not remove {match.name} after import: {e}")
+                        errors.append(f"Could not remove {match.name} after import: {exception_reason(e)}")
 
                 pct = 0.1 + 0.8 * ((i + 1) / len(pending))
                 progress("import", pct, f"Imported {mod_state.name}")
@@ -2337,14 +2336,14 @@ class ModManagerService:
                 try:
                     load_order_files = self._regen_load_order_from_state(mods_dir, state)
                 except Exception as e:
-                    errors.append(f"Load order regeneration failed: {e}")
+                    errors.append(f"Load order regeneration failed: {exception_reason(e)}")
 
             # Sync tracked mods (same as premium sync does after downloading)
             if matched > 0:
                 try:
                     self._maybe_sync_tracked(state)
                 except Exception as e:
-                    errors.append(f"Track sync failed: {e}")
+                    errors.append(f"Track sync failed: {exception_reason(e)}")
 
             still_pending = len(state.get_pending_mods())
             progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")
@@ -2466,7 +2465,7 @@ class ModManagerService:
                             dup_warnings.append(
                                 "The file was already downloaded, but the "
                                 "record of its earlier removal could not be "
-                                f"cleared: {e}. Nothing else failed; fix "
+                                f"cleared: {exception_reason(e)}. Nothing else failed; fix "
                                 "the underlying problem (permissions, disk "
                                 "space) and re-run to clear it."
                             )
@@ -2535,7 +2534,7 @@ class ModManagerService:
                         return self._nxm_failure(
                             info,
                             f"The retained archive at {archive} could not "
-                            f"be extracted: {e}. Run 'nexus-dl import "
+                            f"be extracted: {exception_reason(e)}. Run 'nexus-dl import "
                             f"{target}' to retry, or remove the archive and "
                             "click the download link again for a fresh "
                             "copy.",
@@ -2557,7 +2556,7 @@ class ModManagerService:
                             info,
                             "Extraction from the retained archive succeeded "
                             "but the collection state could not be saved: "
-                            f"{e}. Extracted files were left in place and "
+                            f"{exception_reason(e)}. Extracted files were left in place and "
                             f"the archive is kept at {archive}. Fix the "
                             "underlying problem (permissions, disk space) "
                             f"and run 'nexus-dl import {target}'.",
@@ -2571,14 +2570,14 @@ class ModManagerService:
                     try:
                         self._maybe_sync_tracked(state)
                     except Exception as e:
-                        warnings.append(f"Tracked-mod sync failed: {e}")
+                        warnings.append(f"Tracked-mod sync failed: {exception_reason(e)}")
                     if not no_load_order:
                         progress("loadorder", 0.9, "Regenerating load order...")
                         try:
                             self._regen_load_order_from_state(target, state)
                         except Exception as e:
                             warnings.append(
-                                f"Load order regeneration failed: {e}. Run "
+                                f"Load order regeneration failed: {exception_reason(e)}. Run "
                                 f"'nexus-dl load-order {target}' to retry."
                             )
                     progress("done", 1.0, f"Extracted {existing.name}")
@@ -2623,7 +2622,7 @@ class ModManagerService:
                     selected.get("file_name") or selected.get("name")
                 )
             except DownloadError as e:
-                return self._nxm_failure(info, str(e), collection_dir=target)
+                return self._nxm_failure(info, exception_reason(e), collection_dir=target)
 
             mod_name = self._nxm_mod_name(info, existing=existing)
 
@@ -2769,7 +2768,7 @@ class ModManagerService:
             except DownloadError as e:
                 # State is untouched and any previous files are intact:
                 # a failed download never claims completion.
-                message = str(e)
+                message = exception_reason(e)
                 if owned_dest_hint and "refusing to overwrite" in message:
                     message += owned_dest_hint
                 return self._nxm_failure(
@@ -2814,9 +2813,9 @@ class ModManagerService:
                             return self._nxm_failure(
                                 info,
                                 f"Download succeeded but extraction "
-                                f"failed: {e}. The archive is kept at "
+                                f"failed: {exception_reason(e)}. The archive is kept at "
                                 f"{path}, but the collection state could "
-                                f"not be updated ({save_exc}), so nothing "
+                                f"not be updated ({exception_reason(save_exc)}), so nothing "
                                 f"was recorded and 'nexus-dl import' "
                                 f"cannot see it. Fix the underlying "
                                 f"problem (permissions, disk space), then "
@@ -2854,7 +2853,7 @@ class ModManagerService:
                                 state.removed_mods[info.mod_id] = removed_snapshot
                             state_note = (
                                 " The collection state could not be "
-                                f"updated ({save_exc}), so the entry "
+                                f"updated ({exception_reason(save_exc)}), so the entry "
                                 "remains marked as downloaded; fix the "
                                 "underlying problem (permissions, disk "
                                 "space), then remove the archive and "
@@ -2862,7 +2861,7 @@ class ModManagerService:
                             )
                     return self._nxm_failure(
                         info,
-                        f"Download succeeded but extraction failed: {e}. "
+                        f"Download succeeded but extraction failed: {exception_reason(e)}. "
                         f"The archive is kept at {path}; run 'nexus-dl "
                         f"import {target}' to retry.{state_note}",
                         collection_dir=target,
@@ -2904,7 +2903,7 @@ class ModManagerService:
                 return self._nxm_failure(
                     info,
                     f"The download completed but the collection state could "
-                    f"not be saved: {e}. The verified archive is kept at "
+                    f"not be saved: {exception_reason(e)}. The verified archive is kept at "
                     f"{path}.{extracted_note} Nothing was marked as "
                     f"downloaded. Fix the underlying problem (permissions, "
                     f"disk space) and run 'nexus-dl import {target}'"
@@ -2936,14 +2935,14 @@ class ModManagerService:
             try:
                 self._maybe_sync_tracked(state)
             except Exception as e:
-                warnings.append(f"Tracked-mod sync failed: {e}")
+                warnings.append(f"Tracked-mod sync failed: {exception_reason(e)}")
             if not no_load_order:
                 progress("loadorder", 0.9, "Regenerating load order...")
                 try:
                     self._regen_load_order_from_state(target, state)
                 except Exception as e:
                     warnings.append(
-                        f"Load order regeneration failed: {e}. Run "
+                        f"Load order regeneration failed: {exception_reason(e)}. Run "
                         f"'nexus-dl load-order {target}' to retry."
                     )
 
@@ -2992,7 +2991,7 @@ class ModManagerService:
                 selected.get("file_name") or selected.get("name")
             )
         except DownloadError as e:
-            return self._nxm_failure(info, str(e))
+            return self._nxm_failure(info, exception_reason(e))
 
         # Refuse ANY existing destination entry BEFORE downloading
         # (regular file, symlink, or dangling symlink): --output must
@@ -3053,7 +3052,7 @@ class ModManagerService:
                 no_clobber=True,
             )
         except DownloadError as e:
-            return self._nxm_failure(info, str(e), filename=filename)
+            return self._nxm_failure(info, exception_reason(e), filename=filename)
 
         # Archive-only drop: a payload without real archive magic (error
         # page, loose file, truncated download) is removed, not left behind.
@@ -3280,7 +3279,7 @@ class ModManagerService:
             raise
         except Exception as e:
             raise LoadOrderRegenError(
-                f"Load order regeneration failed: {e}"
+                f"Load order regeneration failed: {exception_reason(e)}"
             ) from e
 
     def _regen_load_order_unwrapped(self, mods_dir: Path, state: CollectionState) -> list[str]:
@@ -3325,7 +3324,7 @@ class ModManagerService:
             written_files = [p.name for p in written]
         except Exception as e:
             raise LoadOrderRegenError(
-                f"Load order generation failed: {e}"
+                f"Load order generation failed: {exception_reason(e)}"
             ) from e
 
         if is_bethesda_game(state.game_domain) and is_loot_available():
@@ -3423,7 +3422,7 @@ def _probe_api_key_source() -> tuple[str | None, str | None]:
     try:
         _value, source = resolve_api_key(None)
     except KeyStoreError as e:
-        return None, str(e)
+        return None, exception_reason(e)
     return source, None
 
 
@@ -3747,7 +3746,7 @@ def collect_health(
         try:
             return fn()
         except Exception as e:
-            reason = (str(e) or "").strip().splitlines()
+            reason = (exception_reason(e) or "").strip().splitlines()
             detail = f"check failed ({type(e).__name__})"
             if reason:
                 detail = f"check failed ({type(e).__name__}: {reason[0][:60]})"

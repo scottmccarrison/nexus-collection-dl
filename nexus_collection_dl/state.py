@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from typing_extensions import Self
 
+from .errmsg import exception_reason
+
 try:
     import fcntl
 except ImportError:  # non-POSIX platforms: locking degrades to a no-op
@@ -199,7 +201,7 @@ class CollectionState:
             with open(self.state_file) as f:
                 data = json.load(f)
         except json.JSONDecodeError as e:
-            raise StateError(f"Invalid state file: {e}")
+            raise StateError(f"Invalid state file: {exception_reason(e)}")
 
         self.collection_url = data.get("collection_url", "")
         self.collection_name = data.get("collection_name", "")

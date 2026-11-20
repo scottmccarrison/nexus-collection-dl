@@ -35,3 +35,24 @@ not in the envelope at all: they exit 2 with plain text on stderr.
 | `invalid_argument` | Domain-level validation failed, e.g. `remove` given zero or both of `--file-id`/`--mod-id` | Fix the invocation. The `hint` (when present) names the lookup command to use |
 | `not_found` | A required path was not found (e.g. no game directory could be located for `deploy`) | Pass `--game-dir` explicitly, or check the Steam install |
 | `operation_failed` | The command ran but its own result reports failure: `add` completed with `success: false` (and similar result-reported failures). The envelope keeps the `result` object alongside the error | Read `result` (for `add`: `error` text, `pending_download` for the free-account path) and act on that; do not re-run blindly |
+
+## Result error text (not error codes)
+
+A result's `errors`/`warnings`/`error` fields are a diagnostic record, not
+the `error.code` above. They carry the deliberate part: which path, which
+refusal reason. The exception suffix beside it is a short category, never
+raw OS or unexpected-exception text, because those fields also reach a
+browser through the web UI's task view.
+
+- `OSError` becomes the fixed OS phrase plus the symbolic errno name, for
+  example `no such file or directory (ENOENT)`. No filename, no
+  `[Errno N]` framing.
+- An exception raised outside this package becomes
+  `unexpected error (<TypeName>)`.
+- An exception raised inside this package keeps its authored message,
+  so the refusal reasons you see (`not a regular file or symlink`,
+  `changed outside`) are exactly as the code wrote them.
+
+The `--json` envelope's `error.message` is a different thing: it is the
+documented diagnostic surface and may carry redacted exception detail.
+Read `error.code` to branch on; read `message` to explain to a human.

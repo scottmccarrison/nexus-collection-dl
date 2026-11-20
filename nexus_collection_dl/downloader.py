@@ -28,6 +28,7 @@ from .api import (
     redact_secret_values,
     suppress_http_debug_logging,
 )
+from .errmsg import exception_reason
 
 # Seconds: (connect timeout, per-read timeout) for download requests.
 CONNECT_TIMEOUT = 15
@@ -115,7 +116,7 @@ def _safe_error(exc: Exception, secrets: tuple = ()) -> str:
         return "connection error"
     if isinstance(exc, requests.RequestException):
         return f"network error ({type(exc).__name__})"
-    return redact_secret_values(f"{type(exc).__name__}: {exc}", secrets)
+    return exception_reason(exc)
 
 
 def _expected_size(mod_info: dict[str, Any]) -> int | None:

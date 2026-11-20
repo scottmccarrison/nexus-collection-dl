@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from . import __version__
+from .errmsg import exception_reason
 
 GRAPHQL_URL = "https://api.nexusmods.com/v2/graphql"
 REST_BASE_URL = "https://api.nexusmods.com/v1"
@@ -608,7 +609,7 @@ class NexusAPI:
         except NexusAPIError as e:
             if key is not None:
                 raise NexusAPIError(
-                    f"{e} The download credentials in this link were rejected "
+                    f"{exception_reason(e)} The download credentials in this link were rejected "
                     "or have expired; click 'Mod manager download' on the "
                     "Nexus website again to get a fresh link."
                 ) from None

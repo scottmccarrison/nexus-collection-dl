@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .errmsg import exception_reason
+
 # Bethesda plugin/archive extensions
 BETHESDA_EXTENSIONS = {".esm", ".esp", ".esl", ".ba2"}
 
@@ -452,7 +454,7 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
     except OSError as e:
-        raise DeployError(f"cannot read {path}: {e}")
+        raise DeployError(f"cannot read {path}: {exception_reason(e)}")
     return h.hexdigest()
 
 
@@ -812,7 +814,7 @@ def _restore_original(
             os.replace(tmp_link, dest)
             return True, ""
         except OSError as e:
-            return False, f"could not restore original symlink at {dest}: {e}"
+            return False, f"could not restore original symlink at {dest}: {exception_reason(e)}"
         finally:
             try:
                 tmp_link.unlink(missing_ok=True)  # no-op once replaced
@@ -831,7 +833,7 @@ def _restore_original(
     try:
         backup_path = backups.path_for(backup_name)
     except DeployError as e:
-        return False, str(e)
+        return False, exception_reason(e)
 
     tmp: Path | None = None
     try:
@@ -858,7 +860,7 @@ def _restore_original(
         os.replace(tmp, dest)
         tmp = None
     except OSError as e:
-        return False, f"could not restore original at {dest}: {e}"
+        return False, f"could not restore original at {dest}: {exception_reason(e)}"
     finally:
         if tmp is not None:
             try:
@@ -913,7 +915,7 @@ def recover_ownership(
         try:
             validate_dest(dest, root, create_parents=False)
         except DeployError as e:
-            return False, str(e)
+            return False, exception_reason(e)
         return _restore_original(dest, rec, backups)
 
     for entry in entries:
@@ -1087,7 +1089,7 @@ def prepare_deploy(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
 
     if st is not None and not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
         raise DeployError(
@@ -1188,7 +1190,7 @@ def install_deploy(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
 
     if (st is not None) != current["exists"]:
         raise DeployError(
@@ -1226,7 +1228,7 @@ def install_deploy(
         try:
             os.replace(tmp_link, dest)
         except OSError as e:
-            raise DeployError(f"could not publish the symlink at {dest}: {e}")
+            raise DeployError(f"could not publish the symlink at {dest}: {exception_reason(e)}")
         finally:
             try:
                 tmp_link.unlink(missing_ok=True)  # no-op once replaced
@@ -1316,7 +1318,7 @@ def deploy_tracked_content(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
     if st is not None and not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
         raise DeployError(
             f"refused: {dest} is not a regular file or symlink; cannot write over it"
@@ -1435,14 +1437,14 @@ def undeploy_record(
         if dest.parent.exists():
             validate_dest(dest, root, create_parents=False)
     except DeployError as e:
-        return "refused", str(e)
+        return "refused", exception_reason(e)
 
     try:
         st = os.lstat(dest)
     except FileNotFoundError:
         st = None
     except OSError as e:
-        return "failed", f"{dest}: cannot inspect destination: {e}"
+        return "failed", f"{dest}: cannot inspect destination: {exception_reason(e)}"
 
     kind = rec.get("kind", "mod")
 
@@ -1454,7 +1456,7 @@ def undeploy_record(
             try:
                 os.unlink(dest)
             except OSError as e:
-                return "failed", f"{dest}: could not remove deployed file: {e}"
+                return "failed", f"{dest}: could not remove deployed file: {exception_reason(e)}"
             _cleanup_empty_parents(dest.parent, root)
             return "removed", (
                 f"{dest}: removed pre-0.2.1 deployment; any original file at "
@@ -1527,7 +1529,7 @@ def undeploy_record(
     try:
         os.unlink(dest)
     except OSError as e:
-        return "failed", f"{dest}: could not remove deployed file: {e}"
+        return "failed", f"{dest}: could not remove deployed file: {exception_reason(e)}"
 
     _cleanup_empty_parents(dest.parent, root)
     return "removed", ""
@@ -1622,10 +1624,10 @@ def deploy(
             journal.deploy_intent(record)
             install_deploy(record, src, current, backups)
         except DeployError as e:
-            result.errors.append(str(e))
+            result.errors.append(exception_reason(e))
             return
         except OSError as e:
-            result.errors.append(f"{dest_rel}: {e}")
+            result.errors.append(f"{dest_rel}: {exception_reason(e)}")
             return
         # Installed: record ownership before anything else so the file stays
         # tracked even if the completion line cannot be written.

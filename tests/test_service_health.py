@@ -514,7 +514,9 @@ def test_scan_collections_survives_blank_exception_text(
     scan = scan_collections(tmp_path)
     assert scan.collections == []
     assert [s.name for s in scan.skipped] == ["Good"]
-    assert scan.skipped[0].reason == "ValueError"
+    # exception_reason turns any exception into a bounded category, so a
+    # blank message cannot produce blank (or malformed) reason text.
+    assert scan.skipped[0].reason == "unexpected error (ValueError)"
     assert list_collections(tmp_path) == []
 
 

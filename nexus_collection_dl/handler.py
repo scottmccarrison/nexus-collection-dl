@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .errmsg import exception_reason
 from .state import STATE_FILENAME, CollectionState, StateError
 
 CONFIG_DIR_NAME = "nexus-dl"
@@ -296,11 +297,11 @@ class HandlerConfig:
         except FileNotFoundError:
             return cfg
         except OSError as e:
-            raise HandlerError(f"Could not read handler config {cfg.path}: {e}")
+            raise HandlerError(f"Could not read handler config {cfg.path}: {exception_reason(e)}")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise HandlerError(f"Handler config {cfg.path} is corrupt: {e}")
+            raise HandlerError(f"Handler config {cfg.path} is corrupt: {exception_reason(e)}")
         if not isinstance(data, dict):
             raise HandlerError(f"Handler config {cfg.path} is corrupt.")
         mappings = data.get("mappings")
@@ -333,7 +334,7 @@ def _load_collection_state(directory: Path) -> CollectionState:
     try:
         state.load()
     except StateError as e:
-        raise HandlerError(f"Could not read collection state in {directory}: {e}")
+        raise HandlerError(f"Could not read collection state in {directory}: {exception_reason(e)}")
     return state
 
 
@@ -1192,7 +1193,7 @@ class DesktopInstaller:
             try:
                 self.entry_path.unlink()
             except OSError as e:
-                raise DesktopEntryError(f"Could not remove {self.entry_path}: {e}")
+                raise DesktopEntryError(f"Could not remove {self.entry_path}: {exception_reason(e)}")
             self._refresh_database()
 
         self.config.desktop = {}
