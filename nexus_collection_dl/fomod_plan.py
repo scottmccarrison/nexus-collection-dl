@@ -282,14 +282,51 @@ def _strip_ns(tag: str) -> str:
 CONFIG_ENCODINGS = ("utf-8-sig", "utf-16", "cp1252")
 
 
+def _nul_aligned_utf16(raw: bytes) -> str | None:
+    """Name the likely UTF-16 flavour from where the NUL bytes sit.
+
+    ASCII text in UTF-16LE carries its NULs on odd byte offsets and in
+    UTF-16BE on even ones. The codecs cannot tell the flavours apart:
+    both decode any byte pair without error, one of them into mojibake.
+    """
+    even = odd = 0
+    for offset, byte in enumerate(raw):
+        if byte == 0:
+            if offset % 2:
+                odd += 1
+            else:
+                even += 1
+    if odd > even:
+        return "utf-16-le"
+    if even > odd:
+        return "utf-16-be"
+    return None
+
+
+def _candidate_encodings(raw: bytes) -> tuple[str, ...]:
+    """Order the encodings worth trying for raw config bytes.
+
+    NUL-interleaved bytes are UTF-16-family content: NULs are valid
+    UTF-8, so the usual order would decode a BOM-less UTF-16 payload as
+    NUL-riddled text and hand the parser the wrong characters.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ("utf-16", "utf-8-sig", "cp1252")
+    if b"\x00" in raw:
+        if _nul_aligned_utf16(raw) == "utf-16-be":
+            return ("utf-16-be", "utf-16-le", "utf-8-sig", "cp1252")
+        return ("utf-16-le", "utf-16-be", "utf-8-sig", "cp1252")
+    return CONFIG_ENCODINGS
+
+
 def decode_config_text(raw: bytes) -> str | None:
-    """Decode config bytes to text. UTF-8 first, UTF-16 then cp1252.
+    """Decode config bytes to text. UTF-16 first when the bytes say so.
 
     Real configs are UTF-16LE with a BOM; a stored copy keeps this text,
     which parses the same way whether it came from the archive or back
     out of the state file.
     """
-    for encoding in CONFIG_ENCODINGS:
+    for encoding in _candidate_encodings(raw):
         try:
             return raw.decode(encoding)
         except UnicodeError:
@@ -298,13 +335,22 @@ def decode_config_text(raw: bytes) -> str | None:
 
 
 def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
-    text = decode_config_text(raw)
-    if text is None:
-        return None
-    try:
-        return ET.fromstring(text)
-    except ET.ParseError:
-        return None
+    """Parse config bytes as XML, trying each likely encoding in turn.
+
+    A decode that succeeds can still be the wrong codec (an ASCII-only
+    BOM-less UTF-16 payload decodes as valid UTF-8), so a parse failure
+    falls through to the next encoding instead of giving up.
+    """
+    for encoding in _candidate_encodings(raw):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeError:
+            continue
+        try:
+            return ET.fromstring(text)
+        except ET.ParseError:
+            continue
+    return None
 
 
 def _parse_xml(config_path: Path) -> ET.Element | None:
