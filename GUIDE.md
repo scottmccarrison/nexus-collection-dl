@@ -572,7 +572,7 @@ If you're pasting links here because clicking **Mod manager download** in the br
 
 ### Reacting to clicks from the shell
 
-When `nexus-dl shell` is open and you click **Mod manager download** in your browser, the shell notices at the next prompt. Press Enter (or type any command) and you'll see something like:
+When `nexus-dl shell` is open and you click **Mod manager download** in your browser, the shell notices while you sit at the prompt - no keystroke needed. You'll see something like:
 
 ```
 Click activity while the shell was running (2 events):

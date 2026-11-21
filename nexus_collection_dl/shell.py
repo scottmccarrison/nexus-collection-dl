@@ -69,6 +69,8 @@ Design notes:
 import json
 import os
 import re
+import select
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -307,6 +309,37 @@ class _Quit(Exception):
     """Control flow for /quit: unwinds to run(), which exits 0."""
 
 
+IDLE_POLL_SECONDS = 2.0
+"""How often the idle wait checks for click events while nobody types."""
+
+
+def _stdin_pollable() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _select_stdin_waiter(poll_seconds: float):
+    """Waiter: True when a complete input line is ready, else a tick.
+
+    Canonical-mode terminals only report readable on a complete line, so
+    a False tick means nobody is mid-line and click events can be
+    surfaced. Where stdin cannot be polled (pipes, Windows consoles) the
+    waiter answers True immediately and the prompt-boundary drain still
+    applies.
+    """
+
+    def waiter() -> bool:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], poll_seconds)
+        except (OSError, ValueError, AttributeError):
+            return True
+        return bool(ready)
+
+    return waiter
+
+
 class _ShellSession:
     """One interactive session; see run_shell for the entry point."""
 
@@ -316,11 +349,22 @@ class _ShellSession:
         root: Path,
         input_fn,
         console: Console,
+        waiter=None,
+        poll_seconds: float = IDLE_POLL_SECONDS,
     ):
         self.svc = svc
         self.root = Path(root)
         self.input_fn = input_fn
         self.console = console
+        # None means "no idle waiting": read lines straight through
+        # input_fn, with click events drained at prompt boundaries only
+        # (tests, pipes). A callable waiter turns on live draining.
+        if waiter is not None:
+            self._waiter = waiter
+        elif poll_seconds and _stdin_pollable():
+            self._waiter = _select_stdin_waiter(poll_seconds)
+        else:
+            self._waiter = None
         # Current collection chosen with /use; None until then.
         self.current: CollectionSummary | None = None
         # Literal secret values redacted from everything the session
@@ -498,7 +542,7 @@ class _ShellSession:
         while True:
             self._drain_events()
             try:
-                line = self.input_fn(self._prompt())
+                line = self._read_line()
             except EOFError:
                 # Ctrl-D: goodbye, exit 0.
                 self._emit("Goodbye.")
@@ -699,12 +743,40 @@ class _ShellSession:
             except OSError:
                 pass
 
-    def _drain_events(self) -> None:
+    def _read_line(self) -> str:
+        """Read one command line, surfacing click events while idle.
+
+        With no waiter this is exactly ``input_fn(prompt)``. With one,
+        the prompt is drawn up front and the wait wakes either for a
+        complete input line or for an idle tick; a tick runs the event
+        drain, so a browser click shows up and starts its flow without
+        the user pressing anything. The prompt is redrawn after a tick
+        that printed something.
+        """
+        prompt = self._prompt()
+        if self._waiter is None:
+            return self.input_fn(prompt)
+        self._draw_prompt(prompt)
+        while True:
+            if self._waiter():
+                return self.input_fn("")
+            if self._drain_events():
+                self._draw_prompt(prompt)
+
+    def _draw_prompt(self, prompt: str) -> None:
+        """Draw the prompt line without a newline, bypassing rich."""
+        stream = self.console.file or sys.stdout
+        stream.write(prompt)
+        stream.flush()
+
+    def _drain_events(self) -> bool:
         """Read and report click events since the last drain.
 
-        Called once per loop iteration, before the prompt. One report
-        block for the whole drain, then one deploy prompt per collection
-        that saw at least one deployable event.
+        Called once per loop iteration, before the prompt, and from the
+        idle wait while nobody types. One report block for the whole
+        drain, then one deploy prompt per collection that saw at least
+        one deployable event. Returns True when the drain printed
+        anything, so the idle wait can redraw the prompt line.
         """
         new_events: list[dict] = []
         for path in self._events_files():
@@ -740,7 +812,7 @@ class _ShellSession:
                     continue  # skip malformed lines silently
 
         if not new_events:
-            return
+            return False
 
         count = len(new_events)
         header = "Click activity while the shell was running"
@@ -802,6 +874,7 @@ class _ShellSession:
             )
             if answer == _CONFIRM_YES:
                 self._deploy_by_path(Path(coll_dir))
+        return True
 
     def _offer_fomod_choices(self, coll_dir: Path, event: dict) -> bool:
         """Prompt for one clicked FOMOD mod's options and install it.
@@ -1682,15 +1755,25 @@ def run_shell(
     root: Path,
     input_fn=input,
     console: Console | None = None,
+    waiter=None,
+    poll_seconds: float = IDLE_POLL_SECONDS,
 ) -> int:
     """Run the interactive shell; returns the process exit code.
 
     ``input_fn`` is injectable for tests (it must behave like input():
     return one line per call, raise EOFError at end of input and
     KeyboardInterrupt on interrupt). ``console`` defaults to a fresh
-    rich Console.
+    rich Console. ``waiter`` is injectable for tests: it answers True
+    when an input line is ready and False on an idle tick; left as None,
+    a real tty gets a select-based waiter so click events surface while
+    nobody types, and everything else keeps the prompt-boundary drain.
     """
     session = _ShellSession(
-        svc, root, input_fn, console if console is not None else Console()
+        svc,
+        root,
+        input_fn,
+        console if console is not None else Console(),
+        waiter=waiter,
+        poll_seconds=poll_seconds,
     )
     return session.run()

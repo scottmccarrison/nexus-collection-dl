@@ -2148,7 +2148,7 @@ def _write_event(coll_dir: Path, **overrides):
     append_nxm_event(coll_dir, defaults)
 
 
-def run_events(svc, root, script):
+def run_events(svc, root, script, waiter=None):
     """run_shell with prompt recording and callable side effects."""
     prompts = []
     buf = io.StringIO()
@@ -2169,7 +2169,9 @@ def run_events(svc, root, script):
                 continue
             return item
 
-    code = run_shell(svc, root, input_fn=input_fn, console=console)
+    code = run_shell(
+        svc, root, input_fn=input_fn, console=console, waiter=waiter
+    )
     return code, buf.getvalue(), prompts
 
 
@@ -2502,3 +2504,51 @@ def test_deploy_command_conflicts_truncate_at_10(shell_env, tmp_path):
     assert "conflict-9" in out
     assert "conflict-10" not in out
     assert "and 5 more" in out
+
+
+def test_live_drain_surfaces_clicks_without_a_keystroke(shell_env, tmp_path):
+    """A click landing while idle is handled before anyone types.
+
+    The waiter models the idle wait: a tick where the click arrives and
+    nobody has typed, then input readiness. The drain must fire on the
+    tick - no Enter, no keystroke at all - and start the flow.
+    """
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+    ticks = {"n": 0}
+
+    def waiter():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            _write_event(coll)  # the click lands while the user is idle
+            return False
+        return True
+
+    code, out, _prompts = run_events(
+        FakeShellService(), root, [""], waiter=waiter
+    )
+    assert code == 0
+    assert ticks["n"] >= 2
+    assert "Click activity while the shell was running" in out
+    assert "SkyUI" in out
+
+
+def test_live_drain_redraws_the_prompt_after_an_idle_report(shell_env, tmp_path):
+    """The prompt line survives an idle-time report."""
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+    ticks = {"n": 0}
+
+    def waiter():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            _write_event(coll)
+            return False
+        return True
+
+    code, out, _prompts = run_events(
+        FakeShellService(), root, [""], waiter=waiter
+    )
+    assert code == 0
+    # Drawn once up front and once again after the tick's report.
+    assert out.count("nexus-dl [Clean Visuals]>") >= 2
