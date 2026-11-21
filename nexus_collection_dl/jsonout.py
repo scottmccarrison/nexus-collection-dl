@@ -34,7 +34,12 @@ def _build_error_codes() -> tuple[tuple[type[BaseException], str], ...]:
     from .collection import CollectionParseError, ModParseError
     from .deploy import DeployError, UndeployError
     from .downloader import DownloadError
-    from .extractor import ExtractionError, FomodChoicesError, FomodInstallerError
+    from .extractor import (
+        ExtractionError,
+        FomodChoicesError,
+        FomodInstallerError,
+        FomodUnreadableError,
+    )
     from .fomod_select import PickError
     from .handler import DesktopEntryError, HandlerError, NxmRoutingError
     from .keystore import KeyStoreError
@@ -62,6 +67,7 @@ def _build_error_codes() -> tuple[tuple[type[BaseException], str], ...]:
         (FomodChoicesError, "fomod_choices"),
         (PickError, "fomod_choices"),
         (FomodInstallerError, "fomod_installer"),
+        (FomodUnreadableError, "fomod_unreadable"),
         (ExtractionError, "extraction_error"),
         (ManifestError, "manifest_error"),
         (LoadOrderError, "load_order_error"),

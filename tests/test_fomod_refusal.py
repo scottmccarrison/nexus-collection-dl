@@ -24,6 +24,7 @@ from nexus_collection_dl.extractor import (
     ExtractionError,
     FomodChoicesError,
     FomodInstallerError,
+    FomodUnreadableError,
     can_enumerate_members,
     find_fomod_installer,
 )
@@ -216,6 +217,19 @@ def test_error_code_is_fomod_installer_not_extraction_error():
     assert error_code_for(exc) != "extraction_error"
     # And the parent still maps the way it always did.
     assert error_code_for(ExtractionError("nope")) == "extraction_error"
+
+
+def test_error_code_is_fomod_unreadable_not_extraction_error():
+    """Found-but-unreadable is its own refusal, not a generic extraction failure.
+
+    The cause differs from a script installer: the config was found and
+    its bytes would not read. A harness branching on the code can tell
+    the two apart.
+    """
+    exc = FomodUnreadableError("Fomod/ModuleConfig.xml", Path("/tmp/x.zip"))
+    assert error_code_for(exc) == "fomod_unreadable"
+    assert error_code_for(exc) != "extraction_error"
+    assert error_code_for(exc) != "fomod_installer"
 
 
 def test_fomod_installer_error_is_an_extraction_error():
