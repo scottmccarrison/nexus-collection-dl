@@ -7,7 +7,7 @@ fields; the "Result object fields" section at the bottom documents each one.
 ## Invocation
 
 ```
-nexus-dl [--api-key KEY] [--json] <command> [args] [flags]
+nexus-dl [--api-key KEY] [--json] [--version] <command> [args] [flags]
 ```
 
 Global options (before the subcommand):
@@ -16,6 +16,7 @@ Global options (before the subcommand):
 |---|---|
 | `--api-key KEY` | Nexus Mods API key for this run. Resolution order is `--api-key`, then the `NEXUS_API_KEY` environment variable, then the stored key (`nexus-dl handler set-api-key`). |
 | `--json` | Emit the machine-readable envelope on stdout and nothing else. Human diagnostics move to stderr. Must come **before** the subcommand. |
+| `--version` | Print `nexus-dl v<version>` and exit 0. Answers without a subcommand, like `--help`, and is plain text: `--json` does not wrap it. The same version is in the `health` envelope. |
 
 **JSON mode is not available** for `shell`, `nxm`, or `handler`.
 Passing `--json` to them (or to any command in the wrong position) is a usage

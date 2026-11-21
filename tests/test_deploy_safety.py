@@ -1390,3 +1390,50 @@ def test_symlink_over_original_symlink_replaced_by_regular_file_refused(env: Env
     assert len(result.errors) == 1 and "changed outside" in result.errors[0]
     assert dest.read_bytes() == b"mod content"
     assert not dest.is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# What deploy refuses to write, and what it says when two mods collide
+# ---------------------------------------------------------------------------
+
+
+def test_packaging_cruft_is_not_deployed(tmp_path):
+    """Vortex metadata, VCS files and licence text are not game content.
+
+    They ride along in real archives when a mod author packs their whole
+    working folder, and they belong with the mod's docs, not in the game
+    directory.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    for name in ("meta.ini", ".gitignore", "LICENSE", "License.txt", "mod.esp"):
+        (tmp_path / name).write_text("x")
+
+    plan = classify_files(tmp_path, "skyrimspecialedition")
+    deployed = {src.name for src, _dest in plan.game_root_files + plan.data_files}
+    assert deployed == {"mod.esp"}, [
+        (rel.as_posix(), why) for rel, why in plan.skipped
+    ]
+
+
+def test_conflict_messages_name_the_source_paths(env):
+    """Two mods shipping one destination: the message has to say which files.
+
+    The basenames are identical in the case that matters (two mods both
+    shipping ``x.nif`` to the same path), so naming them alone says
+    nothing at all. The numbered wrappers are the real collision shape:
+    they strip away, and the two options land on one destination.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    _src(env, "01 TBBP/meshes/actors/x.nif")
+    _src(env, "02 HDT/meshes/actors/x.nif")
+
+    plan = classify_files(env.staging, "skyrimspecialedition")
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "01 TBBP/meshes/actors/x.nif" in msg, msg
+    assert "02 HDT/meshes/actors/x.nif" in msg, msg

@@ -90,6 +90,8 @@ SKIP_PATTERNS = {
     ".nexus-state.json",
     "load-order.txt",
     "plugins.txt",
+    "meta.ini",
+    ".gitignore",
     "__folder_managed_by_vortex",
     "__macosx",
 }
@@ -187,11 +189,18 @@ class DeployedFile:
 
 @dataclass
 class DeploymentPlan:
-    """Classification of files to deploy."""
+    """Classification of files to deploy.
+
+    ``source_root`` is the staging directory the sources live under. It
+    is only used to report sources in paths a human can place (a conflict
+    message naming two files called ``CapeAF_0.nif`` says nothing);
+    ``None`` falls back to whatever the source path is on its own.
+    """
 
     game_root_files: list[tuple[Path, Path]] = field(default_factory=list)
     data_files: list[tuple[Path, Path]] = field(default_factory=list)
     skipped: list[tuple[Path, str]] = field(default_factory=list)
+    source_root: Path | None = None
 
     @property
     def root_destinations(self) -> int:
@@ -255,6 +264,8 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     if name_lower in {p.lower() for p in SKIP_PATTERNS}:
         return None
     if name_lower.startswith("readme"):
+        return None
+    if name_lower.startswith(("license", "licence")):
         return None
     if suffix_lower in SKIP_EXTENSIONS and suffix_lower not in BETHESDA_EXTENSIONS:
         return None
@@ -539,7 +550,7 @@ def classify_files(
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
     fomod_plans = _fomod_plans(mods_dir, mod_choices or {}, fomod_picks, fomod_configs)
 
-    plan = DeploymentPlan()
+    plan = DeploymentPlan(source_root=mods_dir)
 
     for file_path in sorted(mods_dir.rglob("*")):
         if not file_path.is_file():
@@ -1800,6 +1811,16 @@ def undeploy_records(
     return kept, problems, notes, cleared
 
 
+def _source_label(src: Path, source_root: Path | None) -> str:
+    """A source path a reader can place: relative to the staging root."""
+    if source_root is not None:
+        try:
+            return src.relative_to(source_root).as_posix()
+        except ValueError:
+            pass
+    return str(src)
+
+
 def deploy(
     plan: DeploymentPlan,
     game_dir: Path,
@@ -1864,7 +1885,8 @@ def deploy(
         dest = game_dir / dest_rel
         if dest in seen_dests:
             result.conflicts.append(
-                f"{dest_rel}: overwritten by {src.name} (was {seen_dests[dest].name})"
+                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
+                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
             )
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
@@ -1874,7 +1896,8 @@ def deploy(
         dest = data_dir / dest_rel
         if dest in seen_dests:
             result.conflicts.append(
-                f"{dest_rel}: overwritten by {src.name} (was {seen_dests[dest].name})"
+                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
+                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
             )
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)

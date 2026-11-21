@@ -58,6 +58,18 @@ def invoke(args: list[str], json_mode: bool = False):
     return CliRunner().invoke(cli_module.main, prefix + args)
 
 
+# --- version ---------------------------------------------------------------
+
+
+def test_version_flag_prints_the_version():
+    """`--version` answers without a subcommand, like `--help` does."""
+    from nexus_collection_dl import __version__
+
+    r = invoke(["--version"])
+    assert r.exit_code == 0, r.output
+    assert f"nexus-dl v{__version__}" in r.output
+
+
 # --- listings: local, no service, no network -------------------------------
 
 

@@ -89,6 +89,12 @@ _QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
     is_flag=True,
     help="Emit machine-readable JSON on stdout (must come before the subcommand)",
 )
+@click.version_option(
+    __version__,
+    "--version",
+    prog_name="nexus-dl",
+    message="%(prog)s v%(version)s",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
