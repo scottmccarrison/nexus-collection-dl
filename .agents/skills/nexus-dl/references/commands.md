@@ -344,7 +344,12 @@ nexus-dl handler uninstall
 ```
 
 `nxm` handles a single `nxm://` "Mod manager download" link; link credentials
-are used for the request only and are never stored or echoed. `handler`
+are used for the request only and are never stored or echoed. A mod with a
+FOMOD installer is never extracted without its option choices: with a
+`nexus-dl shell` running, the click drain offers the choices and installs on
+the spot, and with no shell running the archive is kept and the mod is
+recorded as `pending_choices` until `import --fomod-option` (or
+`--fomod-config`, or the prompts at a terminal) finishes it. `handler`
 installs/manages the desktop handler and the stored API key.
 
 ## Result object fields
