@@ -59,6 +59,27 @@ class FomodChoicesError(ExtractionError):
         )
 
 
+class FomodUnreadableError(ExtractionError):
+    """The archive is a FOMOD mod, but its option groups could not be read.
+
+    Distinct from an uninspectable archive, which is not proof of anything
+    and is deliberately left alone. Here the installer was found, so the
+    archive is a FOMOD mod and extracting it would install every option at
+    once. The message is the refusal.
+    """
+
+    def __init__(self, member: str, archive_path: Path) -> None:
+        self.member = member
+        self.archive_path = archive_path
+        super().__init__(
+            f"found {member} in {archive_path.name} but could not read it, "
+            f"so its option groups are unknown. Extracting without them "
+            f"could install every option at once. The archive is kept at "
+            f"{archive_path}. Use --no-extract and extract it yourself if "
+            f"you know what it should install."
+        )
+
+
 def sniff_archive_magic(filepath: Path) -> str | None:
     """Detect archive type by magic bytes alone.
 
@@ -351,30 +372,84 @@ def find_module_config(archive_path: Path) -> str | None:
     return None
 
 
+# A member read fails on the archive's own terms: no such member, a
+# corrupt archive, or compression nothing here can decode. Programming
+# errors are deliberately not in this set; a blanket ``except Exception``
+# is what let a nonexistent py7zr method read as "could not read it".
+_UNREADABLE_MEMBER_ERRORS = (
+    KeyError,
+    OSError,
+    zipfile.BadZipFile,
+    rarfile.Error,
+    py7zr.exceptions.ArchiveError,
+    py7zr.exceptions.PasswordRequired,
+)
+
+
 def read_archive_member(archive_path: Path, member: str) -> bytes | None:
-    """Read one member's bytes without extracting the archive."""
+    """Read one member's bytes without extracting the whole archive.
+
+    Returns None when the member cannot be read, and callers turn that
+    into a refusal. Failures that are not about the member at all are
+    not converted into that answer.
+    """
     archive_type = detect_archive_type(archive_path)
     try:
         if archive_type == "zip":
             with zipfile.ZipFile(archive_path, "r") as zf:
                 return zf.read(member)
         if archive_type == "7z":
-            with py7zr.SevenZipFile(archive_path, "r") as szf:
-                got = szf.read([member])
-                target = got.get(member)
-                if target is None:
-                    wanted = member.lower()
-                    for key, value in got.items():
-                        if key.lower() == wanted:
-                            target = value
-                            break
-                return target.read() if target is not None else None
+            return _read_7z_member(archive_path, member)
         if archive_type == "rar":
             with rarfile.RarFile(archive_path, "r") as rf:
                 return rf.read(member)
-    except Exception:
+    except _UNREADABLE_MEMBER_ERRORS:
         return None
     return None
+
+
+def _read_7z_member(archive_path: Path, member: str) -> bytes | None:
+    """Read one member of a 7z archive.
+
+    py7zr has no single-member read, so the one member is extracted to a
+    private temp directory. Archives using compression py7zr cannot
+    decode (BCJ2 in particular, common in Nexus mods) fall back to
+    system ``7z``, the same split :func:`extract_archive` uses.
+    """
+    try:
+        with py7zr.SevenZipFile(archive_path, "r") as szf:
+            target = _match_member_name(szf.getnames(), member)
+            if target is None:
+                return None
+            with tempfile.TemporaryDirectory() as td:
+                szf.extract(path=td, targets=[target])
+                extracted = [p for p in Path(td).rglob("*") if p.is_file()]
+                return extracted[0].read_bytes() if extracted else None
+    except (py7zr.exceptions.ArchiveError, py7zr.exceptions.PasswordRequired):
+        pass
+    return _read_7z_member_system(archive_path, member)
+
+
+def _match_member_name(names: list[str], member: str) -> str | None:
+    """The stored name for ``member``, matched ignoring case and slashes."""
+    wanted = member.replace("\\", "/").lower()
+    for name in names:
+        if name.replace("\\", "/").lower() == wanted:
+            return name
+    return None
+
+
+def _read_7z_member_system(archive_path: Path, member: str) -> bytes | None:
+    """Read one member through system 7z, which prints it to stdout."""
+    sz_bin = shutil.which("7z") or shutil.which("7zz")
+    if not sz_bin:
+        return None
+    result = subprocess.run(
+        [sz_bin, "e", "-so", "-y", str(archive_path), member],
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout if result.returncode == 0 else None
 
 
 def _fomod_marker_from_name(name: str) -> str | None:

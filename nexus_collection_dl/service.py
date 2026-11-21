@@ -48,6 +48,7 @@ from .extractor import (
     ExtractionError,
     FomodChoicesError,
     FomodInstallerError,
+    FomodUnreadableError,
     can_enumerate_members,
     extract_archive,
     find_fomod_installer,
@@ -152,12 +153,7 @@ def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
     raw = read_archive_member(archive_path, member)
     config = load_module_config_bytes(raw) if raw is not None else None
     if config is None:
-        raise ExtractionError(
-            f"found {member} in {archive_path.name} but could not read it, "
-            f"so its option groups are unknown. Extracting without them "
-            f"could install every option at once. The archive is kept at "
-            f"{archive_path}."
-        )
+        raise FomodUnreadableError(member, archive_path)
     return config
 
 
@@ -178,7 +174,14 @@ def _nxm_fomod_blocker(archive_path: Path) -> str | None:
         config = _fomod_config_for_archive(archive_path)
     except FomodInstallerError as e:
         return exception_reason(e)
+    except FomodUnreadableError as e:
+        # The installer was found, so this is a FOMOD mod whatever its
+        # bytes look like. Extracting it now is exactly the harm this
+        # exists to stop.
+        return exception_reason(e)
     except ExtractionError:
+        # Not inspectable at all: not proof of a FOMOD mod, and blocking
+        # every uninspectable download would stop plain mods too.
         return None
     if config is None:
         return None

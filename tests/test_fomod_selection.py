@@ -9,6 +9,7 @@ installs exactly what was chosen.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -298,3 +299,37 @@ def test_deploy_without_picks_falls_back_to_the_installer_defaults(tmp_path):
     # Nothing was picked and both options are Optional: neither installs.
     assert skipped.get("a/thing.esp") == "not in the FOMOD install plan"
     assert skipped.get("b/thing.esp") == "not in the FOMOD install plan"
+
+
+def test_add_with_picks_installs_a_7z_fomod(tmp_path, monkeypatch):
+    """End to end on the format real Nexus FOMODs ship in."""
+    import io
+
+    import py7zr
+
+    svc = _svc(tmp_path, monkeypatch)
+
+    def fake_download(self, game_domain, mods, target_dir, **kw):
+        out = []
+        for m in mods:
+            p = Path(target_dir) / m["filename"]
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with py7zr.SevenZipFile(p, "w") as szf:
+                szf.writef(io.BytesIO(CONFIG), "fomod/ModuleConfig.xml")
+                szf.writef(io.BytesIO(b"a"), "a/thing.esp")
+                szf.writef(io.BytesIO(b"b"), "b/thing.esp")
+            out.append((m, p))
+        return out
+
+    monkeypatch.setattr("nexus_collection_dl.service.Downloader.download_mods",
+                        fake_download)
+    result = svc.add_mod(
+        MOD_URL, tmp_path, no_load_order=True,
+        fomod_picks=[Pick("", "G", "OptB")],
+    )
+    assert result.success, result.error
+    assert (tmp_path / "b" / "thing.esp").read_bytes() == b"b"
+
+    state = _reload(tmp_path)
+    entry = next(iter(state.mods.values()))
+    assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptB"}]
