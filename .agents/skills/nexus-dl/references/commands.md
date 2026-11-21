@@ -446,6 +446,7 @@ Items of `StatusResult.mods`.
 | `success` | bool | False when the add did not complete |
 | `error` | str | Error text when `success` is false (empty otherwise) |
 | `pending_download` | PendingDownload or null | Set for free-account pending mods |
+| `warnings` | list of str | Non-fatal warnings (e.g. FOMOD option choices passed for a mod with no FOMOD installer) |
 
 ### ImportResult
 
@@ -456,6 +457,7 @@ Items of `StatusResult.mods`.
 | `still_pending` | int | Mods still awaiting a file |
 | `errors` | list of str | Per-file errors |
 | `load_order_files` | list of str | Load order files written |
+| `warnings` | list of str | Non-fatal warnings (e.g. FOMOD option choices passed for a mod with no FOMOD installer) |
 
 ### RemoveModResult
 

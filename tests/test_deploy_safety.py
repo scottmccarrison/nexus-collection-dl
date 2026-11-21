@@ -521,6 +521,71 @@ def test_service_rejects_staging_game_overlap(svc, tmp_path):
     assert any("inside the staging directory" in e for e in result.errors)
 
 
+# ---------------------------------------------------------------------------
+# Counts: files, not writes
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_counts_destinations_not_writes(env):
+    """Two entries writing one destination are one file and one conflict.
+
+    The count a deploy reports has to be what lands in the game dir, not
+    how many plan entries were executed: an overwritten entry is gone.
+    """
+    a = _src(env, "a/plugin.esp")
+    b = _src(env, "b/plugin.esp")
+    plan = DeploymentPlan(
+        data_files=[(a, Path("mod.esp")), (b, Path("mod.esp"))],
+    )
+    assert plan.total_files == 1
+
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    assert len(result.deployed) == 1
+    assert len(result.conflicts) == 1
+    assert len(env.ownership) == 1
+
+
+def test_undeploy_counts_mod_files_only(env):
+    """plugins.txt and the game INI are managed game config, not 'files'.
+
+    Both are removed with everything else, but counting them makes undeploy
+    disagree with the deploy that wrote them and with the file count in the
+    game directory.
+    """
+    from nexus_collection_dl.deploy import write_plugins_txt
+
+    mod = _src(env, "mod.esp")
+    plugins_src = _src(env, "plugins.txt", b"mod.esp\n")
+    _deploy(env, [(mod, Path("mod.esp"))])
+    write_plugins_txt(
+        plugins_src, env.game / "plugins.txt",
+        root=env.game, backups=env.backups, journal=env.journal,
+        ownership=env.ownership,
+    )
+    assert {r.get("kind", "mod") for r in env.ownership.values()} == {"mod", "plugins"}
+
+    kept, _problems, _notes, cleared = _undeploy(env)
+    assert cleared == 1
+    assert not kept
+    assert not env.ownership
+
+
+def test_service_deploy_and_undeploy_report_the_same_count(svc, tmp_path):
+    mods, _game, _prefix = _svc_env(tmp_path, {
+        "ModA/plugin.esp": b"a",
+        "ModB/other.esp": b"b",
+        "plugins.txt": b"plugin.esp\n",
+    })
+    result = svc.deploy(mods)
+    assert result.deployed_count == 2, result.errors
+
+    removed = svc.undeploy(mods)
+    assert removed == 2
+
+
 def test_service_rejects_staging_inside_game(svc, tmp_path):
     game = tmp_path / "game2"
     mods = game / "mods"

@@ -333,3 +333,57 @@ def test_add_with_picks_installs_a_7z_fomod(tmp_path, monkeypatch):
     state = _reload(tmp_path)
     entry = next(iter(state.mods.values()))
     assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptB"}]
+
+
+def test_add_with_picks_on_a_non_fomod_warns_instead_of_ignoring(tmp_path, monkeypatch):
+    """Picks for a mod with no installer must not vanish without a word.
+
+    The add still succeeds - there are no options to get wrong - but the
+    caller asked for specific options and did not get them.
+    """
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing(
+            {"TestMod-1.0.zip": {"SKSE/Plugins/thing.esp": b"x"}}
+        ),
+    )
+    result = svc.add_mod(
+        MOD_URL,
+        tmp_path,
+        no_load_order=True,
+        fomod_picks=[Pick("", "G", "OptB")],
+    )
+    assert result.success, result.error
+    assert result.warnings, "picks for a non-FOMOD mod must not vanish silently"
+    assert "no FOMOD installer" in result.warnings[0]
+    assert "not used" in result.warnings[0]
+
+    state = _reload(tmp_path)
+    entry = next(iter(state.mods.values()))
+    assert entry.fomod_picks == []
+
+
+def test_add_with_picks_and_no_extract_warns_instead_of_ignoring(tmp_path, monkeypatch):
+    from nexus_collection_dl import service as service_module
+
+    svc = _svc(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service_module.Downloader,
+        "download_mods",
+        _fake_download_writing({"TestMod-1.0.zip": _payload()}),
+    )
+    result = svc.add_mod(
+        MOD_URL,
+        tmp_path,
+        no_load_order=True,
+        no_extract=True,
+        fomod_picks=[Pick("", "G", "OptB")],
+    )
+    assert result.success, result.error
+    assert result.warnings
+    assert "unextracted" in result.warnings[0]
+    assert "not used" in result.warnings[0]

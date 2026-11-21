@@ -157,6 +157,24 @@ def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
     return config
 
 
+def _unused_picks_warning(name: str, no_extract: bool) -> str:
+    """The message for picks the caller asked for that nothing could apply.
+
+    Built away from the call sites so the text has one home: both the add
+    and the import path report the same two causes the same way.
+    """
+    if no_extract:
+        return (
+            f"{name} was kept unextracted, so the requested FOMOD option "
+            f"choices were not used. Extract it (or import it) to install "
+            f"specific options."
+        )
+    return (
+        f"{name} has no FOMOD installer, so the requested FOMOD option "
+        f"choices were not used."
+    )
+
+
 def _fomod_config_record(archive_path: Path) -> dict[str, str] | None:
     """The archive's FOMOD installer config as a storable record.
 
@@ -314,6 +332,7 @@ class ImportResult:
     still_pending: int
     errors: list[str]
     load_order_files: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -384,6 +403,7 @@ class AddResult:
     success: bool
     error: str = ""
     pending_download: PendingDownload | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1775,6 +1795,7 @@ class ModManagerService:
             # resolved. Picks recorded by a previous install are kept as
             # far as they still name real options.
             resolved_picks: list = []
+            fomod_seen = False
             if not no_extract:
                 previous = state.mods.get(selected_file_id)
                 stored_picks = previous.fomod_picks if previous is not None else None
@@ -1784,6 +1805,7 @@ class ModManagerService:
                     config = _fomod_config_for_archive(file_path)
                     if config is None:
                         continue
+                    fomod_seen = True
                     resolved_picks = _resolve_fomod_picks(
                         config,
                         file_path.name,
@@ -1791,6 +1813,12 @@ class ModManagerService:
                         stored_picks,
                         on_fomod_prompt,
                     )
+
+            # Picks the caller asked for that nothing could apply must not
+            # vanish: the add succeeds, but it says so.
+            add_warnings: list[str] = []
+            if fomod_picks and not fomod_seen:
+                add_warnings.append(_unused_picks_warning(mod_name, no_extract))
             config_record = None
             for _mod, file_path in results:
                 try:
@@ -1837,7 +1865,7 @@ class ModManagerService:
             progress("done", 1.0, f"Added {mod_name}")
             return AddResult(
                 mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                success=True,
+                success=True, warnings=add_warnings,
             )
 
     def add_local(self, name: str, mods_dir: Path, no_load_order: bool = False) -> int:
@@ -2482,6 +2510,7 @@ class ModManagerService:
         """
         progress = on_progress or _noop_progress
         errors: list[str] = []
+        import_warnings: list[str] = []
 
         with CollectionLock(mods_dir):
             state = CollectionState(mods_dir)
@@ -2604,17 +2633,20 @@ class ModManagerService:
                 is_arch = is_archive(match)
                 resolved_picks: list = []
                 config_record = None
+                scoped = None
+                fomod_seen = False
                 try:
+                    from .fomod_select import picks_for_file
+
+                    scoped = (
+                        picks_for_file(fomod_picks, match.name)
+                        if fomod_picks
+                        else None
+                    )
                     if not no_extract and is_arch:
                         config = _fomod_config_for_archive(match)
                         if config is not None:
-                            from .fomod_select import picks_for_file
-
-                            scoped = (
-                                picks_for_file(fomod_picks, match.name)
-                                if fomod_picks
-                                else None
-                            )
+                            fomod_seen = True
                             resolved_picks = _resolve_fomod_picks(
                                 config,
                                 match.name,
@@ -2642,6 +2674,13 @@ class ModManagerService:
                     # partially moved content cannot be rolled back.
                     errors.append(f"Extraction error for {mod_state.name}: {exception_reason(e)}")
                     continue
+
+                # Picks the caller asked for that nothing could apply must
+                # not vanish: the import succeeds, but it says so.
+                if scoped and not fomod_seen:
+                    import_warnings.append(
+                        _unused_picks_warning(mod_state.name, no_extract)
+                    )
 
                 mod_state.download_status = "downloaded"
                 mod_state.browser_url = ""
@@ -2700,6 +2739,7 @@ class ModManagerService:
                 still_pending=still_pending,
                 errors=errors,
                 load_order_files=load_order_files,
+                warnings=import_warnings,
             )
 
     def add_nxm(
@@ -3982,6 +4022,18 @@ def _health_handler(probes: HealthProbes) -> list[HealthCheck]:
                 "not installed",
                 "Install with 'nexus-dl handler install' to handle "
                 "nxm:// clicks.",
+            )
+        ]
+    if not info.get("executable_exists"):
+        exe = info.get("executable")
+        where = f" at {exe}" if exe else ""
+        return [
+            HealthCheck(
+                "nxm handler",
+                "WARN",
+                f"installed but its executable is missing{where}",
+                "Re-run 'nexus-dl handler install' to point the desktop "
+                "entry at a working nexus-dl.",
             )
         ]
     if info.get("is_default"):

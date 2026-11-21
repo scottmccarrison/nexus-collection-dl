@@ -1368,6 +1368,7 @@ def fake_health_probes(**overrides):
         "api_key_source": lambda: ("stored", None),
         "handler_status": lambda: {
             "entry_installed": True,
+            "executable_exists": True,
             "is_default": True,
             "current_default": "nexus-dl-nxm.desktop",
             "xdg_mime_available": True,

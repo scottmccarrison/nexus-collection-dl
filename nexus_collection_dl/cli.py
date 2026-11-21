@@ -539,17 +539,35 @@ def deploy(
             from .manifest import CollectionManifest
             manifest = CollectionManifest.from_dict(state.manifest_data)
             manifest_choices = manifest.mod_choices
-        plan = classify_files(mods_dir, state.game_domain, mod_choices=manifest_choices)
+        # The same picks and recorded configs the real deploy uses: a dry
+        # run has to describe that deployment, not a different one.
+        fomod_picks = {
+            mod.file_id: mod.fomod_picks
+            for mod in state.mods.values()
+            if mod.fomod_picks
+        }
+        fomod_configs = {
+            mod.file_id: {**mod.fomod_config, "mod_id": mod.mod_id}
+            for mod in state.mods.values()
+            if mod.fomod_config
+        }
+        plan = classify_files(
+            mods_dir,
+            state.game_domain,
+            mod_choices=manifest_choices,
+            fomod_picks=fomod_picks,
+            fomod_configs=fomod_configs,
+        )
         if _emit_result(ctx, {
             "dry_run": True,
-            "game_root_files": len(plan.game_root_files),
-            "data_files": len(plan.data_files),
+            "game_root_files": plan.root_destinations,
+            "data_files": plan.data_destinations,
             "skipped": len(plan.skipped),
             "total_files": plan.total_files,
         }):
             return
-        console.print(f"  Game root files: {len(plan.game_root_files)}")
-        console.print(f"  Data files: {len(plan.data_files)}")
+        console.print(f"  Game root files: {plan.root_destinations}")
+        console.print(f"  Data files: {plan.data_destinations}")
         console.print(f"  Skipped: {len(plan.skipped)}")
         console.print(f"\n[yellow]Would deploy {plan.total_files} files (dry run).[/yellow]")
         return
@@ -779,6 +797,10 @@ def add(
     if _emit_result(ctx, result):
         return
 
+    if result.warnings:
+        for w in result.warnings:
+            console.print(f"  [yellow]Warning:[/yellow] {w}")
+
     if result.pending_download:
         p = result.pending_download
         console.print("[yellow]Free account - download manually:[/yellow]")
@@ -871,6 +893,10 @@ def import_cmd(
 
     if _emit_result(ctx, result):
         return
+
+    if result.warnings:
+        for w in result.warnings:
+            console.print(f"  [yellow]Warning:[/yellow] {w}")
 
     if result.errors:
         for err in result.errors:

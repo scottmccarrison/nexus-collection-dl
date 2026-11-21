@@ -194,8 +194,25 @@ class DeploymentPlan:
     skipped: list[tuple[Path, str]] = field(default_factory=list)
 
     @property
+    def root_destinations(self) -> int:
+        """Distinct game-root destinations this plan writes."""
+        return len({str(d) for _s, d in self.game_root_files})
+
+    @property
+    def data_destinations(self) -> int:
+        """Distinct Data/ destinations this plan writes."""
+        return len({str(d) for _s, d in self.data_files})
+
+    @property
     def total_files(self) -> int:
-        return len(self.game_root_files) + len(self.data_files)
+        """Destinations this plan writes, not entries.
+
+        Two entries can name one destination (the later one wins and the
+        overwrite is reported as a conflict); that is one file in the game
+        dir, so it counts once. Root and data destinations are counted
+        separately because they land in different directories.
+        """
+        return self.root_destinations + self.data_destinations
 
 
 @dataclass
@@ -1747,6 +1764,11 @@ def undeploy_records(
     messages about cleared entries. Backups of successfully restored
     originals are dropped only when no remaining record references them; on
     any failure all backups are retained.
+
+    ``cleared_count`` counts mod files only. ``plugins.txt`` and the game
+    INI are cleared like everything else, but a deploy never counted them
+    as deployed files either, and counting them here is what made undeploy
+    report a different number from the deploy it undoes.
     """
     kept: list[dict] = []
     problems: list[str] = []
@@ -1760,7 +1782,8 @@ def undeploy_records(
         status, msg = undeploy_record(rec, roots, backups)
         if status in ("removed", "restored", "gone"):
             ownership.pop(dest_str, None)
-            cleared += 1
+            if rec.get("kind", "mod") == "mod":
+                cleared += 1
             backup_name = rec.get("backup")
             if status == "restored" and backup_name and not any(
                 r.get("backup") == backup_name for r in ownership.values()
@@ -1855,6 +1878,13 @@ def deploy(
             )
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+
+    # One entry per destination: the write that won is the file that is
+    # there. The overwrites themselves are already in `conflicts`.
+    by_dest: dict[str, DeployedFile] = {}
+    for deployed in result.deployed:
+        by_dest[deployed.dest] = deployed
+    result.deployed = list(by_dest.values())
 
     return result
 
