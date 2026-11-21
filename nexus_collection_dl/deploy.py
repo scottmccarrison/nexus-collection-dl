@@ -233,6 +233,7 @@ class DeployResult:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _is_bg3_game(game_domain: str) -> bool:
@@ -416,16 +417,16 @@ def _fomod_plans(
             return str(mod_names[file_id])
         return where
 
-    def _pick_labels(stored: list[dict]) -> list[str]:
-        return [f"{d.get('group', '')}:{d.get('option', '')}" for d in stored]
-
     def picks_to_selections_safe(
         config: "ModuleConfig", stored: list[dict]
-    ) -> tuple[dict, list[str]]:
+    ) -> tuple[dict, list[str], str]:
         """This mod's picks, keeping whatever still matches.
 
         A pick that no longer names a real option is reported, never
-        allowed to erase the picks that still do.
+        allowed to erase the picks that still do. The third value is the
+        matcher's own refusal reason when the picks could not be read at
+        all (an ambiguous name, say): that is not "the option vanished"
+        and must not read as if it were.
         """
         try:
             matched, unmatched = picks_to_selections(
@@ -439,9 +440,13 @@ def _fomod_plans(
                 ],
                 config,
             )
-        except PickError:
-            return {}, _pick_labels(stored)
-        return dict(matched), [f"{p.group}:{p.option}" for p in unmatched]
+        except PickError as e:
+            return {}, [], exception_reason(e)
+        return (
+            dict(matched),
+            [f"{p.step}:{p.group}:{p.option}" for p in unmatched],
+            "",
+        )
 
     def selections_for(
         config: "ModuleConfig", file_id: int | None, mod_id: int | None, where: str
@@ -451,7 +456,13 @@ def _fomod_plans(
         stale_note = ""
         if file_id is not None and fomod_picks and file_id in fomod_picks:
             stored = fomod_picks[file_id]
-            sel, stale = picks_to_selections_safe(config, stored)
+            sel, stale, refusal = picks_to_selections_safe(config, stored)
+            if refusal:
+                warnings.append(
+                    f"{label}: the stored FOMOD options could not be read "
+                    f"({refusal}); installing the installer's own defaults"
+                )
+                return {}
             if stale:
                 warnings.append(
                     f"{label}: stored FOMOD options that are not in this "
@@ -489,7 +500,7 @@ def _fomod_plans(
         for file_id, stored in (fomod_picks or {}).items():
             if fomod_configs and file_id in fomod_configs:
                 continue
-            sel, _stale = picks_to_selections_safe(config, stored)
+            sel, _stale, _refusal = picks_to_selections_safe(config, stored)
             if sel:
                 warnings.append(
                     f"{where}: FOMOD options were matched by name from other "
@@ -1923,7 +1934,7 @@ def deploy(
             "non-dry-run deployments"
         )
 
-    result = DeployResult()
+    result = DeployResult(warnings=list(plan.warnings))
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
 

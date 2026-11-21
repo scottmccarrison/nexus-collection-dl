@@ -517,3 +517,131 @@ def test_an_indeterminate_plan_falls_back_with_a_warning(tmp_path):
         fomod_picks={11: [{"step": "One", "group": "G", "option": "OptA"}]},
     )
     assert any("game state" in w for w in plan.warnings)
+
+
+# ── the remaining warning contract: labels, refusals, parity ────────────
+
+
+AMBIGUOUS_CONFIG = b"""<config>
+  <moduleName>Test</moduleName>
+  <installSteps>
+    <installStep name="Step1">
+      <optionalFileGroups>
+        <group name="G" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="OptA">
+              <files><file source="a/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <installStep name="Step2">
+      <optionalFileGroups>
+        <group name="G" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="OptB">
+              <files><file source="b/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>"""
+
+
+def test_stale_pick_warnings_carry_the_full_step_group_option_name(tmp_path):
+    """Picks are recorded as step:group:option; warnings echo that form."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: [{"step": "Step1", "group": "G", "option": "Gone"}]},
+        fomod_configs={11: _record()},
+    )
+    assert any("Step1:G:Gone" in w for w in plan.warnings), plan.warnings
+
+
+def test_a_refused_pick_says_the_picks_could_not_be_read(tmp_path):
+    """PickError is not "the option vanished" and must not read as if it were.
+
+    A pick whose group name is ambiguous is refused outright; nothing is
+    guessed, the installer's defaults install, and the warning carries the
+    matcher's own reason (through exception_reason) rather than a claim
+    that the options left the installer.
+    """
+    mods = tmp_path / "mods"
+    (mods / "fomod").mkdir(parents=True)
+    (mods / "fomod" / "ModuleConfig.xml").write_bytes(AMBIGUOUS_CONFIG)
+    (mods / "a").mkdir()
+    (mods / "a" / "thing.esp").write_text("a")
+    (mods / "b").mkdir()
+    (mods / "b" / "thing.esp").write_text("b")
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: [{"step": "", "group": "G", "option": "OptA"}]},
+        fomod_configs={11: _record(xml=AMBIGUOUS_CONFIG)},
+    )
+    assert not plan.data_files
+    text = " ".join(plan.warnings)
+    assert "could not be read" in text, plan.warnings
+    assert "more than one step" in text, plan.warnings
+
+
+def test_dry_run_and_json_carry_the_same_warnings_as_deploy(tmp_path):
+    """The parity rule: a dry run describes this deployment, warnings too."""
+    from nexus_collection_dl.deploy import deploy as run_deploy
+    from nexus_collection_dl.jsonout import to_jsonable
+    from nexus_collection_dl.service import ModManagerService
+    from nexus_collection_dl.state import CollectionState
+
+    mods = _tree_with_config(tmp_path)
+    game = tmp_path / "game"
+    game.mkdir()
+    prefix = tmp_path / "pfx"
+    prefix.mkdir()
+
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "TestMod",
+            "file_id": 11,
+            "filename": "m.zip",
+            "version": "1",
+            "optional": False,
+            "manual": True,
+        }
+    )
+    state.mods[11].fomod_picks = [{"step": "Step1", "group": "G", "option": "Gone"}]
+    state.mods[11].fomod_config = {
+        "member": "fomod/ModuleConfig.xml",
+        "xml": CONFIG.decode("utf-8"),
+    }
+    state.game_dir = str(game)
+    state.proton_prefix = str(prefix)
+    state.save()
+
+    svc = ModManagerService(api_key="test-key-unused")
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
+    assert result.errors == []
+    assert "Gone" in " ".join(result.warnings), result.warnings
+
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: state.mods[11].fomod_picks},
+        fomod_configs={11: {**state.mods[11].fomod_config, "mod_id": 1}},
+        mod_names={11: "TestMod"},
+    )
+    dry = run_deploy(plan, game, dry_run=True)
+    assert dry.warnings == plan.warnings
+    assert set(plan.warnings) <= set(result.warnings)
+
+    envelope = to_jsonable(result)
+    assert envelope["warnings"] == result.warnings
