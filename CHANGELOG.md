@@ -183,10 +183,14 @@ deliberately not in this release.
   symlink members are refused rather than recreated, and the staging tree is
   walked after extraction and before anything is merged, which covers the
   system `7z`/`unar`/`unrar` fallbacks as well. An archive that plants a
-  `.nexus-*` name at the collection root (a forged `.nexus-journal.jsonl`
-  beside the real one, say, which recovery would otherwise honour) is refused
-  with a clear error instead of merged beside the real state. The `py7zr`
-  floor moves past CVE-2022-44900.
+  `.nexus-*` name at any depth (a forged `.nexus-journal.jsonl` beside the
+  real one, say, which recovery would otherwise honour) is refused with a
+  clear error instead of merged beside the real state, and an extraction
+  that writes anywhere beside its staging area is removed and refused. The
+  `py7zr` floor moves past CVE-2022-44900. **What this does not cover:**
+  the rare fallbacks to the system `7z`/`unar`/`unrar` tools (compression
+  py7zr cannot decode, RAR5 without a Python backend) rely on those tools'
+  own path handling for member names this tool cannot see before they run.
 
 ### Fixed
 
@@ -250,7 +254,8 @@ deliberately not in this release.
   load order.
 - Queued for 0.4.1: the full installer XML lives in the state file (a few KB
   to about 60KB per FOMOD mod, rewritten on each save); installer configs have
-  no size cap before parsing; error-text scrubbing has no diagnostic escape for
+  no size cap before parsing and archive extraction has no decompression size
+  cap; name pre-validation for the system-tool extraction fallbacks; error-text scrubbing has no diagnostic escape for
   a maintainer reading a bug report; the removed `serve` command reports
   "command not found" rather than a deprecation stub; the staging/game-dir
   overlap guard compares path strings rather than resolved paths; the legacy
