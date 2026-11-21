@@ -1496,27 +1496,43 @@ def nxm(
     filename = redacted(result.filename)
 
     if not result.success:
-        reason = "re_click_required" if result.re_click_required else "rejected"
-        _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
-        # A failed extraction can still leave a recoverable pending entry;
-        # say so rather than reporting a flat failure the user cannot act on.
-        event_outcome = (
-            result.download_status
-            if result.download_status in ("pending_download", "pending_choices")
-            else "error"
-        )
+        # A pending entry is not a failure: the download landed and the
+        # tool did the designed thing (kept the archive, never extracted
+        # a FOMOD blind). Report what is pending and how to finish it;
+        # only a flat failure gets the failure headline.
+        pending = result.download_status in ("pending_download", "pending_choices")
+        if pending:
+            reason = result.download_status
+            _log_nxm("warn", f"{_nxm_ids(result)}reason={reason}")
+        else:
+            reason = "re_click_required" if result.re_click_required else "rejected"
+            _log_nxm("error", f"{_nxm_ids(result)}reason={reason}")
+        event_outcome = result.download_status if pending else "error"
         _record_nxm_event(
             result.collection_dir, _nxm_event_payload(result, event_outcome)
         )
         if result.error:
-            console.print(f"[red]Error:[/red] {escape(error_text)}")
+            if pending:
+                console.print(f"[yellow]Waiting:[/yellow] {escape(error_text)}")
+            else:
+                console.print(f"[red]Error:[/red] {escape(error_text)}")
         if result.re_click_required:
             console.print(
                 "[yellow]Click 'Mod manager download' on the Nexus website "
                 "again, then retry.[/yellow]"
             )
         if want_notify:
-            handler_notify("nexus-dl: download failed", _notify_body(error_text))
+            if pending:
+                what = (
+                    "is waiting for option choices"
+                    if result.download_status == "pending_choices"
+                    else "is waiting for its download to finish"
+                )
+                handler_notify(f"{mod_name or 'A mod'} {what}",
+                               _notify_body(error_text))
+            else:
+                handler_notify("nexus-dl: download failed",
+                               _notify_body(error_text))
         sys.exit(1)
 
     if result.status == "already_downloaded":

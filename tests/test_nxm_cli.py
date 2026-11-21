@@ -1290,3 +1290,65 @@ def test_nxm_typed_error_redacts_short_scoped_secret(cli_env):
     content = nxm_log_file(cli_env).read_text()
     assert "reason=api" in content
     assert short_key not in content and encoded not in content
+
+
+def test_pending_outcomes_are_reported_as_actionable_not_failed(
+    cli_env, tmp_path
+):
+    """A click kept for its choices is not a download failure.
+
+    The download succeeded and the tool did the designed thing (keep the
+    archive, never extract a FOMOD blind). The notification and the log
+    must say what is pending and how to finish it; 'download failed' and
+    'rejected' are the bug this pins.
+    """
+    FakeService.result = NxmResult(
+        success=False,
+        status="pending",
+        game_domain=GAME,
+        mod_id=1988,
+        file_id=469854,
+        mod_name="XPMSSE",
+        filename="xpmsse.7z",
+        download_status="pending_choices",
+        error=(
+            "xpmsse.7z is a FOMOD mod and needs option choices before it "
+            "can be extracted. Run 'nexus-dl import /mods --fomod-option "
+            "'Group:Option''."
+        ),
+    )
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["--api-key", "k", "nxm", f"nxm://{GAME}/mods/1988/files/469854"],
+    )
+    assert result.exit_code == 1
+    summary, body = cli_env["notifications"][0]
+    assert summary != "nexus-dl: download failed"
+    assert "option choices" in summary.lower()
+    assert "nexus-dl import" in body
+    log = (tmp_path / "xdg-state" / "nexus-dl" / "nxm.log").read_text()
+    assert "reason=pending_choices" in log
+    assert "error mod=1988" not in log
+
+
+def test_pending_download_is_reported_as_pending_not_failed(cli_env, tmp_path):
+    FakeService.result = NxmResult(
+        success=False,
+        status="pending",
+        game_domain=GAME,
+        mod_id=7,
+        file_id=8,
+        mod_name="Some Mod",
+        download_status="pending_download",
+        error="Download queued; finish it later.",
+    )
+    CliRunner().invoke(
+        cli_module.main,
+        ["--api-key", "k", "nxm", f"nxm://{GAME}/mods/7/files/8"],
+    )
+    summary, _body = cli_env["notifications"][0]
+    assert summary != "nexus-dl: download failed"
+    assert "waiting" in summary.lower()
+    log = (tmp_path / "xdg-state" / "nexus-dl" / "nxm.log").read_text()
+    assert "reason=pending_download" in log
+    assert "error mod=7" not in log

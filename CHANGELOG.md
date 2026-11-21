@@ -87,13 +87,15 @@ deliberately not in this release.
   distinguishable from a flat failure. Append is `O_APPEND`; rotation is
   best-effort under the collection lock; a broken event file never fails a
   download.
-- The interactive shell drains click events at each prompt boundary and reports
-  them in one block. Three clicks on one collection produce one report and one
-  `Deploy '<name>' now? [yes/no]: ` prompt, not three. Only `downloaded` and
-  `extracted_from_archive` events trigger the deploy prompt. Pre-existing
-  events are not replayed; only collections under the shell's root are visible.
-  Live-while-idle polling (events arriving while the user sits at the prompt)
-  is not included; the drain fires at prompt boundaries only.
+- The interactive shell drains click events live while you sit at the prompt
+  and at each prompt boundary, and reports them in one block. A browser click
+  landing while the shell is idle shows up without anyone pressing a key: the
+  idle wait ticks every couple of seconds, notices the event, and starts the
+  flow (FOMOD choices, deploy prompt) right there. Three clicks on one
+  collection produce one report and one `Deploy '<name>' now? [yes/no]: `
+  prompt, not three. Only `downloaded` and `extracted_from_archive` events
+  trigger the deploy prompt. Pre-existing events are not replayed; only
+  collections under the shell's root are visible.
 - `/deploy [<index|name>]` in the interactive shell, resolving a collection
   exactly like `/use` (or the current selection). The shared deploy flow shows
   dry-run counts, asks for confirmation, then deploys and renders the result:
@@ -194,6 +196,14 @@ deliberately not in this release.
 
 ### Fixed
 
+- A click kept for its option choices is no longer reported as a download
+  failure. When a FOMOD mod lands as `pending_choices` (the archive is kept,
+  nothing extracted), the notification said "download failed" and the log said
+  `error`/`rejected`, even though the download succeeded and the tool did the
+  designed thing. Now the notification says the mod is waiting for option
+  choices (or for its download to finish, for `pending_download`) and names
+  the command to finish it, and the log records `warn` with the pending
+  reason instead of `error`.
 - Deploy keeps the stored FOMOD options that still match instead of dropping
   all of them when one is stale. One renamed option after a mod update used to
   erase every pick, install the installer's defaults (nothing at all for an
