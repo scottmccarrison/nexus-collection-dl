@@ -521,6 +521,71 @@ def test_service_rejects_staging_game_overlap(svc, tmp_path):
     assert any("inside the staging directory" in e for e in result.errors)
 
 
+# ---------------------------------------------------------------------------
+# Counts: files, not writes
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_counts_destinations_not_writes(env):
+    """Two entries writing one destination are one file and one conflict.
+
+    The count a deploy reports has to be what lands in the game dir, not
+    how many plan entries were executed: an overwritten entry is gone.
+    """
+    a = _src(env, "a/plugin.esp")
+    b = _src(env, "b/plugin.esp")
+    plan = DeploymentPlan(
+        data_files=[(a, Path("mod.esp")), (b, Path("mod.esp"))],
+    )
+    assert plan.total_files == 1
+
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    assert len(result.deployed) == 1
+    assert len(result.conflicts) == 1
+    assert len(env.ownership) == 1
+
+
+def test_undeploy_counts_mod_files_only(env):
+    """plugins.txt and the game INI are managed game config, not 'files'.
+
+    Both are removed with everything else, but counting them makes undeploy
+    disagree with the deploy that wrote them and with the file count in the
+    game directory.
+    """
+    from nexus_collection_dl.deploy import write_plugins_txt
+
+    mod = _src(env, "mod.esp")
+    plugins_src = _src(env, "plugins.txt", b"mod.esp\n")
+    _deploy(env, [(mod, Path("mod.esp"))])
+    write_plugins_txt(
+        plugins_src, env.game / "plugins.txt",
+        root=env.game, backups=env.backups, journal=env.journal,
+        ownership=env.ownership,
+    )
+    assert {r.get("kind", "mod") for r in env.ownership.values()} == {"mod", "plugins"}
+
+    kept, _problems, _notes, cleared = _undeploy(env)
+    assert cleared == 1
+    assert not kept
+    assert not env.ownership
+
+
+def test_service_deploy_and_undeploy_report_the_same_count(svc, tmp_path):
+    mods, _game, _prefix = _svc_env(tmp_path, {
+        "ModA/plugin.esp": b"a",
+        "ModB/other.esp": b"b",
+        "plugins.txt": b"plugin.esp\n",
+    })
+    result = svc.deploy(mods)
+    assert result.deployed_count == 2, result.errors
+
+    removed = svc.undeploy(mods)
+    assert removed == 2
+
+
 def test_service_rejects_staging_inside_game(svc, tmp_path):
     game = tmp_path / "game2"
     mods = game / "mods"
@@ -1325,3 +1390,50 @@ def test_symlink_over_original_symlink_replaced_by_regular_file_refused(env: Env
     assert len(result.errors) == 1 and "changed outside" in result.errors[0]
     assert dest.read_bytes() == b"mod content"
     assert not dest.is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# What deploy refuses to write, and what it says when two mods collide
+# ---------------------------------------------------------------------------
+
+
+def test_packaging_cruft_is_not_deployed(tmp_path):
+    """Vortex metadata, VCS files and licence text are not game content.
+
+    They ride along in real archives when a mod author packs their whole
+    working folder, and they belong with the mod's docs, not in the game
+    directory.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    for name in ("meta.ini", ".gitignore", "LICENSE", "License.txt", "mod.esp"):
+        (tmp_path / name).write_text("x")
+
+    plan = classify_files(tmp_path, "skyrimspecialedition")
+    deployed = {src.name for src, _dest in plan.game_root_files + plan.data_files}
+    assert deployed == {"mod.esp"}, [
+        (rel.as_posix(), why) for rel, why in plan.skipped
+    ]
+
+
+def test_conflict_messages_name_the_source_paths(env):
+    """Two mods shipping one destination: the message has to say which files.
+
+    The basenames are identical in the case that matters (two mods both
+    shipping ``x.nif`` to the same path), so naming them alone says
+    nothing at all. The numbered wrappers are the real collision shape:
+    they strip away, and the two options land on one destination.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    _src(env, "01 TBBP/meshes/actors/x.nif")
+    _src(env, "02 HDT/meshes/actors/x.nif")
+
+    plan = classify_files(env.staging, "skyrimspecialedition")
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "01 TBBP/meshes/actors/x.nif" in msg, msg
+    assert "02 HDT/meshes/actors/x.nif" in msg, msg

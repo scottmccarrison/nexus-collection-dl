@@ -70,6 +70,7 @@ def fake_probes(**overrides):
         "api_key_source": lambda: (None, None),
         "handler_status": lambda: {
             "entry_installed": True,
+            "executable_exists": True,
             "is_default": True,
             "current_default": "nexus-dl-nxm.desktop",
             "xdg_mime_available": True,
@@ -207,20 +208,31 @@ def test_api_key_probe_discards_the_value(monkeypatch):
 @pytest.mark.parametrize(
     "info, status, detail_part",
     [
-        ({"entry_installed": False, "is_default": False,
+        ({"entry_installed": False, "executable_exists": False,
+          "is_default": False,
           "current_default": None, "xdg_mime_available": True},
          "WARN", "not installed"),
-        ({"entry_installed": True, "is_default": True,
+        ({"entry_installed": True, "executable_exists": True,
+          "is_default": True,
           "current_default": "nexus-dl-nxm.desktop",
           "xdg_mime_available": True},
          "OK", "installed and the default nxm:// handler"),
-        ({"entry_installed": True, "is_default": False,
+        ({"entry_installed": True, "executable_exists": False,
+          "executable": "/gone/bin/nexus-dl",
+          "is_default": True,
+          "current_default": "nexus-dl-nxm.desktop",
+          "xdg_mime_available": True},
+         "WARN", "executable is missing"),
+        ({"entry_installed": True, "executable_exists": True,
+          "is_default": False,
           "current_default": "other.desktop", "xdg_mime_available": True},
          "WARN", "not the default"),
-        ({"entry_installed": True, "is_default": False,
+        ({"entry_installed": True, "executable_exists": True,
+          "is_default": False,
           "current_default": None, "xdg_mime_available": True},
          "WARN", "no default nxm:// handler is registered"),
-        ({"entry_installed": True, "is_default": False,
+        ({"entry_installed": True, "executable_exists": True,
+          "is_default": False,
           "current_default": None, "xdg_mime_available": False},
          "OK", "xdg-mime not available"),
     ],
@@ -234,11 +246,26 @@ def test_handler_health_lines(info, status, detail_part):
 
 def test_handler_warn_lines_carry_a_remedy():
     checks = run_checks(probes=fake_probes(handler_status=lambda: {
-        "entry_installed": False, "is_default": False,
+        "entry_installed": False, "executable_exists": False,
+        "is_default": False,
         "current_default": None, "xdg_mime_available": True,
     }))
     (line,) = by_label(checks, "nxm handler")
     assert "nexus-dl handler install" in line.remedy
+
+
+def test_dead_handler_executable_names_the_path():
+    """A handler whose entry points at a dead binary is not 'OK'."""
+    checks = run_checks(probes=fake_probes(handler_status=lambda: {
+        "entry_installed": True, "executable_exists": False,
+        "executable": "/home/scott/.venvs/dead/bin/nexus-dl",
+        "is_default": True,
+        "current_default": "nexus-dl-nxm.desktop",
+        "xdg_mime_available": True,
+    }))
+    (line,) = by_label(checks, "nxm handler")
+    assert line.status == "WARN"
+    assert "/home/scott/.venvs/dead/bin/nexus-dl" in line.detail
 
 
 # ---------------------------------------------------------------------------

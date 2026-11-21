@@ -7,7 +7,7 @@ fields; the "Result object fields" section at the bottom documents each one.
 ## Invocation
 
 ```
-nexus-dl [--api-key KEY] [--json] <command> [args] [flags]
+nexus-dl [--api-key KEY] [--json] [--version] <command> [args] [flags]
 ```
 
 Global options (before the subcommand):
@@ -16,6 +16,7 @@ Global options (before the subcommand):
 |---|---|
 | `--api-key KEY` | Nexus Mods API key for this run. Resolution order is `--api-key`, then the `NEXUS_API_KEY` environment variable, then the stored key (`nexus-dl handler set-api-key`). |
 | `--json` | Emit the machine-readable envelope on stdout and nothing else. Human diagnostics move to stderr. Must come **before** the subcommand. |
+| `--version` | Print `nexus-dl v<version>` and exit 0. Answers without a subcommand, like `--help`, and is plain text: `--json` does not wrap it. The same version is in the `health` envelope. |
 
 **JSON mode is not available** for `shell`, `nxm`, or `handler`.
 Passing `--json` to them (or to any command in the wrong position) is a usage
@@ -446,6 +447,7 @@ Items of `StatusResult.mods`.
 | `success` | bool | False when the add did not complete |
 | `error` | str | Error text when `success` is false (empty otherwise) |
 | `pending_download` | PendingDownload or null | Set for free-account pending mods |
+| `warnings` | list of str | Non-fatal warnings (e.g. FOMOD option choices passed for a mod with no FOMOD installer) |
 
 ### ImportResult
 
@@ -456,6 +458,7 @@ Items of `StatusResult.mods`.
 | `still_pending` | int | Mods still awaiting a file |
 | `errors` | list of str | Per-file errors |
 | `load_order_files` | list of str | Load order files written |
+| `warnings` | list of str | Non-fatal warnings (e.g. FOMOD option choices passed for a mod with no FOMOD installer) |
 
 ### RemoveModResult
 

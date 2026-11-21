@@ -105,6 +105,35 @@ def test_click_refuses_a_script_based_installer(svc, tmp_path, monkeypatch):
     assert (cdir / "TestMod-1.0.zip").exists()
 
 
+def make_unreadable_fomod_zip() -> bytes:
+    """A positively identified FOMOD whose installer will not parse."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("fomod/ModuleConfig.xml", b"not xml at all")
+        zf.writestr("a/thing.esp", b"a")
+    return buf.getvalue()
+
+
+def test_click_does_not_extract_a_fomod_whose_config_cannot_be_read(
+    svc, tmp_path, monkeypatch
+):
+    """'Could not read it' is not 'not a FOMOD'.
+
+    The marker was found, so this archive is a FOMOD mod and extracting
+    it would install every option at once. It must refuse like the
+    choices case, not fall through to extraction the way an uninspectable
+    archive does.
+    """
+    cdir = _ready(svc, tmp_path, monkeypatch, make_unreadable_fomod_zip())
+
+    result = svc.add_nxm(uri(), mods_dir=cdir)
+
+    assert result.success is False
+    assert "could not read" in result.error
+    assert not (cdir / "a").exists()
+    assert (cdir / "TestMod-1.0.zip").exists()
+
+
 def test_click_still_extracts_a_plain_archive(svc, tmp_path, monkeypatch):
     cdir = _ready(svc, tmp_path, monkeypatch, make_zip())
 

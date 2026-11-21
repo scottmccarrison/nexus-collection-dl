@@ -16,7 +16,7 @@ installer's test data. The cases worth naming:
 
 from pathlib import Path
 
-from nexus_collection_dl.deploy import classify_files
+from nexus_collection_dl.deploy import _fomod_plans, _plan_lookup, classify_files
 from nexus_collection_dl.fomod_plan import (
     AllOf,
     AnyOf,
@@ -24,6 +24,9 @@ from nexus_collection_dl.fomod_plan import (
     FlagDependency,
     GameDependency,
     GameState,
+    InstallEntry,
+    InstallPlan,
+    iter_manifest_choices,
     load_module_config,
     plan_source_root,
     resolve_install_plan,
@@ -355,41 +358,111 @@ def test_lookup_prefers_the_higher_priority_entry():
 # ── Manifest conversion ─────────────────────────────────────────────────
 
 
-def test_manifest_choices_resolve_by_name_with_id_tiebreak():
+def test_manifest_choices_resolve_by_name_with_group_tiebreak():
     cfg = config("compliance")
-    # 'Plugin1' exists in five groups; the ids disambiguate. Both 1-based
-    # and 0-based conventions must resolve to the same group.
-    choices = {
-        "steps": [
-            {
-                "stepId": 1,
-                "selectedOptions": [
-                    {"groupId": 3, "optionId": 1, "optionName": "Plugin1"},
-                ],
-            }
-        ]
-    }
-    picked = selections_from_manifest(choices, cfg)
-    assert picked == {("Step1", "Group3"): ("Plugin1",)}
+    # 'Plugin1' exists in five groups; the manifest's group name
+    # disambiguates. The step name may be empty in real data, and the
+    # group name must still find the right one.
+    for step_name in ("Step1", ""):
+        choices = {
+            "type": "fomod",
+            "options": [
+                {
+                    "name": step_name,
+                    "groups": [
+                        {"name": "Group3", "choices": [{"name": "Plugin1", "idx": 1}]},
+                    ],
+                }
+            ],
+        }
+        picked = selections_from_manifest(choices, cfg)
+        assert picked == {("Step1", "Group3"): ("Plugin1",)}, step_name
 
-    # A name that is unique resolves without any id.
+    # A name that is unique resolves with no group context at all.
     cfg = config("spid")
     choices = {
-        "steps": [
+        "type": "fomod",
+        "options": [
             {
-                "stepId": 1,
-                "selectedOptions": [
+                "name": "Main",
+                "groups": [
                     {
-                        "groupId": 1,
-                        "optionId": 1,
-                        "optionName": 'SSE v1.5.97 ("Special Edition")',
+                        "name": "DLL",
+                        "choices": [
+                            {"name": 'SSE v1.5.97 ("Special Edition")', "idx": 2}
+                        ],
                     }
                 ],
             }
-        ]
+        ],
     }
     picked = selections_from_manifest(choices, cfg)
     assert picked == {("Main", "DLL"): ('SSE v1.5.97 ("Special Edition")',)}
+
+
+def test_selections_from_manifest_reads_the_real_nexus_shape():
+    """A live collection's stored picks, verbatim (mod 39732).
+
+    The step name is empty, which real manifests carry: Frozen in Time's
+    own config is ``<installStep name="">`` with one group.
+    """
+    cfg = config("frozen-in-time")
+    choices = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "",
+                "groups": [
+                    {
+                        "name": "Body Textures",
+                        "choices": [{"name": "CBBE", "idx": 1}],
+                    }
+                ],
+            }
+        ],
+    }
+    picked = selections_from_manifest(choices, cfg)
+    assert picked == {("", "Body Textures"): ("CBBE",)}
+
+
+def test_iter_manifest_choices_walks_the_multi_step_real_shape():
+    """Another live collection's picks, verbatim (mod 81085).
+
+    Two install steps; the first holds two groups. ``idx`` values are
+    what the manifest stored; nothing locates an option by them.
+    """
+    choices = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "Body Types",
+                "groups": [
+                    {
+                        "name": "Female Body Type",
+                        "choices": [{"name": "CBBE 3BA with HDT-SMP", "idx": 2}],
+                    },
+                    {
+                        "name": "Male Body Type",
+                        "choices": [{"name": "Vanilla", "idx": 2}],
+                    },
+                ],
+            },
+            {
+                "name": "Texture Resolution",
+                "groups": [
+                    {
+                        "name": "Texture Resolution",
+                        "choices": [{"name": "4K", "idx": 1}],
+                    }
+                ],
+            },
+        ],
+    }
+    assert list(iter_manifest_choices(choices)) == [
+        ("Body Types", "Female Body Type", "CBBE 3BA with HDT-SMP"),
+        ("Body Types", "Male Body Type", "Vanilla"),
+        ("Texture Resolution", "Texture Resolution", "4K"),
+    ]
 
 
 # ── Deployment: the plan decides what lands where ───────────────────────
@@ -403,15 +476,20 @@ def _write(path: Path, text: str = "x") -> None:
 def _choices(*names: str) -> dict[int, dict]:
     return {
         1: {
-            "steps": [
+            "type": "fomod",
+            "options": [
                 {
-                    "stepId": 1,
-                    "selectedOptions": [
-                        {"groupId": 1, "optionId": i + 1, "optionName": name}
-                        for i, name in enumerate(names)
+                    "name": "",
+                    "groups": [
+                        {
+                            "name": "G",
+                            "choices": [
+                                {"name": n, "idx": i + 1} for i, n in enumerate(names)
+                            ],
+                        }
                     ],
                 }
-            ]
+            ],
         }
     }
 
@@ -515,3 +593,228 @@ def test_deploy_readable_config_installs_to_its_destination(tmp_path):
         "02 Military Camps/Landscape For Grass Mods - Military Camps.esp"
         in skipped
     )
+
+
+# ── Preserved configs: two FOMOD mods in one tree ───────────────────────
+
+
+def _frozen_xml() -> str:
+    return (FIXTURES / "frozen-in-time.ModuleConfig.xml").read_text(encoding="utf-16")
+
+
+def _choose_one_xml() -> str:
+    return (FIXTURES / "gofomod-choose-one.xml").read_text(encoding="utf-8")
+
+
+# A second FOMOD mod whose options collide with Frozen in Time's names.
+# What each mod picks must reach its own config and no other.
+OTHER_XML = """
+<config>
+  <installSteps><installStep name="Options"><optionalFileGroups>
+    <group name="Pack" type="SelectExactlyOne">
+      <plugins>
+        <plugin name="CBBE">
+          <files><file source="cbbe2/manifest.json" destination="manifest.json"/></files>
+          <typeDescriptor><type name="Optional"/></typeDescriptor>
+        </plugin>
+        <plugin name="Other">
+          <files><file source="other/manifest.json" destination="manifest.json"/></files>
+          <typeDescriptor><type name="Optional"/></typeDescriptor>
+        </plugin>
+      </plugins>
+    </group>
+  </optionalFileGroups></installStep></installSteps>
+</config>
+"""
+
+
+def test_two_fomod_records_plan_both_mods_despite_one_tree_config(tmp_path):
+    """Two FOMOD mods, one tree: both plans must survive.
+
+    Extraction merges every archive into one tree, and a later mod's
+    ``fomod/ModuleConfig.xml`` overwrites an earlier one, so the tree can
+    only ever show one config. The copies each extract recorded are what
+    both plans come from. Frozen in Time's picks were lost to exactly
+    this: its config was clobbered and every one of its option folders
+    deployed.
+    """
+    import shutil
+
+    # The tree keeps only the later mod's config: the shape a clobber
+    # leaves behind.
+    (tmp_path / "fomod").mkdir()
+    shutil.copy(
+        FIXTURES / "gofomod-choose-one.xml", tmp_path / "fomod" / "ModuleConfig.xml"
+    )
+    _write(tmp_path / "core" / "snow elf waifu.esp")
+    _write(tmp_path / "cbbe" / "textures" / "b.dds")
+    _write(tmp_path / "uunp" / "textures" / "a.dds")
+    _write(tmp_path / "vanilla" / "textures" / "c.dds")
+    _write(tmp_path / "alpha" / "manifest.json")
+    _write(tmp_path / "beta" / "manifest.json")
+
+    plan = classify_files(
+        tmp_path,
+        "skyrimspecialedition",
+        fomod_picks={
+            39732: [{"step": "", "group": "Body Textures", "option": "CBBE"}],
+            111: [{"step": "Options", "group": "Pack", "option": "Alpha"}],
+        },
+        fomod_configs={
+            39732: {
+                "member": "fomod/ModuleConfig.xml",
+                "xml": _frozen_xml(),
+                "mod_id": 39732,
+            },
+            111: {
+                "member": "fomod/ModuleConfig.xml",
+                "xml": _choose_one_xml(),
+                "mod_id": 111,
+            },
+        },
+    )
+    deployed = {src.relative_to(tmp_path).as_posix(): dest.as_posix() for src, dest in plan.data_files}
+    skipped = {rel.as_posix(): reason for rel, reason in plan.skipped}
+
+    # Each mod's picked option installs at its destination.
+    assert deployed["cbbe/textures/b.dds"] == "textures/b.dds"
+    assert deployed["alpha/manifest.json"] == "manifest.json"
+    # Required content always installs.
+    assert deployed["core/snow elf waifu.esp"] == "snow elf waifu.esp"
+    # Both mods' unpicked options are filtered, not just the one whose
+    # config happened to survive in the tree.
+    assert skipped["uunp/textures/a.dds"] == "not in the FOMOD install plan"
+    assert skipped["vanilla/textures/c.dds"] == "not in the FOMOD install plan"
+    assert skipped["beta/manifest.json"] == "not in the FOMOD install plan"
+
+
+def test_recorded_config_is_not_planned_twice_from_the_tree(tmp_path):
+    """The tree copy a record already represents is skipped.
+
+    Without this the surviving config would produce a second plan for the
+    same mod, and the same files would be classified twice.
+    """
+    import shutil
+
+    (tmp_path / "fomod").mkdir()
+    shutil.copy(
+        FIXTURES / "gofomod-choose-one.xml", tmp_path / "fomod" / "ModuleConfig.xml"
+    )
+    plans = _fomod_plans(
+        tmp_path,
+        {},
+        fomod_configs={
+            111: {
+                "member": "fomod/ModuleConfig.xml",
+                "xml": _choose_one_xml(),
+                "mod_id": 111,
+            }
+        },
+    )
+    assert len(plans) == 1
+
+
+def test_plan_lookup_prefers_the_config_that_owns_the_file(tmp_path):
+    """Two configs sharing a source root: each file goes to its owner.
+
+    A config must not claim a sibling mod's files, and the first config
+    listed must not swallow the second one's. A file neither owns gets no
+    plan at all, which is what keeps sibling mods' files out of a shared
+    root's plan.
+    """
+    plan_a = InstallPlan(
+        entries=(InstallEntry("a/one.esp", "one.esp", False, 0, "x"),),
+    )
+    plan_b = InstallPlan(
+        entries=(InstallEntry("b/two.esp", "two.esp", False, 0, "x"),),
+    )
+    plans = [
+        (tmp_path, plan_a, ("a/one.esp",)),
+        (tmp_path, plan_b, ("b/two.esp",)),
+    ]
+
+    hit_a = _plan_lookup(tmp_path / "a" / "one.esp", plans)
+    assert hit_a is not None and hit_a[0] is plan_a and hit_a[1] == "a/one.esp"
+    hit_b = _plan_lookup(tmp_path / "b" / "two.esp", plans)
+    assert hit_b is not None and hit_b[0] is plan_b and hit_b[1] == "b/two.esp"
+    assert _plan_lookup(tmp_path / "c" / "stranger.esp", plans) is None
+
+
+def test_record_choices_are_not_cross_wired_between_mods(tmp_path):
+    """Each mod's plan gets its own picks, not another mod's.
+
+    Both configs offer an option named ``CBBE``. Only the first mod's
+    manifest says CBBE; the second must install its own pick rather than
+    the first mod's choice.
+    """
+    _write(tmp_path / "cbbe" / "textures" / "b.dds")
+    _write(tmp_path / "uunp" / "textures" / "a.dds")
+    _write(tmp_path / "cbbe2" / "manifest.json")
+    _write(tmp_path / "other" / "manifest.json")
+
+    plan = classify_files(
+        tmp_path,
+        "skyrimspecialedition",
+        mod_choices={
+            39732: {
+                "type": "fomod",
+                "options": [
+                    {
+                        "name": "",
+                        "groups": [
+                            {
+                                "name": "Body Textures",
+                                "choices": [{"name": "CBBE", "idx": 1}],
+                            }
+                        ],
+                    }
+                ],
+            },
+            111: {
+                "type": "fomod",
+                "options": [
+                    {
+                        "name": "Options",
+                        "groups": [
+                            {
+                                "name": "Pack",
+                                "choices": [{"name": "Other", "idx": 2}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+        fomod_configs={
+            39732: {
+                "member": "fomod/ModuleConfig.xml",
+                "xml": _frozen_xml(),
+                "mod_id": 39732,
+            },
+            111: {
+                "member": "fomod/ModuleConfig.xml",
+                "xml": OTHER_XML,
+                "mod_id": 111,
+            },
+        },
+    )
+    deployed = {src.relative_to(tmp_path).as_posix(): dest.as_posix() for src, dest in plan.data_files}
+    skipped = {rel.as_posix(): reason for rel, reason in plan.skipped}
+
+    assert deployed["cbbe/textures/b.dds"] == "textures/b.dds"
+    assert deployed["other/manifest.json"] == "manifest.json"
+    assert skipped["cbbe2/manifest.json"] == "not in the FOMOD install plan"
+    assert skipped["uunp/textures/a.dds"] == "not in the FOMOD install plan"
+
+
+def test_mod_state_round_trips_the_recorded_config():
+    """The record survives a save/load cycle, and old states still load."""
+    from nexus_collection_dl.state import ModState
+
+    record = {"member": "fomod/ModuleConfig.xml", "xml": "<config/>"}
+    mod = ModState(1, 2, "n", "v", "f.zip", fomod_config=record)
+    assert ModState.from_dict(1, mod.to_dict()).fomod_config == record
+
+    old = mod.to_dict()
+    del old["fomod_config"]
+    assert ModState.from_dict(1, old).fomod_config is None

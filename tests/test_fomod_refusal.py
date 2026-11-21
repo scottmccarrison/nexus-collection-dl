@@ -24,6 +24,7 @@ from nexus_collection_dl.extractor import (
     ExtractionError,
     FomodChoicesError,
     FomodInstallerError,
+    FomodUnreadableError,
     can_enumerate_members,
     find_fomod_installer,
 )
@@ -116,6 +117,75 @@ def test_detection_works_on_7z(tmp_path):
     assert can_enumerate_members(z) is True
 
 
+# --- reading the installer out of an archive -------------------------------
+
+
+def test_read_member_reads_a_7z_module_config(tmp_path):
+    """The 7z read path: py7zr has no ``read()``, so this is the path the
+    broken call turned into a silent 'could not read it'."""
+    from nexus_collection_dl.extractor import read_archive_member
+
+    z = make_7z(tmp_path / "m.7z", {
+        "fomod/ModuleConfig.xml": b"<config/>",
+        "Data/thing.esp": b"x",
+    })
+    assert read_archive_member(z, "fomod/ModuleConfig.xml") == b"<config/>"
+
+
+def test_read_member_matches_the_member_name_loosely(tmp_path):
+    from nexus_collection_dl.extractor import read_archive_member
+
+    z = make_7z(tmp_path / "m.7z", {
+        "Some Mod/fomod/ModuleConfig.xml": b"<config/>",
+    })
+    assert read_archive_member(z, r"some mod\fomod\moduleconfig.xml") == b"<config/>"
+
+
+def test_read_member_falls_back_to_system_7z(tmp_path, monkeypatch):
+    """Archives py7zr cannot decompress still yield their member bytes."""
+    import subprocess
+
+    import py7zr
+
+    from nexus_collection_dl import extractor as extractor_module
+    from nexus_collection_dl.extractor import read_archive_member
+
+    z = make_7z(tmp_path / "m.7z", {"fomod/ModuleConfig.xml": b"<config/>"})
+
+    def unsupported(self, *a, **kw):
+        raise py7zr.exceptions.UnsupportedCompressionMethodError("bcj2", "bcj2")
+
+    monkeypatch.setattr(py7zr.SevenZipFile, "extract", unsupported)
+
+    seen: list = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"<config/>")
+
+    monkeypatch.setattr(extractor_module.subprocess, "run", fake_run)
+    assert read_archive_member(z, "fomod/ModuleConfig.xml") == b"<config/>"
+    assert seen and "7z" in Path(seen[0][0]).name
+    assert "-so" in seen[0]
+
+
+def test_read_member_returns_none_when_nothing_can_read_it(tmp_path, monkeypatch):
+    import py7zr
+
+    from nexus_collection_dl import extractor as extractor_module
+    from nexus_collection_dl.extractor import read_archive_member
+
+    z = make_7z(tmp_path / "m.7z", {"fomod/ModuleConfig.xml": b"<config/>"})
+    monkeypatch.setattr(
+        py7zr.SevenZipFile, "extract",
+        lambda self, *a, **kw: (_ for _ in ()).throw(
+            py7zr.exceptions.UnsupportedCompressionMethodError("bcj2", "bcj2")
+        ),
+    )
+    monkeypatch.setattr(extractor_module.shutil, "which", lambda name: None)
+    assert read_archive_member(z, "fomod/ModuleConfig.xml") is None
+
+
 # --- the exception and its error code --------------------------------------
 
 
@@ -147,6 +217,19 @@ def test_error_code_is_fomod_installer_not_extraction_error():
     assert error_code_for(exc) != "extraction_error"
     # And the parent still maps the way it always did.
     assert error_code_for(ExtractionError("nope")) == "extraction_error"
+
+
+def test_error_code_is_fomod_unreadable_not_extraction_error():
+    """Found-but-unreadable is its own refusal, not a generic extraction failure.
+
+    The cause differs from a script installer: the config was found and
+    its bytes would not read. A harness branching on the code can tell
+    the two apart.
+    """
+    exc = FomodUnreadableError("Fomod/ModuleConfig.xml", Path("/tmp/x.zip"))
+    assert error_code_for(exc) == "fomod_unreadable"
+    assert error_code_for(exc) != "extraction_error"
+    assert error_code_for(exc) != "fomod_installer"
 
 
 def test_fomod_installer_error_is_an_extraction_error():

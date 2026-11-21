@@ -105,6 +105,7 @@ class ModState:
         download_status: str = "downloaded",
         browser_url: str = "",
         fomod_picks: list[dict[str, str]] | None = None,
+        fomod_config: dict[str, str] | None = None,
     ):
         self.file_id = file_id
         self.mod_id = mod_id
@@ -124,6 +125,12 @@ class ModState:
         # chose instead of the schema defaults, and so a re-add can tell
         # which picks still name real options in a changed installer.
         self.fomod_picks = list(fomod_picks or [])
+        # The mod's FOMOD installer config, captured from the archive at
+        # extract time as {"member": <archive-relative path>, "xml": <text>}.
+        # Extraction merges every archive into one tree, so a second mod's
+        # fomod/ModuleConfig.xml overwrites the first; without this record
+        # deploy can only plan for whichever mod extracted last.
+        self.fomod_config = dict(fomod_config) if fomod_config else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +147,7 @@ class ModState:
             "download_status": self.download_status,
             "browser_url": self.browser_url,
             "fomod_picks": self.fomod_picks,
+            "fomod_config": self.fomod_config,
         }
 
     @classmethod
@@ -159,6 +167,7 @@ class ModState:
             download_status=data.get("download_status", "downloaded"),
             browser_url=data.get("browser_url", ""),
             fomod_picks=data.get("fomod_picks"),
+            fomod_config=data.get("fomod_config"),
         )
 
 
