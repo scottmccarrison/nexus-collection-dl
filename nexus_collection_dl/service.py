@@ -2464,6 +2464,7 @@ class ModManagerService:
                 raise FomodChoicesError(archive.name)
 
             extract_archive(archive, mods_dir)
+            config_record = _fomod_config_record(archive)
             mod.download_status = "downloaded"
             mod.browser_url = ""
             mod.installed_at = datetime.now(timezone.utc).isoformat()
@@ -2471,6 +2472,8 @@ class ModManagerService:
                 {"step": p.step, "group": p.group, "option": p.option}
                 for p in resolved
             ]
+            if config_record is not None:
+                mod.fomod_config = config_record
             # Finishing the install is explicit re-add intent, so any
             # removal tombstone for the page goes with the same commit.
             state.clear_removed(mod.mod_id)

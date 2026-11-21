@@ -140,6 +140,26 @@ def test_install_fomod_picks_extracts_and_stores_them(tmp_path):
     assert entry.fomod_picks == [{"step": "Step1", "group": "G", "option": "OptB"}]
 
 
+def test_install_fomod_picks_records_the_config_for_later_deploys(tmp_path):
+    """This extract must record the installer config like every other one.
+
+    Extraction merges archives into one tree, so the record is what lets a
+    later deploy plan for this mod even after another mod overwrites the
+    tree's copy of the config. The picker path has its own extract and is
+    the easy one to leave out.
+    """
+    mods = _collection_with_archive(tmp_path, _fomod_zip())
+
+    _svc().install_fomod_picks(mods, 11, picks=[Pick("", "G", "OptB")])
+
+    state = CollectionState(mods)
+    state.load()
+    entry = state.mods[11]
+    assert entry.fomod_config is not None, "the picker path lost the config record"
+    assert entry.fomod_config["member"].lower().endswith("moduleconfig.xml")
+    assert "<config" in entry.fomod_config["xml"]
+
+
 def test_install_fomod_picks_can_ask(tmp_path):
     mods = _collection_with_archive(tmp_path, _fomod_zip())
     asked: list = []
