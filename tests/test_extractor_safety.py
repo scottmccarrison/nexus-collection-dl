@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from nexus_collection_dl import extractor
 from nexus_collection_dl.extractor import ExtractionError, extract_archive
 
 
@@ -107,6 +108,30 @@ def test_extract_archive_rejects_a_planted_fifo(tmp_path, monkeypatch):
     monkeypatch.setattr("nexus_collection_dl.extractor._extract_zip", plant)
     with pytest.raises(ExtractionError):
         extract_archive(archive, mods)
+
+
+def test_validate_extracted_tree_rejects_symlink_and_fifo(tmp_path):
+    """Direct pin on the staging-tree walk itself.
+
+    Rule 2 of the hardening: the walk that runs before the merge must
+    reject symlink entries and non-regular files (fifo/device/socket),
+    naming the offending relative path. This is the contract the
+    system-tool fallbacks are held to; the planted-entry tests above
+    cover the same walk through ``extract_archive``.
+    """
+    link_dir = tmp_path / "link-staging"
+    link_dir.mkdir()
+    os.symlink("/etc/passwd", link_dir / "evil")
+    with pytest.raises(ExtractionError, match=r"archive contains a symlink \(evil\)"):
+        extractor._validate_extracted_tree(link_dir)
+
+    fifo_dir = tmp_path / "fifo-staging"
+    fifo_dir.mkdir()
+    os.mkfifo(fifo_dir / "pipe")
+    with pytest.raises(
+        ExtractionError, match=r"archive contains a non-regular file \(pipe\)"
+    ):
+        extractor._validate_extracted_tree(fifo_dir)
 
 
 def test_normal_archive_still_extracts(tmp_path):
