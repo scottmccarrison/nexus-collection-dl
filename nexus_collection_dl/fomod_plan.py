@@ -279,14 +279,32 @@ def _strip_ns(tag: str) -> str:
     return tag.split("}", 1)[1] if tag.startswith("{") else tag
 
 
-def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
-    """UTF-8 first, UTF-16 then cp1252 fallback. Real configs are UTF-16LE."""
-    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
+CONFIG_ENCODINGS = ("utf-8-sig", "utf-16", "cp1252")
+
+
+def decode_config_text(raw: bytes) -> str | None:
+    """Decode config bytes to text. UTF-8 first, UTF-16 then cp1252.
+
+    Real configs are UTF-16LE with a BOM; a stored copy keeps this text,
+    which parses the same way whether it came from the archive or back
+    out of the state file.
+    """
+    for encoding in CONFIG_ENCODINGS:
         try:
-            return ET.fromstring(raw.decode(encoding))
-        except (UnicodeDecodeError, ET.ParseError):
+            return raw.decode(encoding)
+        except UnicodeError:
             continue
     return None
+
+
+def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
+    text = decode_config_text(raw)
+    if text is None:
+        return None
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError:
+        return None
 
 
 def _parse_xml(config_path: Path) -> ET.Element | None:
@@ -516,6 +534,15 @@ def load_module_config_bytes(raw: bytes) -> ModuleConfig | None:
     """Parse config bytes straight out of an archive, without extracting it."""
     root = _parse_xml_bytes(raw)
     return None if root is None else _build_config(root)
+
+
+def load_module_config_text(text: str) -> ModuleConfig | None:
+    """Parse a config's decoded text, the form a stored copy keeps."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    return _build_config(root)
 
 
 def plan_source_root(config_path: Path) -> Path:

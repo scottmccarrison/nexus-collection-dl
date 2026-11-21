@@ -57,7 +57,7 @@ from .extractor import (
     read_archive_member,
     sniff_archive_magic,
 )
-from .fomod_plan import load_module_config_bytes
+from .fomod_plan import decode_config_text, load_module_config_bytes
 from .fomod_select import PickError
 from .handler import (
     DesktopInstaller,
@@ -155,6 +155,30 @@ def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
     if config is None:
         raise FomodUnreadableError(member, archive_path)
     return config
+
+
+def _fomod_config_record(archive_path: Path) -> dict[str, str] | None:
+    """The archive's FOMOD installer config as a storable record.
+
+    Returns ``{"member": <archive-relative path>, "xml": <text>}`` or None
+    when the archive carries no ModuleConfig.xml or its bytes cannot be
+    read. Unlike :func:`_fomod_config_for_archive` this never raises: it
+    runs at extract time over archives that are being extracted anyway,
+    and a mod with no record still has the in-tree config deploy
+    discovers on its own.
+    """
+    if not can_enumerate_members(archive_path):
+        return None
+    member = find_module_config(archive_path)
+    if member is None:
+        return None
+    raw = read_archive_member(archive_path, member)
+    if raw is None:
+        return None
+    text = decode_config_text(raw)
+    if text is None:
+        return None
+    return {"member": member, "xml": text}
 
 
 def _nxm_fomod_blocker(archive_path: Path) -> str | None:
@@ -1430,6 +1454,7 @@ class ModManagerService:
             conflicts: list[FileConflict] = []
             for i, (mod_info, file_path) in enumerate(results):
                 try:
+                    config_record = None
                     if not no_extract and is_archive(file_path):
                         final_files = extract_archive(file_path, mods_dir)
                         for ef in final_files:
@@ -1438,6 +1463,7 @@ class ModManagerService:
                             if prev_owner:
                                 conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                             file_owners[rel] = mod_info["mod_name"]
+                        config_record = _fomod_config_record(file_path)
                         file_path.unlink()
                         extracted += 1
                     else:
@@ -1447,6 +1473,8 @@ class ModManagerService:
                             conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                         file_owners[rel] = mod_info["mod_name"]
                     state.add_mod(mod_info)
+                    if config_record is not None:
+                        state.mods[mod_info["file_id"]].fomod_config = config_record
                     state.save()
                     pct = 0.75 + 0.15 * ((i + 1) / len(results))
                     progress("extract", pct, f"Extracted {mod_info['mod_name']}")
@@ -1554,10 +1582,14 @@ class ModManagerService:
                     progress("extract", 0.75, "Extracting archives...")
                     for mod_info, file_path in results:
                         try:
+                            config_record = None
                             if not no_extract and is_archive(file_path):
                                 extract_archive(file_path, mods_dir)
+                                config_record = _fomod_config_record(file_path)
                                 file_path.unlink()
                             state.add_mod(mod_info)
+                            if config_record is not None:
+                                state.mods[mod_info["file_id"]].fomod_config = config_record
                             downloaded += 1
                         except ExtractionError as e:
                             errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
@@ -1759,10 +1791,12 @@ class ModManagerService:
                         stored_picks,
                         on_fomod_prompt,
                     )
+            config_record = None
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
                         extract_archive(file_path, mods_dir)
+                        config_record = _fomod_config_record(file_path)
                         file_path.unlink()
                 except ExtractionError as e:
                     return AddResult(
@@ -1775,6 +1809,8 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            if config_record is not None:
+                state.mods[selected_file_id].fomod_config = config_record
             if resolved_picks:
                 state.mods[selected_file_id].fomod_picks = [
                     {"step": p.step, "group": p.group, "option": p.option}
@@ -2143,15 +2179,25 @@ class ModManagerService:
                 manifest_choices = manifest.mod_choices
             # FOMOD option picks recorded by standalone adds and imports.
             fomod_picks = {
-                mod.mod_id: mod.fomod_picks
+                mod.file_id: mod.fomod_picks
                 for mod in state.mods.values()
                 if mod.fomod_picks
+            }
+            # Installer configs recorded at extract time. The tree cannot
+            # hold more than one (a later mod's fomod/ModuleConfig.xml
+            # overwrites an earlier one), so these copies are what let
+            # deploy plan for every FOMOD mod at once.
+            fomod_configs = {
+                mod.file_id: {**mod.fomod_config, "mod_id": mod.mod_id}
+                for mod in state.mods.values()
+                if mod.fomod_config
             }
             plan = classify_files(
                 mods_dir,
                 game_domain,
                 mod_choices=manifest_choices,
                 fomod_picks=fomod_picks,
+                fomod_configs=fomod_configs,
             )
 
             if plan.total_files == 0:
@@ -2557,6 +2603,7 @@ class ModManagerService:
 
                 is_arch = is_archive(match)
                 resolved_picks: list = []
+                config_record = None
                 try:
                     if not no_extract and is_arch:
                         config = _fomod_config_for_archive(match)
@@ -2576,6 +2623,7 @@ class ModManagerService:
                                 on_fomod_prompt,
                             )
                         extract_archive(match, mods_dir)
+                        config_record = _fomod_config_record(match)
                         extracted += 1
                 except FomodInstallerError as e:
                     # Same contract as a failed extraction: report it and
@@ -2598,6 +2646,8 @@ class ModManagerService:
                 mod_state.download_status = "downloaded"
                 mod_state.browser_url = ""
                 mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+                if config_record is not None:
+                    mod_state.fomod_config = config_record
                 if resolved_picks:
                     mod_state.fomod_picks = [
                         {"step": p.step, "group": p.group, "option": p.option}
@@ -2864,9 +2914,12 @@ class ModManagerService:
                             mod_name=existing.name,
                             filename=existing.filename,
                         )
+                    config_record = _fomod_config_record(archive)
                     existing.download_status = "downloaded"
                     existing.browser_url = ""
                     existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    if config_record is not None:
+                        existing.fomod_config = config_record
                     # Committing this completion is explicit re-add intent,
                     # so the page's removal tombstone (if any) is cleared
                     # with the same save.
@@ -3099,6 +3152,7 @@ class ModManagerService:
                 )
 
             extracted = False
+            config_record = None
             if not no_extract and is_archive(path):
                 blocker = _nxm_fomod_blocker(path)
                 if blocker is not None:
@@ -3141,6 +3195,7 @@ class ModManagerService:
                 try:
                     extract_archive(path, target)
                     extracted = True
+                    config_record = _fomod_config_record(path)
                 except ExtractionError as e:
                     # Extraction failed: never claim completion. The
                     # verified archive stays on disk and the entry stays
@@ -3240,12 +3295,16 @@ class ModManagerService:
                 version = selected.get("version")
                 if version:
                     existing.version = str(version)
+                if config_record is not None:
+                    existing.fomod_config = config_record
             else:
                 download_info["manual"] = True
                 download_info["download_status"] = "downloaded"
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
+                if config_record is not None:
+                    state.mods[info.file_id].fomod_config = config_record
             # Completing this download is explicit re-add intent, so the
             # page's removal tombstone (if any) is cleared with the same
             # save that marks the file downloaded.
