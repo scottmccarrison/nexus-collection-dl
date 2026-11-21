@@ -31,6 +31,8 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .fomod_plan import iter_manifest_choices
+
 
 def _parse_xml(config_path: Path) -> ET.Element | None:
     """Read a ModuleConfig.xml whatever it is encoded as.
@@ -151,10 +153,9 @@ def _names_match(choices: dict, option_to_folders: dict[str, set[str]]) -> bool:
     ``conditionFlags``, for instance), and treating that as "wrong
     config" would push a real selection into the name-matching fallback.
     """
-    for step in choices.get("steps", []):
-        for option in step.get("selectedOptions", []):
-            if option.get("optionName", "").strip().lower() in option_to_folders:
-                return True
+    for _, _, option_name in iter_manifest_choices(choices):
+        if option_name.strip().lower() in option_to_folders:
+            return True
     return False
 
 
@@ -163,17 +164,15 @@ def resolve_selected_folders(
 ) -> set[str]:
     """Archive top-level dirs belonging to the options that were selected.
 
-    ``choices`` is the manifest's own structure:
-    ``{"steps": [{"stepId": N, "selectedOptions": [{"groupId": N,
-    "optionId": N, "optionName": "..."}]}]}``. Only ``selectedOptions``
-    is present, so the unselected side has to come from the config.
+    ``choices`` is the manifest's own structure (see
+    ``fomod_plan.iter_manifest_choices``). Only the selected options are
+    present, so the unselected side has to come from the config.
     """
     selected: set[str] = set()
-    for step in choices.get("steps", []):
-        for option in step.get("selectedOptions", []):
-            option_name = option.get("optionName", "").strip().lower()
-            if option_name in option_to_folders:
-                selected |= option_to_folders[option_name]
+    for _, _, option_name in iter_manifest_choices(choices):
+        name = option_name.strip().lower()
+        if name in option_to_folders:
+            selected |= option_to_folders[name]
     return selected
 
 
@@ -226,11 +225,10 @@ def build_fomod_skip_set(mods_dir: Path, mod_choices: dict[int, dict]) -> set[st
     all_selected_names: dict[int, set[str]] = {}
     for mod_id, choices in mod_choices.items():
         selected_names: set[str] = set()
-        for step in choices.get("steps", []):
-            for option in step.get("selectedOptions", []):
-                name = option.get("optionName", "").strip().lower()
-                if name:
-                    selected_names.add(name)
+        for _, _, option_name in iter_manifest_choices(choices):
+            name = option_name.strip().lower()
+            if name:
+                selected_names.add(name)
         all_selected_names[mod_id] = selected_names
 
     # Strategy 1: parse the configs that are on disk.

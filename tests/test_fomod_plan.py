@@ -24,6 +24,7 @@ from nexus_collection_dl.fomod_plan import (
     FlagDependency,
     GameDependency,
     GameState,
+    iter_manifest_choices,
     load_module_config,
     plan_source_root,
     resolve_install_plan,
@@ -355,41 +356,111 @@ def test_lookup_prefers_the_higher_priority_entry():
 # ── Manifest conversion ─────────────────────────────────────────────────
 
 
-def test_manifest_choices_resolve_by_name_with_id_tiebreak():
+def test_manifest_choices_resolve_by_name_with_group_tiebreak():
     cfg = config("compliance")
-    # 'Plugin1' exists in five groups; the ids disambiguate. Both 1-based
-    # and 0-based conventions must resolve to the same group.
-    choices = {
-        "steps": [
-            {
-                "stepId": 1,
-                "selectedOptions": [
-                    {"groupId": 3, "optionId": 1, "optionName": "Plugin1"},
-                ],
-            }
-        ]
-    }
-    picked = selections_from_manifest(choices, cfg)
-    assert picked == {("Step1", "Group3"): ("Plugin1",)}
+    # 'Plugin1' exists in five groups; the manifest's group name
+    # disambiguates. The step name may be empty in real data, and the
+    # group name must still find the right one.
+    for step_name in ("Step1", ""):
+        choices = {
+            "type": "fomod",
+            "options": [
+                {
+                    "name": step_name,
+                    "groups": [
+                        {"name": "Group3", "choices": [{"name": "Plugin1", "idx": 1}]},
+                    ],
+                }
+            ],
+        }
+        picked = selections_from_manifest(choices, cfg)
+        assert picked == {("Step1", "Group3"): ("Plugin1",)}, step_name
 
-    # A name that is unique resolves without any id.
+    # A name that is unique resolves with no group context at all.
     cfg = config("spid")
     choices = {
-        "steps": [
+        "type": "fomod",
+        "options": [
             {
-                "stepId": 1,
-                "selectedOptions": [
+                "name": "Main",
+                "groups": [
                     {
-                        "groupId": 1,
-                        "optionId": 1,
-                        "optionName": 'SSE v1.5.97 ("Special Edition")',
+                        "name": "DLL",
+                        "choices": [
+                            {"name": 'SSE v1.5.97 ("Special Edition")', "idx": 2}
+                        ],
                     }
                 ],
             }
-        ]
+        ],
     }
     picked = selections_from_manifest(choices, cfg)
     assert picked == {("Main", "DLL"): ('SSE v1.5.97 ("Special Edition")',)}
+
+
+def test_selections_from_manifest_reads_the_real_nexus_shape():
+    """A live collection's stored picks, verbatim (mod 39732).
+
+    The step name is empty, which real manifests carry: Frozen in Time's
+    own config is ``<installStep name="">`` with one group.
+    """
+    cfg = config("frozen-in-time")
+    choices = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "",
+                "groups": [
+                    {
+                        "name": "Body Textures",
+                        "choices": [{"name": "CBBE", "idx": 1}],
+                    }
+                ],
+            }
+        ],
+    }
+    picked = selections_from_manifest(choices, cfg)
+    assert picked == {("", "Body Textures"): ("CBBE",)}
+
+
+def test_iter_manifest_choices_walks_the_multi_step_real_shape():
+    """Another live collection's picks, verbatim (mod 81085).
+
+    Two install steps; the first holds two groups. ``idx`` values are
+    what the manifest stored; nothing locates an option by them.
+    """
+    choices = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "Body Types",
+                "groups": [
+                    {
+                        "name": "Female Body Type",
+                        "choices": [{"name": "CBBE 3BA with HDT-SMP", "idx": 2}],
+                    },
+                    {
+                        "name": "Male Body Type",
+                        "choices": [{"name": "Vanilla", "idx": 2}],
+                    },
+                ],
+            },
+            {
+                "name": "Texture Resolution",
+                "groups": [
+                    {
+                        "name": "Texture Resolution",
+                        "choices": [{"name": "4K", "idx": 1}],
+                    }
+                ],
+            },
+        ],
+    }
+    assert list(iter_manifest_choices(choices)) == [
+        ("Body Types", "Female Body Type", "CBBE 3BA with HDT-SMP"),
+        ("Body Types", "Male Body Type", "Vanilla"),
+        ("Texture Resolution", "Texture Resolution", "4K"),
+    ]
 
 
 # ── Deployment: the plan decides what lands where ───────────────────────
@@ -403,15 +474,20 @@ def _write(path: Path, text: str = "x") -> None:
 def _choices(*names: str) -> dict[int, dict]:
     return {
         1: {
-            "steps": [
+            "type": "fomod",
+            "options": [
                 {
-                    "stepId": 1,
-                    "selectedOptions": [
-                        {"groupId": 1, "optionId": i + 1, "optionName": name}
-                        for i, name in enumerate(names)
+                    "name": "",
+                    "groups": [
+                        {
+                            "name": "G",
+                            "choices": [
+                                {"name": n, "idx": i + 1} for i, n in enumerate(names)
+                            ],
+                        }
                     ],
                 }
-            ]
+            ],
         }
     }
 

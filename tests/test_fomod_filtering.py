@@ -38,15 +38,28 @@ def write_config(path: Path, body: str) -> Path:
 
 
 def choices(*option_names: str) -> dict:
-    """A manifest-shaped choices blob selecting the named options."""
+    """A manifest-shaped choices blob selecting the named options.
+
+    The shape is the one a live Nexus collection stores:
+    ``{"type": "fomod", "options": [{"name": <step>, "groups": [{"name":
+    <group>, "choices": [{"name": <option>, "idx": N}]}]}]}``.
+    """
     return {
-        "steps": [{
-            "stepId": 1,
-            "selectedOptions": [
-                {"groupId": 1, "optionId": i + 1, "optionName": n}
-                for i, n in enumerate(option_names)
-            ],
-        }],
+        "type": "fomod",
+        "options": [
+            {
+                "name": "",
+                "groups": [
+                    {
+                        "name": "G",
+                        "choices": [
+                            {"name": n, "idx": i + 1}
+                            for i, n in enumerate(option_names)
+                        ],
+                    }
+                ],
+            }
+        ],
     }
 
 
@@ -90,6 +103,56 @@ def test_both_real_configs_parse_without_raising():
     """Encoding is the thing most likely to blow up on real input."""
     assert parse_module_config(FROZEN)
     assert parse_module_config(LANDSCAPE)
+
+
+# --- the real manifest shape -----------------------------------------------
+
+
+def test_real_manifest_shape_selects_folders():
+    """A live collection's stored picks against Frozen in Time's config.
+
+    Verbatim from a real collection's state (mod 39732). The step name
+    is empty, as it is in the config itself.
+    """
+    picks = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "",
+                "groups": [
+                    {
+                        "name": "Body Textures",
+                        "choices": [{"name": "CBBE", "idx": 1}],
+                    }
+                ],
+            }
+        ],
+    }
+    mapping = parse_module_config(FROZEN)
+    assert resolve_selected_folders(picks, mapping) == {"cbbe"}
+
+
+def test_real_manifest_shape_skips_the_unpicked_options(tmp_path):
+    write_config(tmp_path / "ModuleConfig.xml", FROZEN.read_text(encoding="utf-16"))
+    for d in ("uunp", "cbbe", "vanilla"):
+        (tmp_path / d).mkdir()
+
+    picks = {
+        "type": "fomod",
+        "options": [
+            {
+                "name": "",
+                "groups": [
+                    {
+                        "name": "Body Textures",
+                        "choices": [{"name": "CBBE", "idx": 1}],
+                    }
+                ],
+            }
+        ],
+    }
+    skip = build_fomod_skip_set(tmp_path, {39732: picks})
+    assert skip == {"uunp", "vanilla"}, f"CBBE is picked; skip got {skip}"
 
 
 # --- bug 1: <folder> and <file> must produce the same shape ----------------

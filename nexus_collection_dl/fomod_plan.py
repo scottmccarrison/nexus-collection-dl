@@ -748,17 +748,59 @@ def _strip_data_prefix(destination: str) -> str:
     return destination
 
 
+def iter_manifest_choices(choices: Mapping[str, Any]) -> Iterator[tuple[str, str, str]]:
+    """Yield ``(step_name, group_name, option_name)`` for each recorded pick.
+
+    The manifest records ``{"type": "fomod", "options": [{"name": <step>,
+    "groups": [{"name": <group>, "choices": [{"name": <option>, "idx": N}]}]}]}``,
+    verbatim from a live collection's state. The step name may be empty
+    and the option name may not. ``idx`` is carried as data only: what it
+    counts has never been verified against a live collection, and nothing
+    here locates an option by it.
+    """
+    for step in choices.get("options") or []:
+        step_name = str(step.get("name") or "").strip()
+        for group in step.get("groups") or []:
+            group_name = str(group.get("name") or "").strip()
+            for pick in group.get("choices") or []:
+                option_name = str(pick.get("name") or "").strip()
+                if option_name:
+                    yield step_name, group_name, option_name
+
+
+def _match_by_names(
+    candidates: list[tuple[str, str]], step_name: str, group_name: str
+) -> tuple[str, str]:
+    """Pick the candidate a manifest's own names point at.
+
+    The group name decides; the step name only narrows further when the
+    manifest has one, because a real manifest's step name can be empty
+    while the config's is not.
+    """
+    want_step = step_name.strip().lower()
+    want_group = group_name.strip().lower()
+    for cand_step, cand_group in candidates:
+        if cand_group.strip().lower() != want_group:
+            continue
+        if want_step and cand_step.strip().lower() != want_step:
+            continue
+        return cand_step, cand_group
+    for cand_step, cand_group in candidates:
+        if cand_group.strip().lower() == want_group:
+            return cand_step, cand_group
+    return candidates[0]
+
+
 def selections_from_manifest(
     choices: Mapping[str, Any], config: ModuleConfig
 ) -> dict[tuple[str, str], tuple[str, ...]]:
     """Convert a collection manifest's choice structure to planner selections.
 
-    The manifest records ``{"steps": [{"stepId": N, "selectedOptions":
-    [{"groupId": N, "optionId": N, "optionName": "..."}]}]}``. The numeric
-    ids are positions in the config, but which base they use has never
-    been verified against a live collection, so they are only a
-    tie-breaker: an option is located by name first and the ids disambiguate
-    when the same name appears in more than one group.
+    Each recorded option is located by name against the config, so the
+    keys are the config's own ``(step_name, group_name)`` pairs whatever
+    names the manifest carries. When the same option name appears in more
+    than one group, the manifest's group and step names disambiguate; an
+    option that matches nothing in the config is dropped.
     """
     by_name: dict[str, list[tuple[str, str]]] = {}
     for step in config.steps:
@@ -769,61 +811,14 @@ def selections_from_manifest(
                 )
 
     picked: dict[tuple[str, str], list[str]] = {}
-    for step in choices.get("steps") or []:
-        for option in step.get("selectedOptions") or []:
-            name = str(option.get("optionName", "")).strip()
-            if not name:
-                continue
-            candidates = by_name.get(name.lower(), [])
-            chosen: tuple[str, str] | None = None
-            if len(candidates) == 1:
-                chosen = candidates[0]
-            elif candidates:
-                step_id = option.get("stepId", step.get("stepId"))
-                group_id = option.get("groupId")
-                for step_name, group_name in candidates:
-                    matched_group = next(
-                        (
-                            g
-                            for s in config.steps
-                            if s.name == step_name
-                            for g in s.groups
-                            if g.name == group_name
-                        ),
-                        None,
-                    )
-                    if matched_group is None:
-                        continue
-                    if _manifest_ids_match(config, step_name, group_name, step_id, group_id):
-                        chosen = (step_name, group_name)
-                        break
-                if chosen is None:
-                    chosen = candidates[0]
-            if chosen is None:
-                continue
-            picked.setdefault(chosen, []).append(name)
+    for step_name, group_name, option_name in iter_manifest_choices(choices):
+        candidates = by_name.get(option_name.lower())
+        if not candidates:
+            continue
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            chosen = _match_by_names(candidates, step_name, group_name)
+        picked.setdefault(chosen, []).append(option_name)
 
     return {key: tuple(names) for key, names in picked.items()}
-
-
-def _manifest_ids_match(
-    config: ModuleConfig,
-    step_name: str,
-    group_name: str,
-    step_id: object,
-    group_id: object,
-) -> bool:
-    """True when the manifest ids point at this (step, group), 1- or 0-based."""
-    try:
-        step_index = int(str(step_id))
-        group_index = int(str(group_id))
-    except (TypeError, ValueError):
-        return False
-    for base in (1, 0):
-        if 0 <= step_index - base < len(config.steps):
-            step = config.steps[step_index - base]
-            if step.name != step_name:
-                continue
-            if 0 <= group_index - base < len(step.groups):
-                return step.groups[group_index - base].name == group_name
-    return False
