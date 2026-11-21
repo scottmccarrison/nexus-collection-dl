@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nexus-collection-dl"
-version = "0.3.0"
+version = "0.4.0"
 description = "Download mod collections from Nexus Mods"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ dependencies = [
     "requests>=2.28.0",
     "click>=8.0.0",
     "rich>=13.0.0",
-    "py7zr>=0.20.0",
+    "py7zr>=0.20.2",
     "rarfile>=4.0",
     "packaging>=21.0",
     # state.py uses typing.Self via typing_extensions, which is not in the

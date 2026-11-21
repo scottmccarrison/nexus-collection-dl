@@ -908,9 +908,27 @@ class _ShellSession:
             manifest = CollectionManifest.from_dict(state.manifest_data)
             manifest_choices = manifest.mod_choices
 
+        # The same picks and recorded configs the real deploy uses: the
+        # preview has to describe that deployment, not a different one.
+        fomod_picks = {
+            mod.file_id: mod.fomod_picks
+            for mod in state.mods.values()
+            if mod.fomod_picks
+        }
+        fomod_configs = {
+            mod.file_id: {**mod.fomod_config, "mod_id": mod.mod_id}
+            for mod in state.mods.values()
+            if mod.fomod_config
+        }
+
         try:
             plan = classify_files(
-                target.path, state.game_domain, mod_choices=manifest_choices
+                target.path,
+                state.game_domain,
+                mod_choices=manifest_choices,
+                fomod_picks=fomod_picks,
+                fomod_configs=fomod_configs,
+                mod_names={mod.file_id: mod.name for mod in state.mods.values()},
             )
         except (StateError, OSError, ValueError) as e:
             self._emit_error(str(e) or type(e).__name__)
@@ -922,6 +940,8 @@ class _ShellSession:
             f"({len(plan.game_root_files)} game root, "
             f"{len(plan.data_files)} data, {len(plan.skipped)} skipped)."
         )
+        for w in plan.warnings:
+            self._emit_warning(str(w))
 
         answer = self._confirm(
             f"Deploy '{_safe_text(target.name)}' now? [yes/no]: "

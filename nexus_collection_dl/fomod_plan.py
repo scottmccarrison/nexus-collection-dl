@@ -282,22 +282,72 @@ def _strip_ns(tag: str) -> str:
 CONFIG_ENCODINGS = ("utf-8-sig", "utf-16", "cp1252")
 
 
-def decode_config_text(raw: bytes) -> str | None:
-    """Decode config bytes to text. UTF-8 first, UTF-16 then cp1252.
+def _nul_aligned_utf16(raw: bytes) -> str | None:
+    """Name the likely UTF-16 flavour from where the NUL bytes sit.
 
-    Real configs are UTF-16LE with a BOM; a stored copy keeps this text,
-    which parses the same way whether it came from the archive or back
-    out of the state file.
+    ASCII text in UTF-16LE carries its NULs on odd byte offsets and in
+    UTF-16BE on even ones. The codecs cannot tell the flavours apart:
+    both decode any byte pair without error, one of them into mojibake.
     """
-    for encoding in CONFIG_ENCODINGS:
-        try:
-            return raw.decode(encoding)
-        except UnicodeError:
-            continue
+    even = odd = 0
+    for offset, byte in enumerate(raw):
+        if byte == 0:
+            if offset % 2:
+                odd += 1
+            else:
+                even += 1
+    if odd > even:
+        return "utf-16-le"
+    if even > odd:
+        return "utf-16-be"
     return None
 
 
+def _candidate_encodings(raw: bytes) -> tuple[str, ...]:
+    """Order the encodings worth trying for raw config bytes.
+
+    NUL-interleaved bytes are UTF-16-family content: NULs are valid
+    UTF-8, so the usual order would decode a BOM-less UTF-16 payload as
+    NUL-riddled text and hand the parser the wrong characters.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ("utf-16", "utf-8-sig", "cp1252")
+    if b"\x00" in raw:
+        if _nul_aligned_utf16(raw) == "utf-16-be":
+            return ("utf-16-be", "utf-16-le", "utf-8-sig", "cp1252")
+        return ("utf-16-le", "utf-16-be", "utf-8-sig", "cp1252")
+    return CONFIG_ENCODINGS
+
+
+def decode_config_text(raw: bytes) -> str | None:
+    """Decode config bytes to text. UTF-16 first when the bytes say so.
+
+    Real configs are UTF-16LE with a BOM; a stored copy keeps this text,
+    which parses the same way whether it came from the archive or back
+    out of the state file. The first encoding that decodes AND parses as
+    XML wins: a decode that succeeds can still be the wrong codec (an
+    ASCII-only BOM-less UTF-16 payload decodes as valid UTF-8, and
+    arbitrary even-length bytes decode as UTF-16), so decoding alone
+    would store text nothing can read back.
+    """
+    first_decoded = None
+    for encoding in _candidate_encodings(raw):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeError:
+            continue
+        if first_decoded is None:
+            first_decoded = text
+        try:
+            ET.fromstring(text)
+        except ET.ParseError:
+            continue
+        return text
+    return first_decoded
+
+
 def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
+    """Parse config bytes as XML in whatever encoding they were written."""
     text = decode_config_text(raw)
     if text is None:
         return None
@@ -527,13 +577,13 @@ def _build_config(root: ET.Element) -> ModuleConfig:
 def load_module_config(config_path: Path) -> ModuleConfig | None:
     """Parse a ``ModuleConfig.xml`` into the full model, or None if unreadable."""
     root = _parse_xml(config_path)
-    return None if root is None else _build_config(root)
+    return None if root is None else _build_config_or_none(root)
 
 
 def load_module_config_bytes(raw: bytes) -> ModuleConfig | None:
     """Parse config bytes straight out of an archive, without extracting it."""
     root = _parse_xml_bytes(raw)
-    return None if root is None else _build_config(root)
+    return None if root is None else _build_config_or_none(root)
 
 
 def load_module_config_text(text: str) -> ModuleConfig | None:
@@ -542,7 +592,20 @@ def load_module_config_text(text: str) -> ModuleConfig | None:
         root = ET.fromstring(text)
     except ET.ParseError:
         return None
-    return _build_config(root)
+    return _build_config_or_none(root)
+
+
+def _build_config_or_none(root: ET.Element) -> ModuleConfig | None:
+    """Build the model, treating a pathologically nested config as unreadable.
+
+    Dependency expressions recurse; expat accepts arbitrary nesting, so a
+    crafted config would otherwise take the process down with a
+    RecursionError instead of reading as unreadable.
+    """
+    try:
+        return _build_config(root)
+    except RecursionError:
+        return None
 
 
 def plan_source_root(config_path: Path) -> Path:

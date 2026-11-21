@@ -700,7 +700,7 @@ def test_recorded_config_is_not_planned_twice_from_the_tree(tmp_path):
     shutil.copy(
         FIXTURES / "gofomod-choose-one.xml", tmp_path / "fomod" / "ModuleConfig.xml"
     )
-    plans = _fomod_plans(
+    plans, _warnings = _fomod_plans(
         tmp_path,
         {},
         fomod_configs={
