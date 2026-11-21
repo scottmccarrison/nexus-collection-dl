@@ -72,8 +72,10 @@ class FakeShellService:
     remove_error = None
     status_error = None
     deploy_error = None
+    install_error = None
     # Canned deploy result.
     deploy_result = None
+    install_result = None
 
     def __init__(self, api_key=None, force_free=False):
         self._api_key = api_key
@@ -125,6 +127,17 @@ class FakeShellService:
             raise FakeShellService.remove_error
         return FakeShellService.remove_result
 
+    def install_fomod_picks(self, mods_dir, file_id, picks=None,
+                            on_fomod_prompt=None):
+        FakeShellService.calls.append(
+            {"method": "install_fomod_picks", "mods_dir": mods_dir,
+             "file_id": file_id, "picks": picks,
+             "on_fomod_prompt": on_fomod_prompt}
+        )
+        if FakeShellService.install_error is not None:
+            raise FakeShellService.install_error
+        return FakeShellService.install_result or "Test Mod installed with 1 option choice(s)"
+
     def deploy(self, mods_dir, game_dir=None, prefix=None, use_copy=False,
                on_progress=None):
         FakeShellService.calls.append(
@@ -165,6 +178,8 @@ def shell_env(monkeypatch, tmp_path):
     FakeShellService.status_error = None
     FakeShellService.deploy_error = None
     FakeShellService.deploy_result = None
+    FakeShellService.install_error = None
+    FakeShellService.install_result = None
 
     version_checks = []
     updater_checks = []
@@ -2372,6 +2387,62 @@ def test_deploy_no_at_drain_prompt_skips_flow(shell_env, tmp_path):
     assert code == 0
     assert "Would deploy" not in out
     assert FakeShellService.calls == []
+
+
+def test_drain_offers_fomod_choices_and_installs(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll, outcome="pending_choices", extracted=False)
+
+    code, out, prompts = run_events(FakeShellService(), root, [
+        write_ev,
+        "",      # no-op so the drain fires
+        "yes",   # Choose now?
+        "no",    # the deploy prompt that follows the install
+    ])
+    assert code == 0
+    assert any("1 FOMOD mod in" in p and "need option choices" in p for p in prompts)
+    installs = [c for c in FakeShellService.calls if c["method"] == "install_fomod_picks"]
+    assert len(installs) == 1
+    assert installs[0]["file_id"] == 456
+    # The install landed, so the deploy question follows and the report
+    # says what happened.
+    assert any("Deploy" in p for p in prompts)
+    assert "installed with 1 option choice(s)" in out
+
+
+def test_drain_declining_fomod_choices_installs_nothing(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll, outcome="pending_choices", extracted=False)
+
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",
+        "no",   # Choose now? no
+    ])
+    assert code == 0
+    assert FakeShellService.calls == []
+    assert "Would deploy" not in out
+
+
+def test_drain_fomod_install_failure_reports_and_continues(shell_env, tmp_path):
+    root, coll, _game = _setup_deploy_collection(tmp_path)
+
+    def write_ev():
+        _write_event(coll, outcome="pending_choices", extracted=False)
+
+    FakeShellService.install_error = ValueError("no such FOMOD option: G:Nope")
+    code, out, _ = run_events(FakeShellService(), root, [
+        write_ev,
+        "",
+        "yes",
+    ])
+    assert code == 0
+    assert "no such FOMOD option" in out
+    assert "Would deploy" not in out
 
 
 # --- /deploy command -------------------------------------------------------
