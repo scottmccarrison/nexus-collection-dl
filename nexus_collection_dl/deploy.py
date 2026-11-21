@@ -460,10 +460,9 @@ def _fomod_plans(
             if refusal:
                 warnings.append(
                     f"{label}: the stored FOMOD options could not be read "
-                    f"({refusal}); installing the installer's own defaults"
+                    f"({refusal})"
                 )
-                return {}
-            if stale:
+            elif stale:
                 warnings.append(
                     f"{label}: stored FOMOD options that are not in this "
                     f"installer any more were not used: {', '.join(stale)}"
@@ -472,8 +471,12 @@ def _fomod_plans(
                 return sel
             if stored:
                 stale_note = (
-                    "none of the stored FOMOD options match this installer "
-                    "any more"
+                    "the stored FOMOD options could not be applied"
+                    if refusal
+                    else (
+                        "none of the stored FOMOD options match this "
+                        "installer any more"
+                    )
                 )
         if mod_id is not None and mod_choices.get(mod_id):
             sel = selections_from_manifest(mod_choices[mod_id], config)
@@ -500,8 +503,8 @@ def _fomod_plans(
         for file_id, stored in (fomod_picks or {}).items():
             if fomod_configs and file_id in fomod_configs:
                 continue
-            sel, _stale, _refusal = picks_to_selections_safe(config, stored)
-            if sel:
+            sel, stale, refusal = picks_to_selections_safe(config, stored)
+            if sel and not stale and not refusal:
                 warnings.append(
                     f"{where}: FOMOD options were matched by name from other "
                     "stored choices (this installer has no recorded choices "
@@ -546,6 +549,11 @@ def _fomod_plans(
         member = str(rec.get("member") or "").replace("\\", "/")
         config = load_module_config_text(str(rec.get("xml") or ""))
         if not member or config is None:
+            warnings.append(
+                f"{_label(file_id, member or 'a recorded installer')}: the "
+                "recorded installer config could not be read; its stored "
+                "options cannot be applied"
+            )
             continue
         recorded.add(member.lower())
         plans.append(

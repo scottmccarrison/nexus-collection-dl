@@ -645,3 +645,46 @@ def test_dry_run_and_json_carry_the_same_warnings_as_deploy(tmp_path):
 
     envelope = to_jsonable(result)
     assert envelope["warnings"] == result.warnings
+
+
+def test_guessing_rejects_a_partial_match(tmp_path):
+    """A guess must explain the whole installer, not one coincidental name."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={
+            12: [
+                {"step": "Step1", "group": "G", "option": "OptB"},
+                {"step": "Step1", "group": "G", "option": "Gone"},
+            ]
+        },
+    )
+    assert not plan.data_files
+
+
+def test_a_refused_pick_falls_through_to_the_manifest(tmp_path):
+    """A pick that cannot be read must not erase the collection's own picks."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: [{"step": "", "group": "G", "option": "OptA"}]},
+        fomod_configs={11: _record(xml=AMBIGUOUS_CONFIG)},
+        mod_choices={
+            1: {
+                "type": "fomod",
+                "options": [
+                    {
+                        "name": "Step1",
+                        "groups": [
+                            {"name": "G", "choices": [{"name": "OptA", "idx": 0}]}
+                        ],
+                    }
+                ],
+            }
+        },
+    )
+    deployed = {dest.as_posix() for _src, dest in plan.data_files}
+    assert "thing.esp" in deployed
+    assert any("could not be read" in w for w in plan.warnings)

@@ -324,33 +324,37 @@ def decode_config_text(raw: bytes) -> str | None:
 
     Real configs are UTF-16LE with a BOM; a stored copy keeps this text,
     which parses the same way whether it came from the archive or back
-    out of the state file.
+    out of the state file. The first encoding that decodes AND parses as
+    XML wins: a decode that succeeds can still be the wrong codec (an
+    ASCII-only BOM-less UTF-16 payload decodes as valid UTF-8, and
+    arbitrary even-length bytes decode as UTF-16), so decoding alone
+    would store text nothing can read back.
     """
-    for encoding in _candidate_encodings(raw):
-        try:
-            return raw.decode(encoding)
-        except UnicodeError:
-            continue
-    return None
-
-
-def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
-    """Parse config bytes as XML, trying each likely encoding in turn.
-
-    A decode that succeeds can still be the wrong codec (an ASCII-only
-    BOM-less UTF-16 payload decodes as valid UTF-8), so a parse failure
-    falls through to the next encoding instead of giving up.
-    """
+    first_decoded = None
     for encoding in _candidate_encodings(raw):
         try:
             text = raw.decode(encoding)
         except UnicodeError:
             continue
+        if first_decoded is None:
+            first_decoded = text
         try:
-            return ET.fromstring(text)
+            ET.fromstring(text)
         except ET.ParseError:
             continue
-    return None
+        return text
+    return first_decoded
+
+
+def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
+    """Parse config bytes as XML in whatever encoding they were written."""
+    text = decode_config_text(raw)
+    if text is None:
+        return None
+    try:
+        return ET.fromstring(text)
+    except ET.ParseError:
+        return None
 
 
 def _parse_xml(config_path: Path) -> ET.Element | None:
@@ -573,13 +577,13 @@ def _build_config(root: ET.Element) -> ModuleConfig:
 def load_module_config(config_path: Path) -> ModuleConfig | None:
     """Parse a ``ModuleConfig.xml`` into the full model, or None if unreadable."""
     root = _parse_xml(config_path)
-    return None if root is None else _build_config(root)
+    return None if root is None else _build_config_or_none(root)
 
 
 def load_module_config_bytes(raw: bytes) -> ModuleConfig | None:
     """Parse config bytes straight out of an archive, without extracting it."""
     root = _parse_xml_bytes(raw)
-    return None if root is None else _build_config(root)
+    return None if root is None else _build_config_or_none(root)
 
 
 def load_module_config_text(text: str) -> ModuleConfig | None:
@@ -588,7 +592,20 @@ def load_module_config_text(text: str) -> ModuleConfig | None:
         root = ET.fromstring(text)
     except ET.ParseError:
         return None
-    return _build_config(root)
+    return _build_config_or_none(root)
+
+
+def _build_config_or_none(root: ET.Element) -> ModuleConfig | None:
+    """Build the model, treating a pathologically nested config as unreadable.
+
+    Dependency expressions recurse; expat accepts arbitrary nesting, so a
+    crafted config would otherwise take the process down with a
+    RecursionError instead of reading as unreadable.
+    """
+    try:
+        return _build_config(root)
+    except RecursionError:
+        return None
 
 
 def plan_source_root(config_path: Path) -> Path:

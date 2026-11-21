@@ -150,3 +150,58 @@ def test_normal_archive_still_extracts(tmp_path):
         "Cool Mod/Data/thing.esp",
         "Cool Mod/fomod/ModuleConfig.xml",
     ]
+
+
+def test_archive_cannot_plant_tool_owned_files_below_the_root(tmp_path):
+    """A tool-owned name is reserved at any depth, not just the root.
+
+    scan_collections treats any directory holding .nexus-state.json as a
+    collection, so one planted below the root is just as loadable as one
+    at it.
+    """
+    archive = _make_zip(tmp_path, {"SomeMod/.nexus-state.json": b"forged"})
+    with pytest.raises(ExtractionError):
+        extract_archive(archive, tmp_path / "mods")
+
+
+def test_zip_symlink_member_is_refused_from_any_creator(tmp_path):
+    """Symlink mode in the external attributes is enough to refuse."""
+    archive = tmp_path / "link.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        info = zipfile.ZipInfo("evil")
+        info.create_system = 0
+        info.external_attr = 0o120777 << 16
+        zf.writestr(info, "/etc/passwd")
+    with pytest.raises(ExtractionError):
+        extract_archive(archive, tmp_path / "mods")
+
+
+def test_file_cannot_nest_inside_an_existing_directory(tmp_path):
+    """shutil.move would silently nest and report the wrong path."""
+    mods = tmp_path / "mods"
+    (mods / "Foo").mkdir(parents=True)
+    (mods / "Foo" / "keep.txt").write_text("k")
+    archive = _make_zip(tmp_path, {"Foo": b"file named like a directory"})
+    with pytest.raises(ExtractionError):
+        extract_archive(archive, mods)
+
+
+def test_extract_archive_rejects_writes_outside_staging(tmp_path, monkeypatch):
+    """Anything a tool drops beside staging is removed and refused.
+
+    The system-tool fallbacks take untrusted names; a tool that does not
+    strip `..` writes into the collection tree during extraction, before
+    any name check could run.
+    """
+    archive = _make_zip(tmp_path, {"ok.txt": b"x"})
+    mods = tmp_path / "mods"
+
+    def plant(archive_path: Path, staging: Path) -> list[Path]:
+        (staging.parent / "planted.txt").write_bytes(b"pwned")
+        (staging / "ok.txt").write_bytes(b"x")
+        return []
+
+    monkeypatch.setattr("nexus_collection_dl.extractor._extract_zip", plant)
+    with pytest.raises(ExtractionError):
+        extract_archive(archive, mods)
+    assert not (mods / "planted.txt").exists()

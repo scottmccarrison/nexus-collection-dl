@@ -563,6 +563,7 @@ def deploy(
             mod_choices=manifest_choices,
             fomod_picks=fomod_picks,
             fomod_configs=fomod_configs,
+            mod_names={mod.file_id: mod.name for mod in state.mods.values()},
         )
         if _emit_result(ctx, {
             "dry_run": True,

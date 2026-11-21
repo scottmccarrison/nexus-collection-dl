@@ -154,8 +154,8 @@ def _validate_member_name(archive_name: str, member: str) -> Path:
 
     Member names are untrusted: a crafted archive can name ``../``, an
     absolute path, a drive letter, or a tool-owned ``.nexus-*`` file at
-    the collection root. Backslashes are separators too (Windows writers
-    use them), so they are normalised before anything else.
+    any depth. Backslashes are separators too (Windows writers use
+    them), so they are normalised before anything else.
     """
     normalised = member.replace("\\", "/")
     if not normalised or not normalised.strip():
@@ -173,12 +173,12 @@ def _validate_member_name(archive_name: str, member: str) -> Path:
             f"{archive_name} contains a member with no path ({member}); "
             "refusing to extract it"
         )
-    if ".." in path.parts:
+    if any(part == ".." or part.rstrip(" .") == ".." for part in path.parts):
         raise ExtractionError(
             f"{archive_name} contains a parent-traversal member ({member}); "
             "refusing to extract it"
         )
-    if path.parts[0].lower().startswith(".nexus-"):
+    if any(part.casefold().startswith(".nexus-") for part in path.parts):
         raise ExtractionError(
             f"{archive_name} contains a tool-owned file ({member}); "
             "refusing to extract it"
@@ -205,10 +205,11 @@ def _reject_unsafe_tree_entry(path: Path, staging_dir: Path) -> None:
             f"archive contains a path outside the extraction root "
             f"({path.relative_to(staging_dir)}); refusing to extract it"
         )
-    if path.parent == staging_dir and path.name.lower().startswith(".nexus-"):
+    rel_parts = path.relative_to(staging_dir).parts
+    if any(part.casefold().startswith(".nexus-") for part in rel_parts):
         raise ExtractionError(
-            f"archive contains a tool-owned file ({path.name}); "
-            "refusing to extract it"
+            f"archive contains a tool-owned file "
+            f"({path.relative_to(staging_dir)}); refusing to extract it"
         )
 
 
@@ -224,6 +225,35 @@ def _validate_extracted_tree(staging_dir: Path) -> None:
             _reject_unsafe_tree_entry(Path(root) / name, staging_dir)
 
 
+def _reject_writes_outside_staging(
+    target_dir: Path, staging_dir: Path, before: set[str]
+) -> None:
+    """Refuse an extraction that wrote anywhere in the target but staging.
+
+    A system-tool fallback that does not strip ``..`` member names writes
+    into the collection tree during extraction, before any name check
+    could run. Entries that appeared outside staging are removed and the
+    extraction is refused.
+    """
+    unexpected = [
+        p
+        for p in target_dir.iterdir()
+        if p.name != staging_dir.name and p.name not in before
+    ]
+    if not unexpected:
+        return
+    for p in unexpected:
+        if p.is_symlink() or p.is_file():
+            p.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(p, ignore_errors=True)
+    names = ", ".join(sorted(p.name for p in unexpected))
+    raise ExtractionError(
+        f"extraction wrote outside its staging area ({names}); "
+        "refusing to merge it"
+    )
+
+
 def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
     """Move all files from staging directory to target, preserving structure."""
     moved_files = []
@@ -232,6 +262,13 @@ def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
             continue
         rel = src.relative_to(staging_dir)
         dest = target_dir / rel
+        if dest.is_dir():
+            # shutil.move would nest the file inside the directory and
+            # report the wrong path back to the caller.
+            raise ExtractionError(
+                f"staging file {rel} collides with an existing directory "
+                f"in the target; refusing to merge it"
+            )
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         moved_files.append(dest)
@@ -264,6 +301,7 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         raise ExtractionError(f"Unknown archive type: {archive_path}")
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    target_names_before = {p.name for p in target_dir.iterdir()}
 
     staging_dir: Path | None = None
     try:
@@ -286,6 +324,7 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
 
         # Whatever wrote into staging, nothing unsafe reaches the tree.
         _validate_extracted_tree(staging_dir)
+        _reject_writes_outside_staging(target_dir, staging_dir, target_names_before)
 
         # Move extracted files from staging to target, preserving structure
         final_files = _move_staging_contents(staging_dir, target_dir)
@@ -307,7 +346,7 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
         for info in zf.infolist():
             if info.is_dir():
                 continue
-            if info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16):
+            if stat.S_ISLNK(info.external_attr >> 16):
                 raise ExtractionError(
                     f"{archive_path.name} contains a symlink member "
                     f"({info.filename}); refusing to extract it"
@@ -486,6 +525,7 @@ def find_module_config(archive_path: Path) -> str | None:
 _UNREADABLE_MEMBER_ERRORS = (
     KeyError,
     OSError,
+    RuntimeError,
     zipfile.BadZipFile,
     rarfile.Error,
     py7zr.exceptions.ArchiveError,
