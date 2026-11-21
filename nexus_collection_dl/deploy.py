@@ -201,6 +201,7 @@ class DeploymentPlan:
     data_files: list[tuple[Path, Path]] = field(default_factory=list)
     skipped: list[tuple[Path, str]] = field(default_factory=list)
     source_root: Path | None = None
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def root_destinations(self) -> int:
@@ -368,7 +369,8 @@ def _fomod_plans(
     mod_choices: dict[int, dict],
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
-) -> list[tuple[Path, "InstallPlan | None", tuple[str, ...]]]:
+    mod_names: dict[int, str] | None = None,
+) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...]]], list[str]]:
     """Install plans for every readable ModuleConfig of this tree.
 
     Each plan carries the directory its sources are relative to (the
@@ -407,9 +409,24 @@ def _fomod_plans(
     )
     from .fomod_select import Pick, PickError, picks_to_selections
 
+    warnings: list[str] = []
+
+    def _label(file_id: int | None, where: str) -> str:
+        if file_id is not None and mod_names and mod_names.get(file_id):
+            return str(mod_names[file_id])
+        return where
+
+    def _pick_labels(stored: list[dict]) -> list[str]:
+        return [f"{d.get('group', '')}:{d.get('option', '')}" for d in stored]
+
     def picks_to_selections_safe(
         config: "ModuleConfig", stored: list[dict]
-    ) -> dict:
+    ) -> tuple[dict, list[str]]:
+        """This mod's picks, keeping whatever still matches.
+
+        A pick that no longer names a real option is reported, never
+        allowed to erase the picks that still do.
+        """
         try:
             matched, unmatched = picks_to_selections(
                 [
@@ -423,40 +440,92 @@ def _fomod_plans(
                 config,
             )
         except PickError:
-            return {}
-        return dict(matched) if matched and not unmatched else {}
+            return {}, _pick_labels(stored)
+        return dict(matched), [f"{p.group}:{p.option}" for p in unmatched]
 
     def selections_for(
-        config: "ModuleConfig", file_id: int | None, mod_id: int | None
+        config: "ModuleConfig", file_id: int | None, mod_id: int | None, where: str
     ) -> dict:
         """This mod's own picks first, then its own manifest choices."""
+        label = _label(file_id, where)
+        stale_note = ""
         if file_id is not None and fomod_picks and file_id in fomod_picks:
-            sel = picks_to_selections_safe(config, fomod_picks[file_id])
+            stored = fomod_picks[file_id]
+            sel, stale = picks_to_selections_safe(config, stored)
+            if stale:
+                warnings.append(
+                    f"{label}: stored FOMOD options that are not in this "
+                    f"installer any more were not used: {', '.join(stale)}"
+                )
             if sel:
                 return sel
+            if stored:
+                stale_note = (
+                    "none of the stored FOMOD options match this installer "
+                    "any more"
+                )
         if mod_id is not None and mod_choices.get(mod_id):
             sel = selections_from_manifest(mod_choices[mod_id], config)
             if sel:
+                if stale_note:
+                    warnings.append(
+                        f"{label}: {stale_note}; using the collection "
+                        "manifest's choices"
+                    )
                 return sel
+        if stale_note:
+            warnings.append(
+                f"{label}: {stale_note}; installing the installer's own defaults"
+            )
         return {}
 
-    def selections_guessing(config: "ModuleConfig") -> dict:
-        """Last resort for a config with no recorded identity."""
-        for stored in (fomod_picks or {}).values():
-            sel = picks_to_selections_safe(config, stored)
+    def selections_guessing(config: "ModuleConfig", where: str) -> dict:
+        """Last resort for a config with no recorded identity.
+
+        Only picks and manifest choices no recorded config owns are
+        eligible: a recorded mod's options are never guessed onto another
+        mod's installer. Whatever matches is a guess and says so.
+        """
+        for file_id, stored in (fomod_picks or {}).items():
+            if fomod_configs and file_id in fomod_configs:
+                continue
+            sel, _stale = picks_to_selections_safe(config, stored)
             if sel:
+                warnings.append(
+                    f"{where}: FOMOD options were matched by name from other "
+                    "stored choices (this installer has no recorded choices "
+                    "of its own)"
+                )
                 return sel
-        for choices in mod_choices.values():
+        for mod_id, choices in mod_choices.items():
+            if fomod_configs and any(
+                rec.get("mod_id") == mod_id for rec in fomod_configs.values()
+            ):
+                continue
             matched = selections_from_manifest(choices, config)
             if matched:
+                warnings.append(
+                    f"{where}: FOMOD options were matched by name from other "
+                    "stored choices (this installer has no recorded choices "
+                    "of its own)"
+                )
                 return dict(matched)
         return {}
 
     def plan_entry(
-        source_root: Path, config: "ModuleConfig", selections: dict
+        source_root: Path, config: "ModuleConfig", selections: dict, where: str
     ) -> tuple[Path, "InstallPlan | None", tuple[str, ...]]:
         resolved = resolve_install_plan(config, selections)
         owned = tuple(entry.source.lower() for entry in config.all_entries())
+        if resolved.indeterminate:
+            message = (
+                f"{where}: installer conditions could not be evaluated "
+                "without game state; using the folder-based install"
+            )
+            detail = "; ".join(resolved.notes)
+            if detail:
+                message = f"{message} ({detail})"
+            warnings.append(message)
         return (source_root, None if resolved.indeterminate else resolved, owned)
 
     plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
@@ -472,7 +541,8 @@ def _fomod_plans(
             plan_entry(
                 plan_source_root(mods_dir / member),
                 config,
-                selections_for(config, file_id, rec.get("mod_id")),
+                selections_for(config, file_id, rec.get("mod_id"), member),
+                member,
             )
         )
 
@@ -484,6 +554,7 @@ def _fomod_plans(
             continue
         if rel.as_posix().replace("\\", "/").lower() in recorded:
             continue
+        where = rel.as_posix()
         config = load_module_config(config_path)
         if config is None:
             continue
@@ -491,10 +562,11 @@ def _fomod_plans(
             plan_entry(
                 plan_source_root(config_path),
                 config,
-                selections_guessing(config),
+                selections_guessing(config, where),
+                where,
             )
         )
-    return plans
+    return plans, warnings
 
 
 def _plan_lookup(
@@ -534,6 +606,7 @@ def classify_files(
     mod_choices: dict[int, dict] | None = None,
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
+    mod_names: dict[int, str] | None = None,
 ) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment.
 
@@ -545,12 +618,16 @@ def classify_files(
     collection from planning over each other. Everything else keeps the
     folder heuristics: numbered option wrappers, SFSE version directories,
     and the top-level skip set for mods whose config could not be read.
+    ``mod_names`` (file id to display name) only improves the wording of
+    the plan's warnings.
     """
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
-    fomod_plans = _fomod_plans(mods_dir, mod_choices or {}, fomod_picks, fomod_configs)
+    fomod_plans, plan_warnings = _fomod_plans(
+        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names
+    )
 
-    plan = DeploymentPlan(source_root=mods_dir)
+    plan = DeploymentPlan(source_root=mods_dir, warnings=plan_warnings)
 
     for file_path in sorted(mods_dir.rglob("*")):
         if not file_path.is_file():

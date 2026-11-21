@@ -570,11 +570,14 @@ def deploy(
             "data_files": plan.data_destinations,
             "skipped": len(plan.skipped),
             "total_files": plan.total_files,
+            "warnings": plan.warnings,
         }):
             return
         console.print(f"  Game root files: {plan.root_destinations}")
         console.print(f"  Data files: {plan.data_destinations}")
         console.print(f"  Skipped: {len(plan.skipped)}")
+        for w in plan.warnings:
+            console.print(f"  [yellow]Warning:[/yellow] {w}")
         console.print(f"\n[yellow]Would deploy {plan.total_files} files (dry run).[/yellow]")
         return
 

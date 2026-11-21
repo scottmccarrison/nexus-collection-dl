@@ -2226,7 +2226,11 @@ class ModManagerService:
                 mod_choices=manifest_choices,
                 fomod_picks=fomod_picks,
                 fomod_configs=fomod_configs,
+                mod_names={
+                    mod.file_id: mod.name for mod in state.mods.values()
+                },
             )
+            deploy_warnings.extend(plan.warnings)
 
             if plan.total_files == 0:
                 errors: list[str] = []

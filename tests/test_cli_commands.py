@@ -204,3 +204,55 @@ def test_remove_human_prints_counts(tmp_path):
     r = invoke(["remove", str(tmp_path), "--file-id", "7"])
     assert "Removed 1 mod(s)" in r.output
     assert "something minor" in r.output
+
+
+def test_deploy_dry_run_carries_the_plan_warnings(tmp_path):
+    """Dry run describes the real deployment, warnings included."""
+    from nexus_collection_dl.state import CollectionState
+
+    config = b"""<config>
+      <moduleName>T</moduleName>
+      <installSteps><installStep name="S1">
+        <optionalFileGroups><group name="G" type="SelectExactlyOne">
+          <plugins><plugin name="OptA">
+            <files><file source="a/thing.esp" destination="thing.esp"/></files>
+            <typeDescriptor><type name="Optional"/></typeDescriptor>
+          </plugin></plugins>
+        </group></optionalFileGroups>
+      </installStep></installSteps>
+    </config>"""
+
+    mods = tmp_path / "mods"
+    (mods / "fomod").mkdir(parents=True)
+    (mods / "fomod" / "ModuleConfig.xml").write_bytes(config)
+    (mods / "a").mkdir()
+    (mods / "a" / "thing.esp").write_text("a")
+
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "M",
+            "file_id": 11,
+            "filename": "m.zip",
+            "version": "1",
+            "optional": False,
+            "manual": True,
+        }
+    )
+    state.mods[11].fomod_picks = [{"step": "S1", "group": "G", "option": "Gone"}]
+    state.mods[11].fomod_config = {
+        "member": "fomod/ModuleConfig.xml",
+        "xml": config.decode("utf-8"),
+    }
+    state.save()
+
+    r = invoke(
+        ["deploy", str(mods), "--game-dir", str(tmp_path / "game"), "--dry-run"],
+        json_mode=True,
+    )
+    assert r.exit_code == 0
+    d = json.loads(r.output)
+    assert d["ok"] is True
+    assert any("Gone" in w for w in d["result"]["warnings"])

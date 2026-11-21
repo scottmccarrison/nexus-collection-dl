@@ -387,3 +387,133 @@ def test_add_with_picks_and_no_extract_warns_instead_of_ignoring(tmp_path, monke
     assert result.warnings
     assert "unextracted" in result.warnings[0]
     assert "not used" in result.warnings[0]
+
+
+# ── deploy keeps what still matches and says what it could not ──────────
+
+
+def _tree_with_config(tmp_path: Path) -> Path:
+    mods = tmp_path / "mods"
+    (mods / "fomod").mkdir(parents=True)
+    (mods / "fomod" / "ModuleConfig.xml").write_bytes(CONFIG)
+    (mods / "a").mkdir()
+    (mods / "a" / "thing.esp").write_text("a")
+    (mods / "b").mkdir()
+    (mods / "b" / "thing.esp").write_text("b")
+    return mods
+
+
+def _record(xml: bytes = CONFIG, file_id: int = 11, mod_id: int = 1) -> dict:
+    return {
+        "member": "fomod/ModuleConfig.xml",
+        "xml": xml.decode("utf-8"),
+        "mod_id": mod_id,
+    }
+
+
+def test_deploy_keeps_matched_picks_and_warns_about_the_stale_ones(tmp_path):
+    """One renamed option must not erase the picks that still match."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={
+            11: [
+                {"step": "Step1", "group": "G", "option": "OptB"},
+                {"step": "Step1", "group": "G", "option": "Gone"},
+            ]
+        },
+        fomod_configs={11: _record()},
+    )
+    deployed = {dest.as_posix() for _src, dest in plan.data_files}
+    assert "thing.esp" in deployed
+    skipped = {rel.as_posix(): reason for rel, reason in plan.skipped}
+    assert skipped.get("a/thing.esp") == "not in the FOMOD install plan"
+    assert "Gone" in " ".join(plan.warnings)
+
+
+def test_deploy_warns_when_no_stored_option_matches(tmp_path):
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: [{"step": "Step1", "group": "G", "option": "Gone"}]},
+        fomod_configs={11: _record()},
+    )
+    # Schema defaults for an all-Optional installer install nothing at all;
+    # the point is that this is said out loud instead of reported as success.
+    assert not plan.data_files
+    assert "Gone" in " ".join(plan.warnings)
+
+
+def test_a_recorded_mods_picks_are_never_guessed_onto_another_installer(tmp_path):
+    """A tree config with no record only sees choices nothing owns."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={11: [{"step": "Step1", "group": "G", "option": "OptB"}]},
+        fomod_configs={
+            11: {
+                "member": "other/fomod/ModuleConfig.xml",
+                "xml": CONFIG.decode("utf-8"),
+                "mod_id": 1,
+            }
+        },
+    )
+    # Without the gate, 11's picks would be guessed onto this installer
+    # and OptB's file would deploy; the installer's own defaults apply.
+    assert not plan.data_files
+
+
+def test_guessing_says_it_is_guessing(tmp_path):
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_picks={12: [{"step": "Step1", "group": "G", "option": "OptB"}]},
+    )
+    deployed = {dest.as_posix() for _src, dest in plan.data_files}
+    assert "thing.esp" in deployed
+    assert "by name" in " ".join(plan.warnings)
+
+
+CONDITIONAL_CONFIG = b"""<config>
+  <moduleName>Cond</moduleName>
+  <installSteps>
+    <installStep name="One">
+      <optionalFileGroups>
+        <group name="G" type="SelectAnyNumber">
+          <plugins>
+            <plugin name="OptA">
+              <files><file source="a/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies>
+          <fileDependency file="Some.esp" state="Active"/>
+        </dependencies>
+        <files><file source="b/thing.esp" destination="thing.esp"/></files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>"""
+
+
+def test_an_indeterminate_plan_falls_back_with_a_warning(tmp_path):
+    """A condition that needs game state must say it fell back."""
+    mods = _tree_with_config(tmp_path)
+    plan = classify_files(
+        mods,
+        "skyrimspecialedition",
+        fomod_configs={11: _record(xml=CONDITIONAL_CONFIG)},
+        fomod_picks={11: [{"step": "One", "group": "G", "option": "OptA"}]},
+    )
+    assert any("game state" in w for w in plan.warnings)
