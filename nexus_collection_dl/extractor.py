@@ -1,10 +1,12 @@
 """Archive extraction for mod files."""
 
+import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import py7zr
 import rarfile
@@ -147,6 +149,81 @@ def detect_archive_type_from_url(url: str) -> str | None:
     return None
 
 
+def _validate_member_name(archive_name: str, member: str) -> Path:
+    """Turn an archive member name into a safe path inside staging.
+
+    Member names are untrusted: a crafted archive can name ``../``, an
+    absolute path, a drive letter, or a tool-owned ``.nexus-*`` file at
+    the collection root. Backslashes are separators too (Windows writers
+    use them), so they are normalised before anything else.
+    """
+    normalised = member.replace("\\", "/")
+    if not normalised or not normalised.strip():
+        raise ExtractionError(f"{archive_name} contains an empty member name")
+    if normalised.startswith("/") or (
+        len(normalised) > 1 and normalised[1] == ":"
+    ):
+        raise ExtractionError(
+            f"{archive_name} contains an absolute member path ({member}); "
+            "refusing to extract it"
+        )
+    path = PurePosixPath(normalised)
+    if not path.parts:
+        raise ExtractionError(
+            f"{archive_name} contains a member with no path ({member}); "
+            "refusing to extract it"
+        )
+    if ".." in path.parts:
+        raise ExtractionError(
+            f"{archive_name} contains a parent-traversal member ({member}); "
+            "refusing to extract it"
+        )
+    if path.parts[0].lower().startswith(".nexus-"):
+        raise ExtractionError(
+            f"{archive_name} contains a tool-owned file ({member}); "
+            "refusing to extract it"
+        )
+    return Path(*path.parts)
+
+
+def _reject_unsafe_tree_entry(path: Path, staging_dir: Path) -> None:
+    """Refuse one staged entry that must never reach the collection tree."""
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode):
+        kind = ""
+    else:
+        kind = "non-regular file"
+    if kind:
+        raise ExtractionError(
+            f"archive contains a {kind} ({path.relative_to(staging_dir)}); "
+            "refusing to extract it"
+        )
+    if not path.resolve().is_relative_to(staging_dir.resolve()):
+        raise ExtractionError(
+            f"archive contains a path outside the extraction root "
+            f"({path.relative_to(staging_dir)}); refusing to extract it"
+        )
+    if path.parent == staging_dir and path.name.lower().startswith(".nexus-"):
+        raise ExtractionError(
+            f"archive contains a tool-owned file ({path.name}); "
+            "refusing to extract it"
+        )
+
+
+def _validate_extracted_tree(staging_dir: Path) -> None:
+    """Reject anything that must never reach the collection tree.
+
+    This runs after extraction, so it also covers the system-tool
+    fallbacks (``7z x``, ``unar``, ``unrar x``): they recreate symlinks
+    and their path handling is not ours to rely on.
+    """
+    for root, dirnames, filenames in os.walk(staging_dir, followlinks=False):
+        for name in [*dirnames, *filenames]:
+            _reject_unsafe_tree_entry(Path(root) / name, staging_dir)
+
+
 def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
     """Move all files from staging directory to target, preserving structure."""
     moved_files = []
@@ -207,10 +284,15 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         else:
             pass
 
+        # Whatever wrote into staging, nothing unsafe reaches the tree.
+        _validate_extracted_tree(staging_dir)
+
         # Move extracted files from staging to target, preserving structure
         final_files = _move_staging_contents(staging_dir, target_dir)
         return final_files
 
+    except ExtractionError:
+        raise
     except Exception as e:
         raise ExtractionError(f"Failed to extract {archive_path}: {exception_reason(e)}")
     finally:
@@ -222,12 +304,19 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
     """Extract a ZIP archive, preserving directory structure."""
     extracted = []
     with zipfile.ZipFile(archive_path, "r") as zf:
-        for member in zf.namelist():
-            if member.endswith("/"):
+        for info in zf.infolist():
+            if info.is_dir():
                 continue
-            # ZipFile.extract preserves directory structure
-            dest = zf.extract(member, target_dir)
-            extracted.append(Path(dest))
+            if info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16):
+                raise ExtractionError(
+                    f"{archive_path.name} contains a symlink member "
+                    f"({info.filename}); refusing to extract it"
+                )
+            dest = target_dir / _validate_member_name(archive_path.name, info.filename)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+            extracted.append(dest)
     return extracted
 
 
@@ -236,12 +325,21 @@ def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with py7zr.SevenZipFile(archive_path, "r") as szf:
+            for entry in szf.list():
+                if getattr(entry, "is_symlink", False):
+                    raise ExtractionError(
+                        f"{archive_path.name} contains a symlink member "
+                        f"({entry.filename}); refusing to extract it"
+                    )
+                _validate_member_name(archive_path.name, entry.filename)
             szf.extractall(target_dir)
             for name in szf.getnames():
                 path = target_dir / name
                 if path.is_file():
                     extracted.append(path)
         return extracted
+    except ExtractionError:
+        raise
     except (py7zr.UnsupportedCompressionMethodError, py7zr.Bad7zFile):
         return _extract_7z_system(archive_path, target_dir)
 
@@ -282,12 +380,21 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with rarfile.RarFile(archive_path, "r") as rf:
+            for info in rf.infolist():
+                if info.is_symlink() or getattr(info, "file_redir", None):
+                    raise ExtractionError(
+                        f"{archive_path.name} contains a symlink member "
+                        f"({info.filename}); refusing to extract it"
+                    )
+                _validate_member_name(archive_path.name, info.filename)
             rf.extractall(target_dir)
             for member in rf.namelist():
                 path = target_dir / member
                 if path.is_file():
                     extracted.append(path)
         return extracted
+    except ExtractionError:
+        raise
     # rarfile cannot handle some archives (RAR5, corrupt, or no backend);
     # falling through to unar/unrar is the intended path, so a silent
     # except here is not a swallowed failure worth logging.
