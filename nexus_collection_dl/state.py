@@ -288,6 +288,23 @@ class CollectionState:
             "track_sync_enabled": self.track_sync_enabled,
         }
 
+        # Forward compatibility, not retroactive repair: an older build that
+        # already drops a key cannot be fixed from here. What this does is
+        # keep the next new key from disappearing when someone runs a
+        # slightly older build against the same state file. Known keys
+        # always come from the in-memory object; only keys this version
+        # does not model are carried over from the file on disk.
+        if self.state_file.exists():
+            try:
+                with open(self.state_file) as f:
+                    existing = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict):
+                for key, value in existing.items():
+                    if key not in data:
+                        data[key] = value
+
         # Temp file lives in the same directory as the target so the final
         # os.replace() is guaranteed to stay on one filesystem.
         fd, tmp_name = tempfile.mkstemp(

@@ -3,6 +3,7 @@
 Everything runs against temporary directories; no network access involved.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -129,3 +130,54 @@ def test_lock_is_scoped_per_directory(tmp_path: Path):
     b.mkdir()
     with CollectionLock(a), CollectionLock(b):
         pass  # different collection dirs do not block each other
+
+
+def test_save_preserves_unknown_top_level_keys(tmp_path: Path):
+    """A top-level key this version does not model must survive a save.
+
+    Forward compatibility, not retroactive repair: an older build that
+    already drops a key cannot be fixed from here. What this pins is that
+    once save() is a merge over the file rather than a rewrite from known
+    fields, the next new key does not disappear when someone runs a
+    slightly older build against the same state file.
+    """
+    mods = tmp_path / "mods"
+    state = _make_state(mods)
+    state.save()
+
+    path = mods / state_module.STATE_FILENAME
+    data = json.loads(path.read_text())
+    data["future_feature"] = {"enabled": True}
+    path.write_text(json.dumps(data, indent=2))
+
+    loaded = CollectionState(mods)
+    loaded.load()
+    loaded.save()
+
+    after = json.loads(path.read_text())
+    assert after.get("future_feature") == {"enabled": True}
+
+
+def test_save_still_writes_known_keys_over_stale_ones(tmp_path: Path):
+    """Preserving unknowns must not preserve stale known values."""
+    mods = tmp_path / "mods"
+    state = _make_state(mods)
+    state.save()
+
+    path = mods / state_module.STATE_FILENAME
+    data = json.loads(path.read_text())
+    data["collection_name"] = "Stale Name"
+    data["future_feature"] = 1
+    path.write_text(json.dumps(data, indent=2))
+
+    loaded = CollectionState(mods)
+    loaded.load()
+    # The known value is whatever the in-memory object says, not the
+    # stale bytes in the file: mutate after load to prove save() takes
+    # known keys from the object and only unknowns from the file.
+    loaded.collection_name = "Renamed In Memory"
+    loaded.save()
+
+    after = json.loads(path.read_text())
+    assert after["collection_name"] == "Renamed In Memory"
+    assert after["future_feature"] == 1
