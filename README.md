@@ -226,7 +226,7 @@ nexus-dl handler install
 
 Now click **Mod manager download** once on any mod file page for that game:
 
-- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
+- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready. A FOMOD mod (one with an installer) is kept unextracted and reported as "waiting for option choices" - the notification names the `import --fomod-option` command that finishes it.
 - Clicking again for the same file re-downloads and re-verifies it: the default flow deletes the archive after extracting, so there is nothing left to dedupe against. A re-click with a retained verified archive triggers no download: an entry already marked downloaded (for example with `--no-extract`) reports "already downloaded" with zero network calls, and an entry whose extraction previously failed finishes extracting from the retained archive (no file download; with track-sync enabled a background tracked-mod sync may still make API calls). Every click also appends a redacted line to `~/.local/state/nexus-dl/nxm.log`.
 - `nexus-dl handler uninstall` removes the desktop entry and restores the app that handled nxm:// links before, when one was recorded and nexus-dl is still the default.
 
@@ -470,9 +470,10 @@ This handles BG3, Cyberpunk, and every other game. Since non-Bethesda games don'
 
 In addition to `load-order.txt`, Bethesda collections also get:
 
-**`plugins.txt`** - Plugin-level load order for `.esp`/`.esm`/`.esl` files. Two sources:
-1. **Collection metadata** - The collection author's intended plugin order (always available)
+**`plugins.txt`** - Plugin-level load order for `.esp`/`.esm`/`.esl` files. Three sources, in priority order:
+1. **Collection metadata** - The collection author's intended plugin order (when the manifest carries one)
 2. **LOOT sorting** - Automatic sorting via [libloot](https://github.com/loot/libloot) using master dependency analysis + community masterlists (when libloot is installed)
+3. **Deployed files** - When neither of the above produces a plugin list (community collections often omit manifest plugin data), the deploy generates one from the `.esp`/`.esm`/`.esl` files it actually placed in the game directory. Entries carry `*` prefixes (Skyrim's enabled marker).
 
 When libloot is available, LOOT-sorted order takes priority over collection metadata. Enabled/disabled status from the collection is preserved either way.
 

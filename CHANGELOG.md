@@ -265,6 +265,9 @@ deliberately not in this release.
 - **No field use** (see the top). Specifically unverified: free-account
   downloads (the API download path needs a premium key), Windows, and the
   browser click chain end to end.
+- The `mods` table shows download status but not stored FOMOD picks. The
+  picks are in the state file and drive the deploy plan; the table just
+  does not surface them yet.
 - `deploy` has no confirmation of any kind, on purpose: the shell's `/deploy`
   is the only confirm and nothing is ever deployed automatically. A harness
   driving the CLI deploys non-interactively and that is the intended path.
