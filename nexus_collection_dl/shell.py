@@ -901,6 +901,11 @@ class _ShellSession:
                 coll_dir, file_id, on_fomod_prompt=ask
             )
         except Exception as e:
+            from .fomod_select import PickAborted
+
+            if isinstance(e, PickAborted):
+                self._emit(f"  '{mod_name}' left pending; nothing installed.")
+                return False
             self._emit_failure(f"'{mod_name}': {_safe_text(str(e))}")
             return False
         self._emit(f"  {_safe_text(report)}")

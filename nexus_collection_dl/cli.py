@@ -699,10 +699,20 @@ class _ClickAsker:
         click.echo(text)
 
     def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None:
-        return _ask_int(prompt, count, allow_none=allow_none)
+        try:
+            return _ask_int(prompt, count, allow_none=allow_none)
+        except (KeyboardInterrupt, EOFError):
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
 
     def choose_many(self, prompt: str, count: int, at_least_one: bool) -> list[int]:
-        return _ask_many(prompt, count, at_least_one=at_least_one)
+        try:
+            return _ask_many(prompt, count, at_least_one=at_least_one)
+        except (KeyboardInterrupt, EOFError):
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
 
 
 def _fomod_prompt(config: Any, archive_name: str, kept: Any) -> list[Any]:
@@ -795,6 +805,13 @@ def add(
         )
     except (NexusAPIError, ModParseError, StateError, ExtractionError, PickError) as e:
         _fail(ctx, e)
+    except Exception as e:
+        from .fomod_select import PickAborted
+
+        if isinstance(e, PickAborted):
+            console.print("[yellow]Cancelled; nothing installed.[/yellow]")
+            sys.exit(1)
+        raise
 
     if not result.success:
         _fail(
@@ -900,6 +917,13 @@ def import_cmd(
         )
     except (StateError, ExtractionError, PickError) as e:
         _fail(ctx, e)
+    except Exception as e:
+        from .fomod_select import PickAborted
+
+        if isinstance(e, PickAborted):
+            console.print("[yellow]Cancelled; nothing installed.[/yellow]")
+            sys.exit(1)
+        raise
 
     if _emit_result(ctx, result):
         return
