@@ -473,17 +473,17 @@ def test_guarded_probe_failure_renders_one_error_line_and_keeps_the_rest():
     labels = [c.label for c in checks]
     assert "API key" in labels
     assert "State locks" in labels
-    # All six checks are present even with one failing.
-    assert len(checks) == 6
+    # All seven checks are present even with one failing.
+    assert len(checks) == 7
 
 
-def test_collect_health_returns_all_six_checks_in_order():
+def test_collect_health_returns_all_seven_checks_in_order():
     labels = [c.label for c in run_checks(probes=fake_probes(
         notification_setting=lambda: CINNAMON,
         notifications_enabled=lambda: True,
     ))]
     assert labels == [
-        "API key", "nxm handler", "Notifications",
+        "User config", "API key", "nxm handler", "Notifications",
         "Desktop tools", "State files", "State locks",
     ]
 
