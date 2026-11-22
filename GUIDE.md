@@ -333,7 +333,7 @@ You only need to specify `--game-dir` once. The tool remembers it for future dep
 
 ### What "deploying" actually does
 
-The tool creates **symlinks** (shortcuts) from your mod staging directory into the game's install directory. The original mod files stay in `~/mods/bg3`, but the game sees them as if they're in its own folder.
+The tool creates **symlinks** (shortcuts) from your mod staging directory into the game's install directory. The original mod files stay in `~/mods/bg3`, but the game sees them as if they're in its own folder. Proton/Wine games always get real copies instead: the game cannot read through Linux symlinks that cross outside the Wine prefix.
 
 This means:
 - Mod files aren't duplicated (saves disk space)

@@ -158,7 +158,7 @@ nexus-dl deploy ~/mods/starfield --copy
 nexus-dl deploy ~/mods/starfield --dry-run
 ```
 
-Creates symlinks (or copies) from your staging directory into the game's install directory. For Bethesda games on Proton, it also writes `plugins.txt` and `StarfieldCustom.ini` (or equivalent) to the correct Wine prefix paths.
+Creates symlinks (or copies) from your staging directory into the game's install directory. For Bethesda games on Proton, it also writes `plugins.txt` and `StarfieldCustom.ini` (or equivalent) to the correct Wine prefix paths. Proton games always use copy mode: the game cannot read through Linux symlinks that cross outside the Wine prefix.
 
 `--game-dir` and `--prefix` are saved after the first deploy, so subsequent runs only need `nexus-dl deploy ~/mods/starfield`.
 
