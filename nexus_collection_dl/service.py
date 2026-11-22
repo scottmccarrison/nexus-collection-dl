@@ -2183,11 +2183,24 @@ class ModManagerService:
             if prefix is None:
                 prefix = find_proton_prefix(game_domain)
 
-            # Pre-deploy validation
+            # Pre-deploy validation.
+            #
+            # Proton/Wine cannot read Linux symlinks that cross outside
+            # the prefix, so a symlink deploy to a Proton game produces
+            # files the game sees by name but cannot load. Force copy
+            # mode whenever a Proton prefix is in play.
             method = "copy" if use_copy else "symlink"
+            proton_symlink_override = method == "symlink" and prefix
+            if proton_symlink_override:
+                method = "copy"
             check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
             deploy_warnings = [w.message for w in check_warnings]
             deploy_warnings.extend(reports)
+            if proton_symlink_override:
+                deploy_warnings.append(
+                    "Using copy mode: Proton games cannot read symlinks "
+                    "through the Wine prefix."
+                )
 
             # Block on errors
             errors_found = [w for w in check_warnings if w.severity == "error"]

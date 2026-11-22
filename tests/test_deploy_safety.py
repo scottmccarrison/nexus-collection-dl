@@ -839,7 +839,7 @@ def test_service_deploy_undeploy_full_cycle(svc, tmp_path):
     assert not result.errors
 
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()  # copy mode: Proton cannot follow symlinks
     ini_path = get_game_ini_path(prefix, DOMAIN)
     assert ini_path.exists()
     ini_text = ini_path.read_text()
@@ -964,13 +964,13 @@ def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkey
     assert state.deployed_files == []
     assert (mods / ".nexus-journal.jsonl").exists()
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()
 
     # Next deploy recovers ownership from the journal, removes the old
     # deployment safely, and redeploys.
     result = svc.deploy(mods, game_dir=game)
     assert result.deployed_count == 1, result.errors
-    assert dest.is_symlink()
+    assert dest.is_file()
     state = CollectionState(mods)
     state.load()
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
@@ -991,7 +991,7 @@ def test_service_nothing_to_deploy_keeps_existing_deployment(svc, tmp_path):
     assert result2.deployed_count == 0
     assert any("left in place" in e for e in result2.errors)
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()  # still deployed
+    assert dest.is_file()  # still deployed
     state = CollectionState(mods)
     state.load()
     assert state.deployed_files  # ownership retained
@@ -1161,7 +1161,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
     monkeypatch.setattr(os, "replace", real_replace)
 
     # Failed run: error surfaced, destination untouched, journal NOT cleared
-    assert result.errors and any(str(orig_b) in e for e in result.errors)
+    assert result.errors and any("other.esp" in e for e in result.errors)
     assert orig_b.read_bytes() == b"USER ORIGINAL B"
     assert (mods / ".nexus-journal.jsonl").exists()
     state = CollectionState(mods)
@@ -1201,7 +1201,7 @@ def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeyp
 
     assert not result.errors, result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()
     state = CollectionState(mods)
     state.load()
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
@@ -1437,3 +1437,74 @@ def test_conflict_messages_name_the_source_paths(env):
     (msg,) = result.conflicts
     assert "01 TBBP/meshes/actors/x.nif" in msg, msg
     assert "02 HDT/meshes/actors/x.nif" in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# Gate findings: Proton symlink override, plugins.txt generation
+# ---------------------------------------------------------------------------
+
+
+def test_proton_deploy_forces_copy_mode(svc, tmp_path):
+    """Symlinks are not readable through the Wine prefix.  When a Proton
+    prefix is in play, the deploy must use copy mode even when the caller
+    did not ask for it, and say so in the warnings."""
+    mods, game, _prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    dest = game / "Data" / "ModA" / "plugin.esp"
+    assert dest.is_file()
+    assert not dest.is_symlink()
+    assert any("copy mode" in w.lower() for w in result.warnings)
+
+
+def test_no_prefix_deploy_still_uses_symlinks(svc, tmp_path, monkeypatch):
+    """A native-Linux deploy (no Proton prefix) keeps the symlink default."""
+    monkeypatch.setattr(
+        "nexus_collection_dl.service.find_proton_prefix", lambda d: None
+    )
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    game = tmp_path / "game"
+    game.mkdir()
+    (mods / "ModA").mkdir()
+    (mods / "ModA" / "plugin.esp").write_bytes(b"esp")
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/skyrimspecialedition/collections/test",
+        "Test Collection", 1, DOMAIN,
+    )
+    state.game_dir = str(game)
+    state.save()
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    dest = game / "Data" / "ModA" / "plugin.esp"
+    assert dest.is_symlink()
+
+
+def test_plugins_txt_generated_from_mod_files_when_manifest_empty(tmp_path):
+    """When the collection manifest carries no plugin list, plugins.txt is
+    built from the mod files that are themselves plugins (.esp/.esm/.esl),
+    with Skyrim-style * prefixes marking them enabled."""
+    from nexus_collection_dl.loadorder import LoadOrderGenerator
+    from nexus_collection_dl.manifest import CollectionManifest
+
+    manifest = CollectionManifest.from_dict({
+        "name": "Test",
+        "game_domain": "skyrimspecialedition",
+        "mods": [],
+    })
+    mods = [
+        {"mod_id": 1, "file_id": 10, "mod_name": "A", "filename": "A.esp", "optional": False},
+        {"mod_id": 2, "file_id": 20, "mod_name": "B", "filename": "B.esm", "optional": False},
+        {"mod_id": 3, "file_id": 30, "mod_name": "C", "filename": "C.zip", "optional": False},
+        {"mod_id": 4, "file_id": 40, "mod_name": "D", "filename": "D.esl", "optional": False},
+    ]
+    gen = LoadOrderGenerator(manifest, mods, {}, "skyrimspecialedition")
+    out = tmp_path / "out"
+    out.mkdir()
+    gen.generate(out)
+    plugins_text = (out / "plugins.txt").read_text()
+    assert "*A.esp" in plugins_text
+    assert "*B.esm" in plugins_text
+    assert "*D.esl" in plugins_text
+    assert "C.zip" not in plugins_text  # not a plugin

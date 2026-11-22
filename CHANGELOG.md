@@ -204,6 +204,18 @@ deliberately not in this release.
   choices (or for its download to finish, for `pending_download`) and names
   the command to finish it, and the log records `warn` with the pending
   reason instead of `error`.
+- Deploying to a Proton/Wine game now uses copy mode automatically. Symlinked
+  files in the game's `Data/` directory are visible to the game by name but
+  the game cannot read through Linux symlinks that cross outside the Wine
+  prefix, so the plugins loaded as empty shells and modded content never
+  appeared. Real files work. A deploy to a Proton prefix says so in its
+  warnings; native-Linux deploys are unchanged.
+- `plugins.txt` is generated from the deployed plugin files (`.esp`/`.esm`/
+  `.esl`) when the collection manifest carries no plugin list, instead of
+  producing a comment-only file. Skyrim SE requires `*` prefixes to mark
+  plugins enabled; entries are written with them. Without this, the game
+  auto-detected plugins but left them disabled and modded content never
+  loaded.
 - Deploy keeps the stored FOMOD options that still match instead of dropping
   all of them when one is stale. One renamed option after a mod update used to
   erase every pick, install the installer's defaults (nothing at all for an
