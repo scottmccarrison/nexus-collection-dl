@@ -583,16 +583,39 @@ def deploy(
         return
 
     svc = ctx.obj["service"]
+    from .progress import ProgressLine
+
+    json_mode = _is_json(ctx)
+    # The write loop is the long silent phase of a deploy. One moving
+    # line, suppressed entirely under --json where the output is parsed.
+    line = ProgressLine(total=0, label="Deploying", enabled=not json_mode)
+
+    def on_file_progress(done: int, total: int, detail: str) -> None:
+        line.total = total
+        line.update(done, detail)
+
+    def on_progress(event: str, pct: float, msg: str) -> None:
+        if event == "deploy":
+            # The per-file calls drive the line, so a coarse deploy
+            # message would fight it for the same row. The line says what
+            # the banner said and more: where the loop is right now.
+            return
+        line.close()
+        _cli_progress(event, pct, msg)
+
     try:
         result = svc.deploy(
             mods_dir,
             game_dir=game_dir,
             prefix=prefix,
             use_copy=use_copy,
-            on_progress=_cli_progress,
+            on_progress=on_progress,
+            on_file_progress=on_file_progress,
         )
     except (StateError, NexusAPIError, DeployError) as e:
+        line.close()
         _fail(ctx, e)
+    line.close()
 
     if _emit_result(ctx, result):
         return

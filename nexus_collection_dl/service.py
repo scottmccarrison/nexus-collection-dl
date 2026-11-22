@@ -2127,6 +2127,7 @@ class ModManagerService:
         prefix: Path | None = None,
         use_copy: bool = False,
         on_progress: ProgressCallback | None = None,
+        on_file_progress: "Callable[[int, int, str], None] | None" = None,
     ) -> DeployResult:
         """Deploy mods from staging to game directory.
 
@@ -2136,6 +2137,11 @@ class ModManagerService:
         overwritten. The previous deployment is removed safely first; if any
         old entry cannot be safely removed, the redeploy stops and the
         remaining entries stay in state for retry.
+
+        ``on_file_progress(done, total, detail)`` fires once per file in
+        the write loop. It is separate from ``on_progress`` because the
+        loop is the long silent phase and a caller rendering a progress
+        line needs the raw counts, not a pre-baked message.
         """
         progress = on_progress or _noop_progress
 
@@ -2290,9 +2296,19 @@ class ModManagerService:
 
             # Deploy
             progress("deploy", 0.3, f"Deploying {plan.total_files} files via {method}...")
+
+            def _file_progress(done: int, total: int, detail: str) -> None:
+                if on_file_progress is not None:
+                    on_file_progress(done, total, detail)
+                # The write loop is the long silent phase; 0.3 to 1.0 is
+                # the span left after classify/undeploy.
+                frac = (done / total) if total else 1.0
+                progress("deploy", 0.3 + 0.7 * frac, detail)
+
             result = deploy_files(
                 plan, game_dir, method=method, dry_run=False,
                 backups=backups, journal=journal, ownership=ownership,
+                on_progress=_file_progress,
             )
 
             # Write plugins.txt and the game INI through the same tracking,
