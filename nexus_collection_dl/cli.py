@@ -62,7 +62,7 @@ console = Console()
 _QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option(
     "--api-key",
     envvar="NEXUS_API_KEY",
@@ -165,6 +165,62 @@ def main(
     if not skip_update_check and not quiet:
         from .updater import check_and_prompt_update
         check_and_prompt_update(console)
+
+    if ctx.invoked_subcommand is None:
+        _handle_bare_invocation(ctx, json_mode)
+
+
+def _is_interactive() -> bool:
+    """Can this run a REPL?
+
+    Both streams have to be terminals. A pipe on either side means this
+    is a script, a capture, or CI, not a person typing, and a REPL is
+    not a thing to drop into any of those.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _handle_bare_invocation(ctx: click.Context, json_mode: bool) -> None:
+    """What bare `nexus-dl` does. The front door.
+
+    Three shapes. The middle one is why this is careful:
+
+    - Interactive and configured: the shell is the default seat now.
+    - Not interactive: usage and out. Never a REPL, never a prompt.
+    - Interactive but unconfigured: say so. The setup wizard boots here
+      once it exists; until then a message beats a REPL with no root.
+    """
+    from .config import UserConfig
+
+    if json_mode:
+        # stdout is parsed output; an interactive shell cannot be the
+        # answer to it. Same reason `--json` refuses `shell` and `nxm`.
+        raise click.UsageError(
+            "--json needs a command: bare invocation is interactive and "
+            "this output is meant to be parsed"
+        )
+    if not _is_interactive():
+        # The guard. A script calling bare nexus-dl gets usage, not a REPL.
+        console.print(ctx.get_help())
+        return
+
+    cfg = UserConfig.load()
+    if not cfg.is_configured():
+        console.print("[yellow]First run.[/yellow] nexus-dl is not configured yet.")
+        console.print(
+            "It needs a collections root: the directory collection folders "
+            "live under. Until that is set there is nothing for the shell "
+            "to show."
+        )
+        return
+
+    from .shell import run_shell
+
+    svc = ctx.obj["service"]
+    sys.exit(run_shell(svc, Path(cfg.collections_root), console=console))
 
 
 def _is_json(ctx: click.Context) -> bool:
