@@ -34,8 +34,10 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 __all__ = [
+    "MAX_CONFIG_BYTES",
     "AllOf",
     "AnyOf",
+    "ConfigTooLargeError",
     "FileDependency",
     "FileEntry",
     "FlagDependency",
@@ -51,10 +53,30 @@ __all__ = [
     "Pattern",
     "load_module_config",
     "load_module_config_bytes",
+    "load_module_config_text",
     "plan_source_root",
     "resolve_install_plan",
     "selections_from_manifest",
 ]
+
+
+# An installer config is third-party bytes from a download. Observed real
+# configs run from a few KB to about 60KB, so 512KiB is generous headroom
+# while still bounding the parse. Anything past it is refused before the
+# XML parser sees it.
+MAX_CONFIG_BYTES = 512 * 1024
+
+
+class ConfigTooLargeError(ValueError):
+    """An installer config exceeded ``MAX_CONFIG_BYTES`` and was refused."""
+
+
+def _enforce_config_budget(size: int, source: str) -> None:
+    if size > MAX_CONFIG_BYTES:
+        raise ConfigTooLargeError(
+            f"{source} is {size} bytes, over the {MAX_CONFIG_BYTES} byte "
+            f"installer-config limit; refusing to parse it"
+        )
 
 
 # ── Conditions ──────────────────────────────────────────────────────────
@@ -348,6 +370,7 @@ def decode_config_text(raw: bytes) -> str | None:
 
 def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
     """Parse config bytes as XML in whatever encoding they were written."""
+    _enforce_config_budget(len(raw), "Installer config")
     text = decode_config_text(raw)
     if text is None:
         return None
@@ -359,6 +382,9 @@ def _parse_xml_bytes(raw: bytes) -> ET.Element | None:
 
 def _parse_xml(config_path: Path) -> ET.Element | None:
     try:
+        # Budget the on-disk size before reading, so a huge file is never
+        # pulled into memory just to be refused.
+        _enforce_config_budget(config_path.stat().st_size, "Installer config")
         return _parse_xml_bytes(config_path.read_bytes())
     except OSError:
         return None
@@ -588,6 +614,7 @@ def load_module_config_bytes(raw: bytes) -> ModuleConfig | None:
 
 def load_module_config_text(text: str) -> ModuleConfig | None:
     """Parse a config's decoded text, the form a stored copy keeps."""
+    _enforce_config_budget(len(text), "Installer config")
     try:
         root = ET.fromstring(text)
     except ET.ParseError:

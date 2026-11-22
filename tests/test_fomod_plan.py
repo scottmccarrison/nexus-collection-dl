@@ -818,3 +818,42 @@ def test_mod_state_round_trips_the_recorded_config():
     old = mod.to_dict()
     del old["fomod_config"]
     assert ModState.from_dict(1, old).fomod_config is None
+
+
+def test_oversized_module_config_is_refused():
+    """An installer config past the byte budget is refused, not parsed.
+
+    Resource exhaustion from an untrusted archive: the XML is attacker
+    controlled and comes out of a third-party download.
+    """
+    import pytest
+
+    from nexus_collection_dl.fomod_plan import (
+        MAX_CONFIG_BYTES,
+        ConfigTooLargeError,
+        load_module_config_bytes,
+        load_module_config_text,
+    )
+
+    over = b"<fomod>" + (b"x" * (MAX_CONFIG_BYTES + 1)) + b"</fomod>"
+    with pytest.raises(ConfigTooLargeError) as exc:
+        load_module_config_bytes(over)
+    message = str(exc.value)
+    assert str(MAX_CONFIG_BYTES) in message or "size" in message.lower()
+
+    with pytest.raises(ConfigTooLargeError):
+        load_module_config_text(over.decode("ascii"))
+
+
+def test_config_within_budget_still_parses():
+    """The cap must not refuse a real installer."""
+    from nexus_collection_dl.fomod_plan import (
+        MAX_CONFIG_BYTES,
+        load_module_config_bytes,
+    )
+
+    assert MAX_CONFIG_BYTES >= 512 * 1024, "budget must fit real installers"
+    xml = b"<fomod><name>ok</name></fomod>"
+    # Unreadable as a full config is fine (returns None); what matters is
+    # that a small config is not refused for size.
+    load_module_config_bytes(xml)

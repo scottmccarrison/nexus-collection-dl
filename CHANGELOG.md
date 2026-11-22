@@ -282,8 +282,7 @@ deliberately not in this release.
   no size cap before parsing and archive extraction has no decompression size
   cap; name pre-validation for the system-tool extraction fallbacks; error-text scrubbing has no diagnostic escape for
   a maintainer reading a bug report; the removed `serve` command reports
-  "command not found" rather than a deprecation stub; the staging/game-dir
-  overlap guard compares path strings rather than resolved paths; the legacy
+  "command not found" rather than a deprecation stub; the legacy
   tree scan and the archive marker check disagree on how deep a
   `ModuleConfig.xml` may live.
 - Upgrading from 0.3.0: state files load unchanged. Installers extracted

@@ -1530,3 +1530,101 @@ def test_deploy_generates_plugins_txt_from_deployed_files(svc, tmp_path):
     assert "*HSPlayerHomes - Breezehome.esp" in plugins_text
     assert "*HSResources.esl" in plugins_text
     assert "texture.dds" not in plugins_text
+
+
+def test_overlap_guard_resolves_symlink_staging_to_game(tmp_path):
+    """Staging that resolves to the game dir is the same path.
+
+    The overlap guard must compare resolved paths, or a staging directory
+    reached through a symlink deploys over the tree it extracts from.
+    """
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    alias = tmp_path / "mods-alias"
+    alias.symlink_to(game)
+
+    message = _validate_no_overlap(alias, game)
+    assert message is not None
+    assert "same path" in message
+
+
+def test_overlap_guard_resolves_dotdot_staging_into_game(tmp_path):
+    """A `..`-spelled staging path that names the game dir is the same path."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    inner = game / "sub"
+    inner.mkdir()
+
+    message = _validate_no_overlap(inner / "..", game)
+    assert message is not None
+    assert "same path" in message
+
+
+def test_overlap_guard_resolves_symlinked_parent_containment(tmp_path):
+    """Containment holds through a symlinked parent, not just for equals."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    root = tmp_path / "root"
+    root.mkdir()
+    game = root / "game"
+    game.mkdir()
+    staging = game / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+
+    message = _validate_no_overlap(staging, alias)
+    assert message is not None
+    assert "inside the game directory" in message
+
+
+def test_overlap_guard_allows_genuinely_separate_dirs(tmp_path):
+    """Resolving must not manufacture an overlap that is not there."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    staging = tmp_path / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+
+    assert _validate_no_overlap(staging, alias) is None
+
+
+def test_service_allows_deploy_through_symlinked_game_dir(svc, tmp_path):
+    """A symlinked game dir with genuinely separate staging must deploy.
+
+    Resolving paths must not manufacture an overlap that is not there:
+    staging elsewhere, game reached through a link, is a normal deploy.
+    """
+    mods, game, _prefix = _svc_env(tmp_path)
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+    result = svc.deploy(mods, game_dir=alias)
+    assert result.errors == [], result.errors
+    assert result.deployed_count == 1
+
+
+def test_service_rejects_staging_inside_symlinked_game(svc, tmp_path):
+    """Containment holds through a symlinked parent, not just for equals."""
+    root = tmp_path / "root"
+    root.mkdir()
+    game = root / "game"
+    game.mkdir()
+    staging = game / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+    state = CollectionState(staging)
+    state.set_collection_info("https://x/y", "T", 1, DOMAIN)
+    state.game_dir = str(alias)
+    state.save()
+    (staging / "a.esp").write_bytes(b"x")
+    result = svc.deploy(staging, game_dir=alias)
+    assert result.deployed_count == 0
+    assert result.errors, result.errors

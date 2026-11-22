@@ -82,6 +82,46 @@ class FomodUnreadableError(ExtractionError):
         )
 
 
+# Extraction ceiling. Mod archives run large (a big modpack can be tens of
+# GB) but a small archive must not expand without bound: the input is a
+# third-party download. 4GiB is far above any single mod and far below a
+# disk. Tests raise the cap by monkeypatching, which is why it is a module
+# global and not an argument threaded through every extractor.
+MAX_EXTRACTED_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def _enforce_size_budget(declared_total: int, archive_name: str) -> None:
+    """Refuse an archive whose declared uncompressed size exceeds the cap.
+
+    Header-declared sizes are cheap and catch the ordinary bomb before a
+    byte is written. Lying headers are caught by _check_staging_size after
+    the fact.
+    """
+    if declared_total > MAX_EXTRACTED_BYTES:
+        raise ExtractionError(
+            f"{archive_name} declares {declared_total} uncompressed bytes, "
+            f"over the {MAX_EXTRACTED_BYTES} byte extraction limit; refusing"
+        )
+
+
+def _check_staging_size(staging_dir: Path, archive_name: str) -> None:
+    """Refuse when what landed in staging exceeds the cap.
+
+    The backstop for every path, including the system-tool fallbacks
+    (``7z x``, ``unar``, ``unrar``) where writes cannot be intercepted,
+    and for archives whose headers understate the real size.
+    """
+    total = 0
+    for path in staging_dir.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            total += path.stat().st_size
+            if total > MAX_EXTRACTED_BYTES:
+                raise ExtractionError(
+                    f"{archive_name} expanded past the {MAX_EXTRACTED_BYTES} "
+                    f"byte extraction limit; refusing"
+                )
+
+
 def sniff_archive_magic(filepath: Path) -> str | None:
     """Detect archive type by magic bytes alone.
 
@@ -322,6 +362,10 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         else:
             pass
 
+        # Backstop for every path: the system-tool fallbacks cannot
+        # intercept writes, and headers can understate the real size.
+        _check_staging_size(staging_dir, archive_path.name)
+
         # Whatever wrote into staging, nothing unsafe reaches the tree.
         _validate_extracted_tree(staging_dir)
         _reject_writes_outside_staging(target_dir, staging_dir, target_names_before)
@@ -343,6 +387,7 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
     """Extract a ZIP archive, preserving directory structure."""
     extracted = []
     with zipfile.ZipFile(archive_path, "r") as zf:
+        declared = 0
         for info in zf.infolist():
             if info.is_dir():
                 continue
@@ -351,6 +396,12 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
                     f"{archive_path.name} contains a symlink member "
                     f"({info.filename}); refusing to extract it"
                 )
+            _validate_member_name(archive_path.name, info.filename)
+            declared += info.file_size
+        _enforce_size_budget(declared, archive_path.name)
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
             dest = target_dir / _validate_member_name(archive_path.name, info.filename)
             dest.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(dest, "wb") as out:
@@ -364,6 +415,7 @@ def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with py7zr.SevenZipFile(archive_path, "r") as szf:
+            declared = 0
             for entry in szf.list():
                 if getattr(entry, "is_symlink", False):
                     raise ExtractionError(
@@ -371,6 +423,8 @@ def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
                         f"({entry.filename}); refusing to extract it"
                     )
                 _validate_member_name(archive_path.name, entry.filename)
+                declared += int(getattr(entry, "uncompressed", 0) or 0)
+            _enforce_size_budget(declared, archive_path.name)
             szf.extractall(target_dir)
             for name in szf.getnames():
                 path = target_dir / name
@@ -419,6 +473,7 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with rarfile.RarFile(archive_path, "r") as rf:
+            declared = 0
             for info in rf.infolist():
                 if info.is_symlink() or getattr(info, "file_redir", None):
                     raise ExtractionError(
@@ -426,6 +481,8 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
                         f"({info.filename}); refusing to extract it"
                     )
                 _validate_member_name(archive_path.name, info.filename)
+                declared += int(getattr(info, "file_size", 0) or 0)
+            _enforce_size_budget(declared, archive_path.name)
             rf.extractall(target_dir)
             for member in rf.namelist():
                 path = target_dir / member

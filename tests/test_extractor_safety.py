@@ -205,3 +205,36 @@ def test_extract_archive_rejects_writes_outside_staging(tmp_path, monkeypatch):
     with pytest.raises(ExtractionError):
         extract_archive(archive, mods)
     assert not (mods / "planted.txt").exists()
+
+
+def test_extraction_size_cap_refuses_bomb(tmp_path, monkeypatch):
+    """A small archive must not expand without bound into staging.
+
+    Zip-bomb guard: the cap counts bytes written, and a refusal leaves
+    nothing behind in the target directory.
+    """
+    monkeypatch.setattr(extractor, "MAX_EXTRACTED_BYTES", 64 * 1024)
+
+    archive = tmp_path / "bomb.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        # 4 MiB of zeros compresses to a few KB and expands on extract.
+        zf.writestr("big.bin", b"\x00" * (4 * 1024 * 1024))
+
+    target = tmp_path / "out"
+    target.mkdir()
+    with pytest.raises(ExtractionError):
+        extract_archive(archive, target)
+
+    left = [p for p in target.rglob("*")]
+    assert left == [], f"staging not cleaned up: {left}"
+
+
+def test_extraction_under_cap_still_works(tmp_path, monkeypatch):
+    monkeypatch.setattr(extractor, "MAX_EXTRACTED_BYTES", 1024 * 1024)
+
+    archive = _make_zip(tmp_path, {"a/one.esp": b"x" * 100, "a/two.esp": b"y" * 100})
+    target = tmp_path / "out"
+    target.mkdir()
+    names = extract_archive(archive, target)
+    assert (target / "a" / "one.esp").exists()
+    assert names
