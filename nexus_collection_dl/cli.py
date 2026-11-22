@@ -1175,9 +1175,33 @@ def mods(ctx: click.Context, mods_dir: Path) -> None:
     table.add_column("file_id", justify="right")
     table.add_column("mod_id", justify="right")
     table.add_column("Status", style="dim")
+    table.add_column("Picks", style="dim")
     for m in found:
-        table.add_row(m.name, m.version or "-", str(m.file_id), str(m.mod_id), m.download_status)
+        table.add_row(
+            m.name,
+            m.version or "-",
+            str(m.file_id),
+            str(m.mod_id),
+            m.download_status,
+            _format_picks(m.fomod_picks),
+        )
     console.print(table)
+
+
+def _format_picks(picks: list, limit: int = 3) -> str:
+    """Option names from stored FOMOD picks, truncated with a count.
+
+    A mod with a dozen options reads as the first few plus how many are
+    hidden, not as one endless cell. Empty means no picks recorded.
+    """
+    names = [str(p.get("option", "")) for p in picks if isinstance(p, dict)]
+    names = [n for n in names if n]
+    if not names:
+        return "-"
+    if len(names) <= limit:
+        return ", ".join(names)
+    shown = ", ".join(names[:limit])
+    return f"{shown} (+{len(names) - limit} more)"
 
 
 @main.command()

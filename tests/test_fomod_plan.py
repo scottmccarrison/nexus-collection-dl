@@ -729,14 +729,16 @@ def test_plan_lookup_prefers_the_config_that_owns_the_file(tmp_path):
         entries=(InstallEntry("b/two.esp", "two.esp", False, 0, "x"),),
     )
     plans = [
-        (tmp_path, plan_a, ("a/one.esp",)),
-        (tmp_path, plan_b, ("b/two.esp",)),
+        (tmp_path, plan_a, ("a/one.esp",), "Mod A"),
+        (tmp_path, plan_b, ("b/two.esp",), "Mod B"),
     ]
 
     hit_a = _plan_lookup(tmp_path / "a" / "one.esp", plans)
     assert hit_a is not None and hit_a[0] is plan_a and hit_a[1] == "a/one.esp"
+    assert hit_a[2] == "Mod A"
     hit_b = _plan_lookup(tmp_path / "b" / "two.esp", plans)
     assert hit_b is not None and hit_b[0] is plan_b and hit_b[1] == "b/two.esp"
+    assert hit_b[2] == "Mod B"
     assert _plan_lookup(tmp_path / "c" / "stranger.esp", plans) is None
 
 

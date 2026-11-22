@@ -256,3 +256,101 @@ def test_deploy_dry_run_carries_the_plan_warnings(tmp_path):
     d = json.loads(r.output)
     assert d["ok"] is True
     assert any("Gone" in w for w in d["result"]["warnings"])
+
+
+def test_list_mods_surfaces_fomod_picks(tmp_path):
+    """Stored option picks must reach the listing, not just the state file.
+
+    The picks drive the deploy plan, so a user who cannot see them cannot
+    tell what they chose without reading .nexus-state.json by hand.
+    """
+    from nexus_collection_dl.service import list_mods
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "Body",
+            "file_id": 11,
+            "filename": "body.zip",
+            "version": "1",
+        }
+    )
+    state.mods[11].fomod_picks = [
+        {"step": "S1", "group": "Body", "option": "CBBE"},
+        {"step": "S1", "group": "Textures", "option": "4K"},
+    ]
+    state.save()
+
+    (summary,) = list_mods(mods)
+    assert summary.fomod_picks == [
+        {"step": "S1", "group": "Body", "option": "CBBE"},
+        {"step": "S1", "group": "Textures", "option": "4K"},
+    ]
+
+
+def test_mods_table_shows_the_option_names(tmp_path):
+    """The human table has to name the chosen options.
+
+    A column of option names is what answers "what did I pick for this
+    mod" from the CLI.
+    """
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "Body",
+            "file_id": 11,
+            "filename": "body.zip",
+            "version": "1",
+        }
+    )
+    state.mods[11].fomod_picks = [{"step": "S1", "group": "Body", "option": "CBBE"}]
+    state.save()
+
+    r = invoke(["mods", str(mods)])
+    assert r.exit_code == 0
+    assert "CBBE" in r.output
+
+
+def test_mods_table_truncates_a_long_pick_list(tmp_path):
+    """Many picks must not blow the table apart.
+
+    A mod with a dozen options should read as the first few plus a count,
+    not as one endless cell.
+    """
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "Big",
+            "file_id": 11,
+            "filename": "big.zip",
+            "version": "1",
+        }
+    )
+    state.mods[11].fomod_picks = [
+        {"step": "S", "group": f"G{i}", "option": f"OptionNumber{i:02d}"}
+        for i in range(12)
+    ]
+    state.save()
+
+    r = invoke(["mods", str(mods)])
+    assert r.exit_code == 0
+    assert "OptionNumber00" in r.output
+    assert "OptionNumber11" not in r.output
+    assert "more" in r.output
