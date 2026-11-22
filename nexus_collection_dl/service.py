@@ -4268,6 +4268,31 @@ def _health_locks(
     return [HealthCheck("State locks", "OK", detail)]
 
 
+def _health_user_config() -> list[HealthCheck]:
+    """Has the tool ever been set up?
+
+    The front door's signal: a missing or unusable user config is a
+    first run, and `health` is the one place that looks at the whole
+    installation, so it is where a fresh install gets noticed.
+    """
+    from .config import UserConfig
+
+    cfg = UserConfig.load()
+    if cfg.is_configured():
+        return [HealthCheck("User config", "OK", f"collections root: {cfg.collections_root}")]
+    return [
+        HealthCheck(
+            "User config",
+            "WARN",
+            "not configured (first run)",
+            remedy=(
+                "Set a collections root: the directory collection folders "
+                "live under. Until then every command asks for its paths."
+            ),
+        )
+    ]
+
+
 def collect_health(
     root: Path,
     *,
@@ -4300,6 +4325,7 @@ def collect_health(
 
     checks: list[HealthCheck] = []
     for label, fn in (
+        ("User config", _health_user_config),
         ("API key", lambda: _health_api_key(probes, api_key_present)),
         ("nxm handler", lambda: _health_handler(probes)),
         ("Notifications", lambda: _health_notifications(probes)),
