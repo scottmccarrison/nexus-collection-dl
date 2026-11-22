@@ -256,19 +256,21 @@ class _ShellAsker:
     def tell(self, text: str) -> None:
         self._shell._emit(f"  {text}")
 
-    def _read(self, prompt: str) -> str | None:
+    def _read(self, prompt: str) -> str:
         try:
             return self._shell.input_fn(prompt)
         except (KeyboardInterrupt, EOFError):
-            return None
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
         except Exception:
-            return None
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
 
     def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None:
         while True:
             raw = self._read(prompt + ": ")
-            if raw is None:
-                return None
             raw = raw.strip()
             if not raw:
                 if allow_none:
@@ -284,8 +286,6 @@ class _ShellAsker:
     def choose_many(self, prompt: str, count: int, at_least_one: bool) -> list[int]:
         while True:
             raw = self._read(prompt + ": ")
-            if raw is None:
-                return []
             parts = [p.strip() for p in raw.strip().split(",") if p.strip()]
             if not parts:
                 if not at_least_one:

@@ -2552,3 +2552,42 @@ def test_live_drain_redraws_the_prompt_after_an_idle_report(shell_env, tmp_path)
     assert code == 0
     # Drawn once up front and once again after the tick's report.
     assert out.count("nexus-dl [Clean Visuals]>") >= 2
+
+
+def test_ctrl_c_at_fomod_picker_aborts_the_walk(shell_env, tmp_path):
+    """Ctrl-C at a FOMOD group prompt aborts the entire walk: no picks
+    are recorded and the mod stays pending. The walk must not trudge
+    through every remaining group after the user cancels."""
+    root = make_root(tmp_path, ("Clean Visuals", []))
+    coll = root / "Clean Visuals"
+
+    def write_ev():
+        _write_event(coll, outcome="pending_choices")
+
+    ticks = {"n": 0}
+
+    def waiter():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            write_ev()
+            return False
+        return True
+
+    # Drain prompt: "Choose now? [yes/no]:" -> yes
+    # Then the FOMOD walk's first "Pick one:" -> Ctrl-C (abort)
+    code, out, _prompts = run_events(
+        FakeShellService(),
+        root,
+        ["yes", KeyboardInterrupt()],
+        waiter=waiter,
+    )
+    assert code == 0  # shell survives
+    # The walk was aborted: no install_fomod_picks call with real picks
+    installs = [
+        c for c in FakeShellService.calls if c["method"] == "install_fomod_picks"
+    ]
+    # Either no install call at all, or one with empty picks
+    for call in installs:
+        assert not call.get("picks"), "abort must not install picks"
+    # The shell is still usable
+    assert "nexus-dl" in out
