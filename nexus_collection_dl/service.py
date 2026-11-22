@@ -876,6 +876,10 @@ class ModSummary:
     version: str
     filename: str
     download_status: str
+    # The stored FOMOD option picks as {"step", "group", "option"}
+    # triples. They drive the deploy plan, so the listing has to carry
+    # them: otherwise "what did I pick" is unanswerable from the CLI.
+    fomod_picks: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1028,6 +1032,7 @@ def list_mods(mods_dir: Path) -> list[ModSummary]:
             version=ms.version,
             filename=ms.filename,
             download_status=ms.download_status,
+            fomod_picks=list(ms.fomod_picks),
         )
         for ms in state.mods.values()
     ]

@@ -202,6 +202,12 @@ class DeploymentPlan:
     skipped: list[tuple[Path, str]] = field(default_factory=list)
     source_root: Path | None = None
     warnings: list[str] = field(default_factory=list)
+    # Source path (as str) to the mod that produced it, so a conflict can
+    # name the two mods rather than two paths nobody can attribute. The
+    # label is the display name when one is known and the source's
+    # top-level folder otherwise: that folder is the mod's own directory
+    # in the merged staging tree.
+    source_owners: dict[str, str] = field(default_factory=dict)
 
     @property
     def root_destinations(self) -> int:
@@ -371,7 +377,7 @@ def _fomod_plans(
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
     mod_names: dict[int, str] | None = None,
-) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...]]], list[str]]:
+) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...], str]], list[str]]:
     """Install plans for every readable ModuleConfig of this tree.
 
     Each plan carries the directory its sources are relative to (the
@@ -527,8 +533,12 @@ def _fomod_plans(
         return {}
 
     def plan_entry(
-        source_root: Path, config: "ModuleConfig", selections: dict, where: str
-    ) -> tuple[Path, "InstallPlan | None", tuple[str, ...]]:
+        source_root: Path,
+        config: "ModuleConfig",
+        selections: dict,
+        where: str,
+        label: str,
+    ) -> tuple[Path, "InstallPlan | None", tuple[str, ...], str]:
         resolved = resolve_install_plan(config, selections)
         owned = tuple(entry.source.lower() for entry in config.all_entries())
         if resolved.indeterminate:
@@ -540,9 +550,9 @@ def _fomod_plans(
             if detail:
                 message = f"{message} ({detail})"
             warnings.append(message)
-        return (source_root, None if resolved.indeterminate else resolved, owned)
+        return (source_root, None if resolved.indeterminate else resolved, owned, label)
 
-    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
+    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...], str]] = []
 
     recorded: set[str] = set()
     for file_id, rec in (fomod_configs or {}).items():
@@ -562,6 +572,7 @@ def _fomod_plans(
                 config,
                 selections_for(config, file_id, rec.get("mod_id"), member),
                 member,
+                _label(file_id, member),
             )
         )
 
@@ -583,6 +594,7 @@ def _fomod_plans(
                 config,
                 selections_guessing(config, where),
                 where,
+                where,
             )
         )
     return plans, warnings
@@ -590,22 +602,23 @@ def _fomod_plans(
 
 def _plan_lookup(
     file_path: Path,
-    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...]]],
-) -> tuple["InstallPlan | None", str] | None:
+    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...], str]],
+) -> tuple["InstallPlan | None", str, str] | None:
     """Locate the plan that owns ``file_path``, if any.
 
-    Returns ``(plan, path under the source root)`` for the config whose
-    entry sources claim the file. A config must not claim another mod's
-    files, so a path under some config's source root but under none of
-    its entries is owned by nobody and gets no plan. When several configs
-    share a source root (two FOMOD mods in one collection), the one that
-    owns the file wins rather than whichever came first.
+    Returns ``(plan, path under the source root, owner label)`` for the
+    config whose entry sources claim the file. A config must not claim
+    another mod's files, so a path under some config's source root but
+    under none of its entries is owned by nobody and gets no plan. When
+    several configs share a source root (two FOMOD mods in one
+    collection), the one that owns the file wins rather than whichever
+    came first.
 
     ``file_path`` must be absolute: source roots come from the config's
     own location and are absolute too, and a relative path silently
     matches nothing.
     """
-    for source_root, plan, owned_prefixes in plans:
+    for source_root, plan, owned_prefixes, label in plans:
         try:
             under = file_path.relative_to(source_root)
         except ValueError:
@@ -615,7 +628,7 @@ def _plan_lookup(
             under_s.lower() == prefix or under_s.lower().startswith(prefix + "/")
             for prefix in owned_prefixes
         ):
-            return plan, under_s
+            return plan, under_s, label
     return None
 
 
@@ -663,7 +676,7 @@ def classify_files(
         # Files a readable FOMOD config claims follow its install plan.
         hit = _plan_lookup(file_path, fomod_plans)
         if hit is not None:
-            fomod_plan, under = hit
+            fomod_plan, under, owner = hit
             if fomod_plan is not None:
                 found = fomod_plan.lookup(under)
                 if found is None:
@@ -673,6 +686,7 @@ def classify_files(
                 if not plan_dest:
                     plan.skipped.append((rel, "empty FOMOD destination"))
                     continue
+                plan.source_owners[str(file_path)] = owner
                 plan.data_files.append((file_path, Path(plan_dest)))
                 continue
 
@@ -701,6 +715,11 @@ def classify_files(
             continue
 
         target_base, dest_rel = result
+
+        # The top-level folder is the mod's own directory in the merged
+        # staging tree: the closest thing to a mod identity the folder
+        # heuristic has.
+        plan.source_owners[str(file_path)] = parts[0]
 
         if target_base == "staging":
             # For BG3 paks: they stay in place, deploy will symlink them to Data/
@@ -1946,6 +1965,17 @@ def deploy(
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
 
+    def _owner(src: Path) -> str:
+        return plan.source_owners.get(str(src), "")
+
+    def _conflict(dest_rel: Path, winner: Path, loser: Path) -> str:
+        owner_new, owner_old = _owner(winner), _owner(loser)
+        if owner_new and owner_old and owner_new != owner_old:
+            head = f"{dest_rel}: {owner_new} overwrites {owner_old}"
+        else:
+            head = f"{dest_rel}: overwritten by {_source_label(winner, plan.source_root)}"
+        return f"{head} ({_source_label(winner, plan.source_root)} over {_source_label(loser, plan.source_root)})"
+
     def _deploy_one(src: Path, dest: Path, dest_rel: Path) -> None:
         if dry_run:
             result.deployed.append(DeployedFile(str(src), str(dest), method))
@@ -1980,10 +2010,7 @@ def deploy(
     for src, dest_rel in plan.game_root_files:
         dest = game_dir / dest_rel
         if dest in seen_dests:
-            result.conflicts.append(
-                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
-                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
-            )
+            result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
 
@@ -1991,10 +2018,7 @@ def deploy(
     for src, dest_rel in plan.data_files:
         dest = data_dir / dest_rel
         if dest in seen_dests:
-            result.conflicts.append(
-                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
-                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
-            )
+            result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
 

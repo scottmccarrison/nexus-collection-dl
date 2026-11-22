@@ -1628,3 +1628,104 @@ def test_service_rejects_staging_inside_symlinked_game(svc, tmp_path):
     result = svc.deploy(staging, game_dir=alias)
     assert result.deployed_count == 0
     assert result.errors, result.errors
+
+
+def test_conflict_messages_name_the_owning_mods(env):
+    """A conflict has to say which mods collide, not just which files.
+
+    A FOMOD install plan writes to the destination the config names, so
+    both sides of the collision carry source paths that say nothing about
+    which Nexus mod they belong to. The display name is the thing a user
+    can act on.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    collide = """
+    <config>
+      <installSteps><installStep name="Options"><optionalFileGroups>
+        <group name="Pack" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Only">
+              <files><file source="content/payload.nif"
+                           destination="meshes/actors/x.nif"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups></installStep></installSteps>
+    </config>
+    """
+    for mod in ("alpha", "beta"):
+        (env.staging / mod / "content").mkdir(parents=True)
+        (env.staging / mod / "content" / "payload.nif").write_bytes(mod.encode())
+
+    plan = classify_files(
+        env.staging,
+        "skyrimspecialedition",
+        fomod_picks={
+            1: [{"step": "Options", "group": "Pack", "option": "Only"}],
+            2: [{"step": "Options", "group": "Pack", "option": "Only"}],
+        },
+        fomod_configs={
+            1: {"member": "alpha/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 1},
+            2: {"member": "beta/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 2},
+        },
+        mod_names={1: "Alpha Armor", 2: "Beta Armor"},
+    )
+    assert len(plan.data_files) == 2, plan.data_files
+
+    result = run_deploy(
+        plan, env.game, method="copy", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "Alpha Armor" in msg, msg
+    assert "Beta Armor" in msg, msg
+
+
+def test_conflict_message_keeps_the_source_paths(env):
+    """Naming the mods must not drop the paths that place the files.
+
+    The paths are what let a user find the file in the staging tree; the
+    names are what let them know which mods to talk about. Both belong.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    collide = """
+    <config>
+      <installSteps><installStep name="Options"><optionalFileGroups>
+        <group name="Pack" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Only">
+              <files><file source="content/payload.nif"
+                           destination="meshes/actors/x.nif"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups></installStep></installSteps>
+    </config>
+    """
+    for mod in ("alpha", "beta"):
+        (env.staging / mod / "content").mkdir(parents=True)
+        (env.staging / mod / "content" / "payload.nif").write_bytes(mod.encode())
+
+    plan = classify_files(
+        env.staging,
+        "skyrimspecialedition",
+        fomod_picks={
+            1: [{"step": "Options", "group": "Pack", "option": "Only"}],
+            2: [{"step": "Options", "group": "Pack", "option": "Only"}],
+        },
+        fomod_configs={
+            1: {"member": "alpha/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 1},
+            2: {"member": "beta/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 2},
+        },
+    )
+    result = run_deploy(
+        plan, env.game, method="copy", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "alpha/content/payload.nif" in msg, msg
+    assert "beta/content/payload.nif" in msg, msg
