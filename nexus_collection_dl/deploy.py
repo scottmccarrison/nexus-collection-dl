@@ -22,6 +22,7 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1945,6 +1946,7 @@ def deploy(
     backups: BackupStore | None = None,
     journal: DeployJournal | None = None,
     ownership: dict[str, dict] | None = None,
+    on_progress: "Callable[[int, int, str], None] | None" = None,
 ) -> DeployResult:
     """Execute a deployment plan.
 
@@ -1954,6 +1956,12 @@ def deploy(
     holds exactly one effective record per destination: when mods conflict,
     the last file in deterministic (sorted) plan order wins, the original is
     backed up once, and the conflict is reported.
+
+    ``on_progress(done, total, detail)`` fires once per plan entry as the
+    write loop advances. The loop is the long silent phase of a deploy
+    (hundreds of files in copy mode), so without this the caller can only
+    say "deploying N files" and then go quiet. ``total`` is
+    ``plan.total_files`` and ``detail`` is the destination being written.
     """
     if not dry_run and (backups is None or journal is None or ownership is None):
         raise ValueError(
@@ -1964,6 +1972,14 @@ def deploy(
     result = DeployResult(warnings=list(plan.warnings))
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
+    entries_total = len(plan.game_root_files) + len(plan.data_files)
+    entries_done = 0
+
+    def _advance(dest_rel: Path) -> None:
+        nonlocal entries_done
+        entries_done += 1
+        if on_progress is not None:
+            on_progress(entries_done, entries_total, dest_rel.as_posix())
 
     def _owner(src: Path) -> str:
         return plan.source_owners.get(str(src), "")
@@ -2013,6 +2029,7 @@ def deploy(
             result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+        _advance(dest_rel)
 
     # Data/ files (includes BG3 .pak symlinks)
     for src, dest_rel in plan.data_files:
@@ -2021,6 +2038,7 @@ def deploy(
             result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+        _advance(dest_rel)
 
     # One entry per destination: the write that won is the file that is
     # there. The overwrites themselves are already in `conflicts`.
