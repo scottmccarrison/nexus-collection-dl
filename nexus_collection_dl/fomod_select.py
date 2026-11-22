@@ -272,65 +272,60 @@ def prompt_for_picks(
             header_shown = True
             asker.tell(f"FOMOD options for {archive_name}")
 
-    try:
-        for step in config.steps:
-            if evaluate(step.visible, flags, GameState()) is False:
-                continue
-            for group in step.groups:
-                if (step.name, group.name) in resolved:
-                    # Already chosen: absorb its flags for the steps below,
-                    # but do not return it again. The caller owns the kept
-                    # picks and prepends them to what this walk returns.
-                    wanted = {n.strip().lower() for n in resolved[(step.name, group.name)]}
-                    for option in group.options:
-                        if option.name.strip().lower() in wanted:
-                            flags.update(option.flags)
-                    continue
-                if group.group_type == "SelectAll":
-                    for option in group.options:
-                        record(option, step.name, group.name)
-                    continue
-
+    for step in config.steps:
+        if evaluate(step.visible, flags, GameState()) is False:
+            continue
+        for group in step.groups:
+            if (step.name, group.name) in resolved:
+                # Already chosen: absorb its flags for the steps below,
+                # but do not return it again. The caller owns the kept
+                # picks and prepends them to what this walk returns.
+                wanted = {n.strip().lower() for n in resolved[(step.name, group.name)]}
                 for option in group.options:
-                    if option.option_type == "Required":
-                        record(option, step.name, group.name)
-                askable = [
-                    o
-                    for o in group.options
-                    if o.option_type not in ("Required", "NotUsable")
-                ]
-                if not askable:
-                    continue
+                    if option.name.strip().lower() in wanted:
+                        flags.update(option.flags)
+                continue
+            if group.group_type == "SelectAll":
+                for option in group.options:
+                    record(option, step.name, group.name)
+                continue
 
-                header()
-                asker.tell(f"{step.name} / {group.name} ({group.group_type})")
-                for i, option in enumerate(askable, 1):
-                    hint = " [recommended]" if option.option_type == "Recommended" else ""
-                    asker.tell(f"  {i}. {option.name}{hint}")
-                    if option.description:
-                        asker.tell(f"     {option.description}")
+            for option in group.options:
+                if option.option_type == "Required":
+                    record(option, step.name, group.name)
+            askable = [
+                o
+                for o in group.options
+                if o.option_type not in ("Required", "NotUsable")
+            ]
+            if not askable:
+                continue
 
-                if group.group_type in ("SelectExactlyOne", "SelectAtMostOne"):
-                    allow_none = group.group_type == "SelectAtMostOne"
-                    n = asker.choose_one(
-                        "  Pick one" + (", or press Enter for none" if allow_none else ""),
-                        len(askable),
-                        allow_none=allow_none,
-                    )
-                    if n is not None:
-                        record(askable[n - 1], step.name, group.name)
-                else:
-                    at_least_one = group.group_type == "SelectAtLeastOne"
-                    nums = asker.choose_many(
-                        "  Pick any, comma separated"
-                        + (" (at least one)" if at_least_one else ""),
-                        len(askable),
-                        at_least_one=at_least_one,
-                    )
-                    for n in nums:
-                        record(askable[n - 1], step.name, group.name)
-    except PickAborted:
-        # Ctrl-C or Ctrl-D at a picker: stop the walk and install nothing
-        # from a partial set of answers. The mod stays pending.
-        return []
+            header()
+            asker.tell(f"{step.name} / {group.name} ({group.group_type})")
+            for i, option in enumerate(askable, 1):
+                hint = " [recommended]" if option.option_type == "Recommended" else ""
+                asker.tell(f"  {i}. {option.name}{hint}")
+                if option.description:
+                    asker.tell(f"     {option.description}")
+
+            if group.group_type in ("SelectExactlyOne", "SelectAtMostOne"):
+                allow_none = group.group_type == "SelectAtMostOne"
+                n = asker.choose_one(
+                    "  Pick one" + (", or press Enter for none" if allow_none else ""),
+                    len(askable),
+                    allow_none=allow_none,
+                )
+                if n is not None:
+                    record(askable[n - 1], step.name, group.name)
+            else:
+                at_least_one = group.group_type == "SelectAtLeastOne"
+                nums = asker.choose_many(
+                    "  Pick any, comma separated"
+                    + (" (at least one)" if at_least_one else ""),
+                    len(askable),
+                    at_least_one=at_least_one,
+                )
+                for n in nums:
+                    record(askable[n - 1], step.name, group.name)
     return picks
