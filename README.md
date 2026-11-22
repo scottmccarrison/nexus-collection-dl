@@ -1,6 +1,6 @@
 # nexus-collection-dl
 
-A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. Comes with a local web UI and a CLI.
+A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. A CLI, with an interactive shell on top.
 
 > [!IMPORTANT]
 > **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
@@ -23,7 +23,9 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 **`main` is stable.** It gets bug fixes and the features that have proven out. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
 
-**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly, with the web UI planned for deprecation once the shell covers the workflows people use. Beta points are tagged as `v0.3.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+
+For AI harnesses, the repo ships an agent skill at [`.agents/skills/nexus-dl/`](.agents/skills/nexus-dl/). It teaches the command surface, the safe defaults (read before write, dry-run before deploy), and the [`--json` machine-readable output](#machine-readable-output), so a harness can drive the same CLI the shell wraps.
 
 Switch channels by checking out the branch before the install steps below. Stay on `main` for stable:
 
@@ -91,29 +93,6 @@ Planning to use "Mod manager download" click-through? Also store the key with `n
 
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
 
-## Web UI
-
-Launch the local web interface for day-to-day mod management:
-
-```bash
-nexus-dl serve ~/mods/starfield
-
-# Custom port
-nexus-dl serve ~/mods/starfield --port 8080
-```
-
-Opens a dark-themed dashboard at `http://127.0.0.1:5000` with:
-
-- **Dashboard** - collection info, deployment status, quick action buttons (sync, update, deploy, undeploy)
-- **Mods** - full mod table with status badges, add mod by URL, register local mods
-- **Background tasks** - long-running operations (sync, update, deploy) stream progress in real time
-
-There's also a standalone entry point:
-
-```bash
-nexus-dl-web ~/mods/starfield
-```
-
 ## CLI Usage
 
 All operations are also available from the command line.
@@ -179,7 +158,7 @@ nexus-dl deploy ~/mods/starfield --copy
 nexus-dl deploy ~/mods/starfield --dry-run
 ```
 
-Creates symlinks (or copies) from your staging directory into the game's install directory. For Bethesda games on Proton, it also writes `plugins.txt` and `StarfieldCustom.ini` (or equivalent) to the correct Wine prefix paths.
+Creates symlinks (or copies) from your staging directory into the game's install directory. For Bethesda games on Proton, it also writes `plugins.txt` and `StarfieldCustom.ini` (or equivalent) to the correct Wine prefix paths. Proton games always use copy mode: the game cannot read through Linux symlinks that cross outside the Wine prefix.
 
 `--game-dir` and `--prefix` are saved after the first deploy, so subsequent runs only need `nexus-dl deploy ~/mods/starfield`.
 
@@ -247,7 +226,7 @@ nexus-dl handler install
 
 Now click **Mod manager download** once on any mod file page for that game:
 
-- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready.
+- The first click downloads that one file into the mapped collection, verifies it, extracts it, and reports the outcome as a desktop notification (the registered handler runs headless and requests notifications explicitly). Nothing is deployed to the game; run `nexus-dl deploy` when you're ready. A FOMOD mod (one with an installer) is kept unextracted and reported as "waiting for option choices" - the notification names the `import --fomod-option` command that finishes it.
 - Clicking again for the same file re-downloads and re-verifies it: the default flow deletes the archive after extracting, so there is nothing left to dedupe against. A re-click with a retained verified archive triggers no download: an entry already marked downloaded (for example with `--no-extract`) reports "already downloaded" with zero network calls, and an entry whose extraction previously failed finishes extracting from the retained archive (no file download; with track-sync enabled a background tracked-mod sync may still make API calls). Every click also appends a redacted line to `~/.local/state/nexus-dl/nxm.log`.
 - `nexus-dl handler uninstall` removes the desktop entry and restores the app that handled nxm:// links before, when one was recorded and nexus-dl is still the default.
 
@@ -366,6 +345,64 @@ Matches files you downloaded through the browser to pending mods, extracts archi
 nexus-dl status ~/mods/starfield
 ```
 
+### Remove a mod
+
+```bash
+# See what is tracked, with the ids remove takes
+nexus-dl mods ~/mods/starfield/My\ Collection
+
+# Preview: list what would go, change nothing
+nexus-dl remove ~/mods/starfield/My\ Collection --file-id 12345 --dry-run
+
+# Remove by file id (or --mod-id 123 to drop the whole mod page)
+nexus-dl remove ~/mods/starfield/My\ Collection --file-id 12345
+```
+
+Drops the mod from the collection's state and records a tombstone so `sync`/`update` skip it from then on (the shell's `/remove` is the same operation). Exactly one of `--file-id`/`--mod-id` is required; look ids up with `mods` rather than guessing. `--file-id` resolves to its mod page, so every tracked file of that mod goes, not just the one file. It never deletes files from disk (a collection's extraction tree is merged, so payload files cannot be attributed back to one mod), and re-adding the mod clears the tombstone and restores it. `--no-load-order` skips the load order regeneration.
+
+### List collections
+
+```bash
+nexus-dl collections ~/mods
+```
+
+Lists collections under a directory (default: the current directory): the directory itself and its immediate subfolders holding `.nexus-state.json`, with game, mod count, and pending count for each. Read-only and offline; unreadable collections are skipped.
+
+### List games
+
+```bash
+nexus-dl games ~/mods
+```
+
+The same scan rolled up per game domain: collection count and total mods per game. Read-only and offline.
+
+### List tracked mods
+
+```bash
+nexus-dl mods ~/mods/starfield/My\ Collection
+```
+
+Lists a collection's tracked mod files from local state only (no network): name, version, download status, and the `file_id`/`mod_id` values that `remove` takes.
+
+### Health check
+
+```bash
+nexus-dl health
+```
+
+Local health checks for the tool installation: where the API key comes from (never the value), nxm handler state, desktop notification capability, unreadable state files, and write-lock state. This is a report, not a gate: it exits 0 even when a check reports WARN or ERROR, so read the per-check statuses.
+
+### Machine-readable output
+
+`--json` goes **before** the subcommand and switches every non-interactive command to a single JSON object on stdout (human diagnostics move to stderr):
+
+```bash
+nexus-dl --json status ~/mods/starfield/My\ Collection | jq .ok
+nexus-dl --json update ~/mods/starfield/My\ Collection --dry-run | jq '.result.updates'
+```
+
+The envelope is `{"ok", "result", "error"}`: `ok` is true exactly when the command exits 0; on failure `error` carries a stable `code`, the exception type, the message, and an optional `hint`; a partial failure (an `add` that reports `success: false`, say) keeps its `result` alongside the error under `code` `operation_failed`. Flag placement matters: `nexus-dl --json status <dir>`, not `nexus-dl status --json <dir>`, and a wrong invocation is a plain-text usage error on stderr with exit code 2, not JSON. `shell`, `nxm`, and `handler` do not support `--json`. The [agent skill](.agents/skills/nexus-dl/) carries the per-command result shapes and the error-code reference.
+
 ### Interactive shell
 
 For browsing and quick changes without retyping paths, `nexus-dl shell` opens an interactive prompt over the same service layer:
@@ -374,7 +411,9 @@ For browsing and quick changes without retyping paths, `nexus-dl shell` opens an
 nexus-dl shell ~/mods/starfield
 ```
 
-List collections and games, pick one with `/use` (a root with a single collection is picked for you, and bare `/use` shows the current selection; an explicit `/use` sticks across sessions), then `/mods`, `/add`, `/sync`, `/remove`, and `/status <index|name>` work on it. Bare `/status` is the exception and needs no selection: a tool-wide local report (per-game overview with totals, removal tombstone counts, and health checks for the API key, nxm handler, desktop notifications, and more) that never touches the network, while `/status <index|name>` checks one collection against the latest revision. Every command takes a bare `--help` (or `/help <command>`) for its usage and one example instead of running. `/add` takes an `https://` mod page URL (an `nxm://` link works too if you have one, bare on its own line or after `/add`, and the shell never echoes a link back), and `/sync` takes a collection URL, a collection you already have by index or name, or nothing to resync the current one (the index/name and resync forms update that collection's own directory; the URL form makes a new directory named from the API). `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
+List collections and games, pick one with `/use` (a root with a single collection is picked for you, and bare `/use` shows the current selection; an explicit `/use` sticks across sessions), then `/mods`, `/add`, `/sync`, `/remove`, `/deploy`, and `/status <index|name>` work on it. Bare `/status` is the exception and needs no selection: a tool-wide local report (per-game overview with totals, removal tombstone counts, and health checks for the API key, nxm handler, desktop notifications, and more) that never touches the network, while `/status <index|name>` checks one collection against the latest revision. Every command takes a bare `--help` (or `/help <command>`) for its usage and one example instead of running. `/add` takes an `https://` mod page URL (an `nxm://` link works too if you have one, bare on its own line or after `/add`, and the shell never echoes a link back), and `/sync` takes a collection URL, a collection you already have by index or name, or nothing to resync the current one (the index/name and resync forms update that collection's own directory; the URL form makes a new directory named from the API). `/deploy` copies files to the game directory after showing dry-run counts and asking for confirmation. `ROOT_DIR` defaults to the current directory, and a "collection" is `ROOT_DIR` itself or a depth-1 subdirectory holding `.nexus-state.json`. The [Beginner's Guide](GUIDE.md#using-the-interactive-shell) has a full sample session.
+
+A running shell also sees browser clicks: when you hit "Mod manager download" on the Nexus website while `nexus-dl shell` is open, the shell notices while you sit at the prompt - no keystroke needed - and reports the new mod and offers to deploy its collection. One report block per batch and one deploy prompt per collection. A FOMOD mod needs option choices before it can be extracted, so the shell asks for those instead and installs it with your picks when you answer. Only collections under the shell's root are visible. See [Reacting to clicks from the shell](GUIDE.md#reacting-to-clicks-from-the-shell) in the guide.
 
 Honest note on `/remove`: it drops the mod's entries from collection state and records a tombstone so `sync`/`update` skip the mod from then on, but it never deletes files already on disk (a collection's extraction tree is merged, so payload files can't be attributed back to one mod). Re-adding the mod clears the tombstone and restores it.
 
@@ -414,8 +453,6 @@ The `import` command matches downloaded files by filename (case-insensitive), ex
 
 Re-running `sync` or `update` as a free user won't regress mods you've already imported - only new or changed mods show as pending.
 
-The web UI also supports this workflow: the dashboard shows a "Pending Downloads" card with clickable links, and an "Import Downloads" button.
-
 ## Load order
 
 `nexus-dl` generates load order files automatically during `sync` and `update`. The approach differs by game type:
@@ -433,9 +470,10 @@ This handles BG3, Cyberpunk, and every other game. Since non-Bethesda games don'
 
 In addition to `load-order.txt`, Bethesda collections also get:
 
-**`plugins.txt`** - Plugin-level load order for `.esp`/`.esm`/`.esl` files. Two sources:
-1. **Collection metadata** - The collection author's intended plugin order (always available)
+**`plugins.txt`** - Plugin-level load order for `.esp`/`.esm`/`.esl` files. Three sources, in priority order:
+1. **Collection metadata** - The collection author's intended plugin order (when the manifest carries one)
 2. **LOOT sorting** - Automatic sorting via [libloot](https://github.com/loot/libloot) using master dependency analysis + community masterlists (when libloot is installed)
+3. **Deployed files** - When neither of the above produces a plugin list (community collections often omit manifest plugin data), the deploy generates one from the `.esp`/`.esm`/`.esl` files it actually placed in the game directory. Entries carry `*` prefixes (Skyrim's enabled marker).
 
 When libloot is available, LOOT-sorted order takes priority over collection metadata. Enabled/disabled status from the collection is preserved either way.
 
@@ -455,10 +493,9 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 
 ## How it works
 
-- **serve** - Launches a local web UI for managing mods from your browser.
 - **sync** - Fetches the collection from the Nexus API and caches the manifest. Premium: downloads each mod (skipping any already downloaded), extracts archives into per-collection subdirectories, generates load order, and reports file conflicts. Free: prints browser download links for manual download.
 - **update** - Re-fetches the collection and downloads any mods that have newer versions. Regenerates load order.
-- **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal).
+- **add** - Downloads a single mod by URL and registers it as a manual mod (phase 999, protected from update removal). If the archive carries a FOMOD installer (it needs option choices like a body type before anything is extracted), `add` asks for the choices: `--fomod-option 'Group:Option'` (repeatable) or `--fomod-config picks.json` from a script, the prompts at a terminal, and the picks are remembered so a later deploy installs exactly what you chose. With no way to ask (a pipe, `--json`), it refuses rather than installing every option folder at once, and keeps the archive. Script-based installers (FOMOD 1.0) are refused outright since there is nothing to pick from.
 - **add-local** - Registers an already-present mod in the state without downloading anything.
 - **import** - Matches manually downloaded files to pending mods, extracts archives, and regenerates load order. Used with free accounts after downloading files through the browser.
 - **deploy** - Classifies files by type and symlinks (or copies) them to the correct game directory locations. Handles SFSE, Data/ assets, plugins, and Proton config files. Backs up any pre-existing destination file first and journals every mutation for crash recovery.
@@ -466,9 +503,9 @@ Masterlists are cached in `~/.cache/nexus-dl/masterlists/` and refreshed every 2
 - **track-sync** - Manages Nexus tracked-mod sync (enable/disable/push). When enabled, the tracked bell icon on the website matches your local loadout.
 - **load-order** - Regenerates load order from the cached manifest (no API call needed).
 - **status** - Shows what's installed and whether updates are available.
-- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/status`) over the same commands.
+- **shell** - Opens an interactive prompt (`/collections`, `/use`, `/mods`, `/add`, `/sync`, `/remove`, `/deploy`, `/status`) over the same commands.
 
-Both the web UI and CLI share the same service layer, so all operations behave identically regardless of interface.
+Everything runs through the same service layer, so a CLI call and a shell command behave identically.
 
 State is tracked in a `.nexus-state.json` file inside your mods directory, including the cached collection manifest for offline load order regeneration.
 

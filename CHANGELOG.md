@@ -4,7 +4,292 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.4.0] - 2026-11-21
+
+The FOMOD release. A browser click on a mod with an installer can now end with
+that mod's chosen options in the game directory, and standalone `add` and
+`import` make the same choices. **This release has had no field use.** What was
+exercised is the test suite and a scripted smoke run against real Nexus archives
+and one real collection; the browser click chain, free-account downloads, and
+Windows were not part of that. "Known gaps" at the end names what else is
+deliberately not in this release.
+
+### Added
+
+- A click on a FOMOD mod now asks which options to install, and a running
+  `nexus-dl shell` places the result in the game directory in the same sitting.
+  At 0.3.0 a click on a mod with an installer (`fomod/ModuleConfig.xml`)
+  extracted every option folder at once, which is the wrong content, and for
+  the common installer where every option is `Optional` it was **nothing at
+  all**: measured against real configs, the installer's own defaults install 0
+  of 83 entries for XPMSE, 0 of 6 for Improved Map, 0 of 2 for SPID. A click
+  now stops before extraction. With a shell running, the click drain offers the
+  installer's groups one at a time in install order (the same walk `add` uses,
+  driven by the same code, on the shell's plain input lines), records the picks
+  on the mod, and offers the deploy that places the new files straight after:
+  website to game directory in one sitting. Declining leaves the mod waiting and
+  nothing is installed from a guess. With no shell running, the click keeps the
+  archive and records the mod as `pending_choices`, and
+  `nexus-dl import <dir> --fomod-option 'Group:Option'` (or `--fomod-config`,
+  or the prompts at a terminal) finishes it. A re-click of a mod waiting on
+  choices says so instead of trying again. Script-based installers (FOMOD 1.0,
+  `fomod/script.cs`) have no options to pick and are refused with the reason.
+  `pending_choices` joins `pending_download` everywhere a pending state is
+  reported: the `mods` table, `import`'s matching, the click-event `outcome`
+  tokens, and the shell's event line.
+
+- Standalone `add` and `import` make FOMOD option choices instead of extracting
+  every option at once. When an archive carries a readable installer, its groups
+  are presented and only the chosen options install. Three ways to choose:
+  `--fomod-option 'Group:Option'` (repeatable, `'Step:Group:Option'` when a
+  group name appears in more than one step), `--fomod-config <file.json>` for
+  names that contain a colon and for batch imports (each pick may carry a
+  `"file"` key scoping it to one archive), and the prompts, which run only at a
+  terminal when no picks were passed. **The picks are stored in the collection
+  state**, so a later `deploy` installs exactly what was chosen rather than the
+  installer's defaults. Re-adding a mod keeps the stored picks as far as they
+  still name real options in a changed installer and asks only about the rest.
+  With no picks and nobody to ask (a pipe, `--json`, a script), the archive is
+  refused rather than extracted to every option at once, with a message naming
+  the flags to pass; that refusal has its own error code, `fomod_choices`, so a
+  harness can tell "give me choices" apart from "I cannot read this installer",
+  and a pick that names nothing the installer offers is refused the same way
+  rather than silently matched onto something similar. Script-based installers
+  have no groups to pick from and are refused under `fomod_installer`.
+  `--no-extract` is unchanged as the escape hatch. Flags that cannot apply (a
+  mod with no installer, or `--no-extract`) say so in the result's `warnings`
+  instead of vanishing silently.
+
+- `--json` before the subcommand switches any non-interactive command to
+  machine-readable output: stdout carries exactly one JSON object and nothing
+  else, and the envelope is `{"ok", "result", "error"}` with a stable
+  snake_case `error.code` on failure. Wrong invocations stay click usage
+  errors (exit 2), and `shell`, `nxm`, and `handler` do not support `--json`.
+- Five CLI commands closing the coverage gap with the interactive shell:
+  `remove`, `collections`, `games`, `mods`, and `health`. `remove` takes
+  exactly one of `--file-id`/`--mod-id`, never touches payload files on disk,
+  tombstones positive Nexus mod ids so `sync`/`update` skip them until an
+  explicit re-add, and never prompts (the shell's `/remove` keeps its
+  confirmation). `collections` and `games` list from a local scan, `mods` lists
+  a collection's tracked files from local state only, and `health` reports API
+  key source (never the value), nxm handler state, notification capability,
+  unreadable states, and write-lock state, exiting 0 even when a check reports
+  WARN or ERROR because it is a report and not a gate.
+- An agent skill at `.agents/skills/nexus-dl/` for AI harnesses that discover
+  skills in the checkout: intent-to-command routing, safe defaults (read before
+  write, `deploy --dry-run` before `deploy`, confirm before `remove`, never
+  invent mod/file ids), the `--json` envelope contract, and error triage.
+- A per-collection click-events file (`<mods_dir>/.nexus-events.jsonl`) so a
+  running shell can learn that a browser click landed a mod. The `nxm` command
+  appends one compact JSON line per click attempt (no URIs, keys, or
+  credentials), with an `outcome` token and enough context to report it.
+  `NxmResult` gains `download_status` so a recoverable pending entry is
+  distinguishable from a flat failure. Append is `O_APPEND`; rotation is
+  best-effort under the collection lock; a broken event file never fails a
+  download.
+- The interactive shell drains click events live while you sit at the prompt
+  and at each prompt boundary, and reports them in one block. A browser click
+  landing while the shell is idle shows up without anyone pressing a key: the
+  idle wait ticks every couple of seconds, notices the event, and starts the
+  flow (FOMOD choices, deploy prompt) right there. Three clicks on one
+  collection produce one report and one `Deploy '<name>' now? [yes/no]: `
+  prompt, not three. Only `downloaded` and `extracted_from_archive` events
+  trigger the deploy prompt. Pre-existing events are not replayed; only
+  collections under the shell's root are visible.
+- `/deploy [<index|name>]` in the interactive shell, resolving a collection
+  exactly like `/use` (or the current selection). The shared deploy flow shows
+  dry-run counts, asks for confirmation, then deploys and renders the result:
+  errors first, conflicts, warnings, and a `Deploy incomplete` line on partial
+  failure instead of a clean success. Ctrl-C, Ctrl-D, and any input failure at
+  the confirm prompt cancel the deploy. Nothing touches the game directory
+  without an explicit `yes`.
+- `nexus-dl --version` prints `nexus-dl v<version>` and exits 0. It answers
+  without a subcommand, like `--help`, and is plain text.
+
+### Changed
+
+- Mods with a FOMOD installer deploy from an **install plan** instead of a
+  top-level folder filter. The plan is computed from the mod's
+  `ModuleConfig.xml`: `requiredInstallFiles`, plus the entries of the options
+  the collection manifest or the user picked, plus every
+  `conditionalFileInstalls` pattern whose dependencies hold. Each entry is a
+  (source, destination) pair at full path depth, so what lands is what the
+  installer asked for and where it asked for it. Four things the old filter
+  could not do, each found by running it against real Nexus archives:
+
+  1. Options that partition nested paths inside a shared top-level directory.
+     XPMSE (mod 1988) splits `Skeleton Rig\HDT` from `Skeleton Rig\HDT 4.51`
+     from `Skeleton Rig\TBBP`; the old filter worked on top-level names, so
+     picking one skeleton style installed all three.
+  2. `source` entries that carry a `destination` renaming or moving the
+     content. NVAC (mod 53635) installs `<folder source="NVSE"
+     destination="SKSE"/>`; the old filter ignored `destination`.
+  3. Sources written relative to the `fomod/` directory's parent rather than
+     the archive root. SPID (mod 36869) wraps everything in one folder and
+     writes `AE/SKSE/Plugins` relative to that wrapper; the old filter could
+     not see the option directories and installed both game versions.
+  4. `conditionalFileInstalls` patterns, which is where a modern config does
+     most of its installing (in one real patch collection, 254 of 264 sources
+     live inside patterns). `flagDependency` is evaluated against the flags the
+     selected options set. `fileDependency` and `gameDependency` are evaluated
+     when the caller supplies game state, and **no caller supplies game state
+     yet**, so those two condition types are undecidable at deploy: the mod
+     falls back to the folder-based install and says so per mod rather than
+     installing a guessed branch. Options marked `alwaysInstall` install
+     regardless of the pick, `installIfUsable` installs when the option is
+     usable, and step-level `<visible>` conditions hide steps whose flags are
+     not set.
+
+  **When a condition cannot be evaluated, nothing is guessed.** A multi-game
+  installer like NVAC picks `SKSE`/`FOSE`/`NVSE`/`OBSE` from the game version
+  and the load order; with no game state those patterns are undecidable, and
+  the mod keeps the old folder behaviour instead of a randomly chosen branch.
+  The same applies to an unreadable config, which is also the only case the old
+  folder filter still serves. Non-FOMOD mods are untouched. Installer configs
+  are decoded in whatever encoding the author wrote them: UTF-8, UTF-16 with
+  or without a BOM, in either byte order.
+
+- Error and warning text in results (the `errors`/`warnings`/`error` fields of
+  deploy, undeploy, sync, update, import, add, remove, and nxm outcomes) now
+  carries a short category in place of raw OS and unexpected-exception text, so
+  an exception message can no longer carry an absolute filesystem path or
+  reflected request detail out of the process. Refused and failed paths and
+  their authored refusal reasons still appear exactly as before; what changed
+  is the exception suffix beside them (`no such file or directory (ENOENT)`,
+  `unexpected error (<TypeName>)`). What you lose: the CLI's error lines no
+  longer show raw OS wording such as `[Errno 2] No such file or directory:
+  '/path'`. The path is still in the authored part of the message when it
+  matters, and the `--json` envelope's `error.message` is unchanged, because
+  that is the documented diagnostic surface.
+
+### Removed
+
+- The local web UI, `nexus-dl serve`, and the `nexus-dl-web` console script.
+  `nexus-dl shell` is the intended driver and the CLI covers the same
+  operations over the same service layer; `--json` gives harnesses
+  machine-readable output. **What is gone:** the browser dashboard and live
+  progress over Server-Sent Events. The CLI's Rich progress bar and phase text
+  lines are the replacement; that polish has no terminal equivalent yet. If you
+  want it back, say so and it becomes work on the CLI's progress rather than a
+  restored web app. `flask` and its dependencies are no longer installed
+  alongside the tool. The `0.3.0` README already carried the intent, and the
+  shell has covered the workflows since this release's click-event drain and
+  `/deploy`.
+
+### Security
+
+- Archive extraction refuses traversal names, symlink members, and tool-owned
+  files. Member names are validated before extraction (no `..` segments, no
+  absolute or drive-letter paths, backslashes normalised so a Windows-written
+  zip lays out its directories instead of writing literal-backslash filenames),
+  symlink members are refused rather than recreated, and the staging tree is
+  walked after extraction and before anything is merged, which covers the
+  system `7z`/`unar`/`unrar` fallbacks as well. An archive that plants a
+  `.nexus-*` name at any depth (a forged `.nexus-journal.jsonl` beside the
+  real one, say, which recovery would otherwise honour) is refused with a
+  clear error instead of merged beside the real state, and an extraction
+  that writes anywhere beside its staging area is removed and refused. The
+  `py7zr` floor moves past CVE-2022-44900. **What this does not cover:**
+  the rare fallbacks to the system `7z`/`unar`/`unrar` tools (compression
+  py7zr cannot decode, RAR5 without a Python backend) rely on those tools'
+  own path handling for member names this tool cannot see before they run.
+
+### Fixed
+
+- A click kept for its option choices is no longer reported as a download
+  failure. When a FOMOD mod lands as `pending_choices` (the archive is kept,
+  nothing extracted), the notification said "download failed" and the log said
+  `error`/`rejected`, even though the download succeeded and the tool did the
+  designed thing. Now the notification says the mod is waiting for option
+  choices (or for its download to finish, for `pending_download`) and names
+  the command to finish it, and the log records `warn` with the pending
+  reason instead of `error`.
+- Deploying to a Proton/Wine game now uses copy mode automatically. Symlinked
+  files in the game's `Data/` directory are visible to the game by name but
+  the game cannot read through Linux symlinks that cross outside the Wine
+  prefix, so the plugins loaded as empty shells and modded content never
+  appeared. Real files work. A deploy to a Proton prefix says so in its
+  warnings; native-Linux deploys are unchanged.
+- `plugins.txt` is generated from the deployed plugin files (`.esp`/`.esm`/
+  `.esl`) when the collection manifest carries no plugin list, instead of
+  producing a comment-only file. Skyrim SE requires `*` prefixes to mark
+  plugins enabled; entries are written with them. Without this, the game
+  auto-detected plugins but left them disabled and modded content never
+  loaded.
+- Deploy keeps the stored FOMOD options that still match instead of dropping
+  all of them when one is stale. One renamed option after a mod update used to
+  erase every pick, install the installer's defaults (nothing at all for an
+  all-Optional installer), and report success. Now the still-matching picks
+  install, the rest are named in a `warnings` entry, and an installer whose
+  options were matched by name from stored choices (the legacy path for
+  collections extracted before option records existed) says so rather than
+  looking recorded. When the install plan cannot be evaluated without game
+  state and the folder-based install runs instead, that is reported per mod.
+  Dry-run and `--json` carry the same warnings as the deploy result.
+- `deploy` no longer ignores `--game-dir` and `--prefix`. The pre-deploy checks
+  read what a previous run happened to record instead of the values this
+  deploy was given, so a first deploy of a manually configured game refused to
+  run even with `--game-dir` on the command line. The parameter now wins over
+  state, auto-detection last, and every check reports on the effective values.
+- `deploy` and `undeploy` count the same files. A deploy reported writes, not
+  destinations: two entries naming one destination counted twice, so
+  `Deployed 904 files` landed 763 symlinks. Deploy counts destinations and
+  undeploy counts mod files, so both report what is in the game directory, and
+  the dry run plans with the same picks and recorded configs the real deploy
+  uses.
+- `health` and `/status` no longer call the nxm handler OK while its executable
+  is missing. They checked only that the desktop entry was registered, so an
+  entry pointing at a deleted virtualenv read `installed and the default
+  nxm:// handler`; they now check the executable too and name the path they did
+  not find.
+- `deploy` stops writing packaging cruft into the game directory: `meta.ini`
+  (Vortex metadata a mod author packed by accident), `.gitignore`, and licence
+  text join `readme*` on the skip list. And a deploy conflict between two files
+  with one name now names the source paths, which is the part that differs,
+  instead of `overwritten by CapeAF_0.nif (was CapeAF_0.nif)`.
+- The deploy-time FOMOD folder filter's wrong installs are fixed. Four things
+  were wrong with it, all found by checking it against real installer configs:
+  `<folder>` and `<file>` sources were recorded in different shapes so folder
+  installs could never match the skip set; only the first folder of a plugin
+  was read, so unselected options still deployed half their content; the
+  name-matching fallback matched each numbered folder against each mod
+  independently, so one mod's choices could skip another mod's folders; and
+  the numbered-option pattern required a dash or underscore where real archives
+  use a plain space (`01 Main Mod`), which could deploy a mod's files under its
+  option wrapper directory. Space, dash, and underscore are all accepted now.
+  The filter itself is now only the fallback for an unreadable config; readable
+  installers deploy from the install plan above.
+
+### Known gaps and what was not verified
+
+- **No field use** (see the top). Specifically unverified: free-account
+  downloads (the API download path needs a premium key), Windows, and the
+  browser click chain end to end.
+- The `mods` table shows download status but not stored FOMOD picks. The
+  picks are in the state file and drive the deploy plan; the table just
+  does not surface them yet.
+- `deploy` has no confirmation of any kind, on purpose: the shell's `/deploy`
+  is the only confirm and nothing is ever deployed automatically. A harness
+  driving the CLI deploys non-interactively and that is the intended path.
+- A deploy conflict names source paths, not the owning mods. Once files are
+  extracted into the merged tree, which mod produced which file is not
+  recorded.
+- `fileDependency` and `gameDependency` installer conditions fall back to the
+  folder-based install with a per-mod warning until deploy can see the game's
+  load order.
+- Queued for 0.4.1: the full installer XML lives in the state file (a few KB
+  to about 60KB per FOMOD mod, rewritten on each save); installer configs have
+  no size cap before parsing and archive extraction has no decompression size
+  cap; name pre-validation for the system-tool extraction fallbacks; error-text scrubbing has no diagnostic escape for
+  a maintainer reading a bug report; the removed `serve` command reports
+  "command not found" rather than a deprecation stub; the staging/game-dir
+  overlap guard compares path strings rather than resolved paths; the legacy
+  tree scan and the archive marker check disagree on how deep a
+  `ModuleConfig.xml` may live.
+- Upgrading from 0.3.0: state files load unchanged. Installers extracted
+  before this release carry no option records, so deploy matches their options
+  by name from stored choices and warns that it is doing so. Downgrading to
+  0.3.0 after a 0.4.0 deploy is untested.
 
 ## [0.3.0] - 2026-11-17
 

@@ -1,0 +1,47 @@
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+	<moduleName>NVAC - New Vegas Anti Crash</moduleName>
+	<conditionalFileInstalls><patterns>
+		<pattern>
+			<dependencies>
+				<gameDependency version="1.9.32.0"/>
+				<dependencies operator="Or">
+				<fileDependency file="Skyrim.esm" state="Active"/>
+				<fileDependency file="Skyrim.esm" state="Inactive"/>
+			</dependencies></dependencies>
+			<files>
+				<folder source="NVSE" destination="SKSE"/>
+			</files>
+		</pattern><pattern>
+			<dependencies>
+				<gameDependency version="1.7.0.3"/>
+				<fileDependency file="FalloutNV.esm" state="Missing"/>
+				<dependencies operator="Or">
+				<fileDependency file="Fallout3.esm" state="Active"/>
+				<fileDependency file="Fallout3.esm" state="Inactive"/>
+			</dependencies></dependencies>
+			<files>
+				<folder source="NVSE" destination="FOSE"/>
+			</files>
+		</pattern><pattern>
+			<dependencies>
+				<gameDependency version="1.4.0.525"/>
+				<dependencies operator="Or">
+				<fileDependency file="FalloutNV.esm" state="Active"/>
+				<fileDependency file="FalloutNV.esm" state="Inactive"/>
+			</dependencies></dependencies>
+			<files>
+				<folder source="NVSE" destination="NVSE"/>
+			</files>
+		</pattern><pattern>
+			<dependencies>
+				<gameDependency version="1.2.0.416"/>
+				<dependencies operator="Or">
+				<fileDependency file="Oblivion.esm" state="Active"/>
+				<fileDependency file="Oblivion.esm" state="Inactive"/>
+			</dependencies></dependencies>
+			<files>
+				<folder source="NVSE" destination="OBSE"/>
+			</files>
+		</pattern>
+	</patterns></conditionalFileInstalls>
+</config>

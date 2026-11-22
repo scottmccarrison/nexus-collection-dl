@@ -126,7 +126,10 @@ def test_failure_mid_extraction_leaves_no_residue(tmp_path, monkeypatch):
 
     with pytest.raises(ExtractionError) as excinfo:
         extract_archive(archive, target)
-    assert "boom mid-extraction" in str(excinfo.value)
+    # The authored part survives; the raw RuntimeError text does not
+    # (see errmsg.exception_reason), so pin the wrapper, not the cause.
+    assert "Failed to extract" in str(excinfo.value)
+    assert "Mod-1.0.zip" in str(excinfo.value)
 
     # No partial content under the final names and no staging debris
     assert list(target.iterdir()) == []
@@ -188,7 +191,9 @@ def test_mid_publication_failure_leaves_earlier_files_and_cleans_staging(
 
     with pytest.raises(ExtractionError) as excinfo:
         extract_archive(archive, target)
-    assert "device exploded mid-move" in str(excinfo.value)
+    # Authored wrapper survives; the raw OSError text does not.
+    assert "Failed to extract" in str(excinfo.value)
+    assert "Mod-1.0.zip" in str(excinfo.value)
 
     # The first file was already published; the rest never moved
     published = sorted(p for p in target.rglob("*") if p.is_file())

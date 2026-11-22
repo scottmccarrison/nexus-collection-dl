@@ -5,11 +5,15 @@ import hashlib
 import os
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .fomod_plan import ModuleConfig
+    from .fomod_select import Pick
 
 from .api import NexusAPI, NexusAPIError
 from .collection import (
@@ -39,7 +43,22 @@ from .downloader import (
     SignedLink,
     validate_download_filename,
 )
-from .extractor import ExtractionError, extract_archive, is_archive, sniff_archive_magic
+from .errmsg import exception_reason
+from .extractor import (
+    ExtractionError,
+    FomodChoicesError,
+    FomodInstallerError,
+    FomodUnreadableError,
+    can_enumerate_members,
+    extract_archive,
+    find_fomod_installer,
+    find_module_config,
+    is_archive,
+    read_archive_member,
+    sniff_archive_magic,
+)
+from .fomod_plan import decode_config_text, load_module_config_bytes
+from .fomod_select import PickError
 from .handler import (
     DesktopInstaller,
     NxmRoutingError,
@@ -106,6 +125,166 @@ def _state_text(value: Any, fallback: str = "") -> str:
         return fallback
 
 
+def _fomod_config_for_archive(archive_path: Path) -> "ModuleConfig | None":
+    """Read an archive's FOMOD installer config without extracting it.
+
+    Returns None for an archive that is not a FOMOD mod. Raises for the
+    two refusals: an archive this tool cannot enumerate at all (we do not
+    know whether it is FOMOD, and extracting on a guess is the harm this
+    exists to stop), and a script-based installer whose options are
+    computed rather than declared. ``--no-extract`` is the escape hatch
+    for a mod the caller knows is safe.
+    """
+    if not can_enumerate_members(archive_path):
+        raise ExtractionError(
+            f"could not inspect {archive_path.name} for a FOMOD installer: "
+            f"this archive format cannot be listed here. Extracting on a "
+            f"guess could install every option of a FOMOD mod at once. If "
+            f"you know it is not a FOMOD mod, use --no-extract and extract "
+            f"it yourself."
+        )
+    member = find_module_config(archive_path)
+    if member is None:
+        marker = find_fomod_installer(archive_path)
+        if marker is not None:
+            raise FomodInstallerError(marker, archive_path)
+        return None
+
+    raw = read_archive_member(archive_path, member)
+    config = load_module_config_bytes(raw) if raw is not None else None
+    if config is None:
+        raise FomodUnreadableError(member, archive_path)
+    return config
+
+
+def _unused_picks_warning(name: str, no_extract: bool) -> str:
+    """The message for picks the caller asked for that nothing could apply.
+
+    Built away from the call sites so the text has one home: both the add
+    and the import path report the same two causes the same way.
+    """
+    if no_extract:
+        return (
+            f"{name} was kept unextracted, so the requested FOMOD option "
+            f"choices were not used. Extract it (or import it) to install "
+            f"specific options."
+        )
+    return (
+        f"{name} has no FOMOD installer, so the requested FOMOD option "
+        f"choices were not used."
+    )
+
+
+def _fomod_config_record(archive_path: Path) -> dict[str, str] | None:
+    """The archive's FOMOD installer config as a storable record.
+
+    Returns ``{"member": <archive-relative path>, "xml": <text>}`` or None
+    when the archive carries no ModuleConfig.xml or its bytes cannot be
+    read. Unlike :func:`_fomod_config_for_archive` this never raises: it
+    runs at extract time over archives that are being extracted anyway,
+    and a mod with no record still has the in-tree config deploy
+    discovers on its own.
+    """
+    if not can_enumerate_members(archive_path):
+        return None
+    member = find_module_config(archive_path)
+    if member is None:
+        return None
+    raw = read_archive_member(archive_path, member)
+    if raw is None:
+        return None
+    text = decode_config_text(raw)
+    if text is None:
+        return None
+    return {"member": member, "xml": text}
+
+
+def _nxm_fomod_blocker(archive_path: Path) -> str | None:
+    """A message when this archive must not be extracted without choices.
+
+    Only a positively identified FOMOD is blocked. An archive this tool
+    cannot enumerate at all returns None: extraction has its own honest
+    failure for that, and refusing every uninspectable archive would stop
+    downloads that are not FOMOD at all.
+
+    Extracting a FOMOD without its option choices installs the wrong
+    content, and for the common all-Optional installer that content is
+    nothing at all, which looks exactly like success. This is the click
+    path's half of the rule ``add`` and ``import`` already follow.
+    """
+    try:
+        config = _fomod_config_for_archive(archive_path)
+    except FomodInstallerError as e:
+        return exception_reason(e)
+    except FomodUnreadableError as e:
+        # The installer was found, so this is a FOMOD mod whatever its
+        # bytes look like. Extracting it now is exactly the harm this
+        # exists to stop.
+        return exception_reason(e)
+    except ExtractionError:
+        # Not inspectable at all: not proof of a FOMOD mod, and blocking
+        # every uninspectable download would stop plain mods too.
+        return None
+    if config is None:
+        return None
+    parent = archive_path.parent
+    return (
+        f"{archive_path.name} is a FOMOD mod and needs option choices before "
+        f"it can be extracted; extracting it now would install the wrong "
+        f"content. Run 'nexus-dl import {parent} --fomod-option "
+        f"\"Group:Option\"' to install it with your choices. The archive is "
+        f"kept at {archive_path}."
+    )
+
+
+def _resolve_fomod_picks(
+    config: "ModuleConfig",
+    archive_name: str,
+    provided: "Sequence[Pick] | None",
+    stored: "Sequence[dict[str, str]] | None",
+    on_fomod_prompt: "Callable[..., Sequence[Pick]] | None",
+) -> "list[Pick]":
+    """Decide which options a FOMOD archive installs.
+
+    Command-line picks win outright, and a pick that names nothing in the
+    installer is an error rather than a silent mismatch. Without them, the
+    picks stored from a previous install are kept as far as they still
+    name real options and the rest is asked again when there is somebody
+    to ask; with nobody to ask, the kept picks stand and the groups they
+    no longer cover fall back to the installer's own defaults. With
+    nothing at all, refuse: guessing is the harm this exists to stop.
+    """
+    from .fomod_select import Pick, PickError, normalize_picks, picks_to_selections
+
+    if provided:
+        return normalize_picks(provided, config)
+
+    kept: list[Pick] = []
+    if stored:
+        stored_picks = [
+            Pick(step=str(d.get("step", "")), group=str(d.get("group", "")),
+                 option=str(d.get("option", "")))
+            for d in stored
+        ]
+        try:
+            selections, _unmatched = picks_to_selections(stored_picks, config)
+        except PickError:
+            # A name that became ambiguous when the installer changed is
+            # dropped; anything unambiguous is still kept below.
+            selections = {}
+        for (step_name, group_name), option_names in selections.items():
+            for option in option_names:
+                kept.append(Pick(step=step_name, group=group_name, option=option))
+
+    if on_fomod_prompt is not None:
+        asked = on_fomod_prompt(config, archive_name, kept)
+        return kept + list(asked)
+
+    if kept or stored:
+        return kept
+    raise FomodChoicesError(archive_name)
+
+
 @dataclass
 class ModStatus:
     mod_id: int
@@ -153,6 +332,7 @@ class ImportResult:
     still_pending: int
     errors: list[str]
     load_order_files: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -223,6 +403,7 @@ class AddResult:
     success: bool
     error: str = ""
     pending_download: PendingDownload | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -247,6 +428,12 @@ class NxmResult:
     extracted: bool = False
     error: str = ""
     re_click_required: bool = False  # user must re-click on the website
+    # What the collection state says about this file now: "downloaded",
+    # "pending_download", or "" when nothing was recorded. Separate from
+    # `status` because a failed extraction can still leave a recoverable
+    # pending entry, and the caller needs to tell "run import to finish"
+    # apart from "nothing was recorded".
+    download_status: str = ""
     # Non-fatal issues on an otherwise successful run (e.g. load order
     # regeneration failed after the download was already completed and
     # saved). Truthful completion: success stays True, the warning says
@@ -671,6 +858,15 @@ class CollectionSummary:
 
 
 @dataclass
+class GameSummary:
+    """One game's rollup of collections and mods (see list_games)."""
+
+    game_domain: str
+    collection_count: int
+    mod_count: int
+
+
+@dataclass
 class ModSummary:
     """One tracked mod file from local state (see list_mods)."""
 
@@ -752,11 +948,9 @@ def scan_collections(root: Path) -> CollectionScan:
             # StateError, OSError, or int()/type errors on bad keys.)
             # The safe stringify pattern keeps a whitespace-only
             # message from raising here and hiding every collection.
-            lines = (str(e) or "").strip().splitlines()
-            summary = f"{lines[0][:60]}" if lines else ""
-            reason = (
-                f"{type(e).__name__}: {summary}" if summary else type(e).__name__
-            )
+            # exception_reason never returns blank and never raises, so
+            # there is no empty-list indexing to guard against here.
+            reason = exception_reason(e)[:120]
             skipped.append(
                 SkippedCollection(
                     name=cdir.name,
@@ -793,6 +987,25 @@ def list_collections(root: Path) -> list[CollectionSummary]:
     the healthy ones. Never touches the network. Sorted by name.
     """
     return scan_collections(root).collections
+
+
+def list_games(root: Path) -> list[GameSummary]:
+    """Roll collections up by game domain (read-only, no network).
+
+    Same scan as list_collections, aggregated so a caller can see what is
+    present per game without reading every collection. Games with no
+    readable collections simply do not appear. Sorted by game domain.
+    """
+    totals: dict[str, list[int]] = {}
+    for c in list_collections(root):
+        domain = _state_text(c.game_domain) or "-"
+        row = totals.setdefault(domain, [0, 0])
+        row[0] += 1
+        row[1] += c.mod_count
+    return [
+        GameSummary(game_domain=domain, collection_count=counts[0], mod_count=counts[1])
+        for domain, counts in sorted(totals.items())
+    ]
 
 
 def list_mods(mods_dir: Path) -> list[ModSummary]:
@@ -1073,6 +1286,7 @@ class ModManagerService:
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
         target_dir: Path | None = None,
+        show_progress: bool = True,
     ) -> SyncResult:
         """Download an entire collection.
 
@@ -1250,6 +1464,7 @@ class ModManagerService:
                     mods=mods_to_download,
                     target_dir=mods_dir,
                     on_progress=on_download_progress,
+                    show_progress=show_progress,
                 )
 
             # Extract archives
@@ -1259,6 +1474,7 @@ class ModManagerService:
             conflicts: list[FileConflict] = []
             for i, (mod_info, file_path) in enumerate(results):
                 try:
+                    config_record = None
                     if not no_extract and is_archive(file_path):
                         final_files = extract_archive(file_path, mods_dir)
                         for ef in final_files:
@@ -1267,6 +1483,7 @@ class ModManagerService:
                             if prev_owner:
                                 conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                             file_owners[rel] = mod_info["mod_name"]
+                        config_record = _fomod_config_record(file_path)
                         file_path.unlink()
                         extracted += 1
                     else:
@@ -1276,11 +1493,13 @@ class ModManagerService:
                             conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                         file_owners[rel] = mod_info["mod_name"]
                     state.add_mod(mod_info)
+                    if config_record is not None:
+                        state.mods[mod_info["file_id"]].fomod_config = config_record
                     state.save()
                     pct = 0.75 + 0.15 * ((i + 1) / len(results))
                     progress("extract", pct, f"Extracted {mod_info['mod_name']}")
                 except ExtractionError as e:
-                    errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                    errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
 
             # Generate load order
             if not no_load_order:
@@ -1314,6 +1533,7 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        show_progress: bool = True,
     ) -> UpdateResult:
         """Check for and download updates."""
         progress = on_progress or _noop_progress
@@ -1376,18 +1596,23 @@ class ModManagerService:
                         mods=mods_to_download,
                         target_dir=mods_dir,
                         on_progress=on_download_progress,
+                        show_progress=show_progress,
                     )
 
                     progress("extract", 0.75, "Extracting archives...")
                     for mod_info, file_path in results:
                         try:
+                            config_record = None
                             if not no_extract and is_archive(file_path):
                                 extract_archive(file_path, mods_dir)
+                                config_record = _fomod_config_record(file_path)
                                 file_path.unlink()
                             state.add_mod(mod_info)
+                            if config_record is not None:
+                                state.mods[mod_info["file_id"]].fomod_config = config_record
                             downloaded += 1
                         except ExtractionError as e:
-                            errors.append(f"Extraction error for {mod_info['mod_name']}: {e}")
+                            errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
                 else:
                     # Free user: register as pending
                     game_domain = collection_data["game_domain"]
@@ -1444,8 +1669,18 @@ class ModManagerService:
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        show_progress: bool = True,
+        fomod_picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
     ) -> AddResult:
-        """Add a single mod by Nexus URL."""
+        """Add a single mod by Nexus URL.
+
+        ``fomod_picks`` are the FOMOD option choices to install, when the
+        caller already has them (a flag or a choices file). Without them
+        and with ``on_fomod_prompt`` set, the installer's groups are
+        handed to that callback to ask about. Without either, a FOMOD
+        archive is refused rather than extracted to every option at once.
+        """
         progress = on_progress or _noop_progress
 
         mod_info = parse_mod_url(mod_url)
@@ -1544,6 +1779,7 @@ class ModManagerService:
                 mods=[download_info],
                 target_dir=mods_dir,
                 on_progress=on_download_progress,
+                show_progress=show_progress,
             )
 
             if not results:
@@ -1553,15 +1789,47 @@ class ModManagerService:
                 )
 
             progress("extract", 0.85, "Extracting...")
+            # Read the FOMOD installer (if any) and settle the option
+            # choices BEFORE extracting anything, so a multi-file add
+            # extracts nothing when one file's choices cannot be
+            # resolved. Picks recorded by a previous install are kept as
+            # far as they still name real options.
+            resolved_picks: list = []
+            fomod_seen = False
+            if not no_extract:
+                previous = state.mods.get(selected_file_id)
+                stored_picks = previous.fomod_picks if previous is not None else None
+                for _mod, file_path in results:
+                    if not is_archive(file_path):
+                        continue
+                    config = _fomod_config_for_archive(file_path)
+                    if config is None:
+                        continue
+                    fomod_seen = True
+                    resolved_picks = _resolve_fomod_picks(
+                        config,
+                        file_path.name,
+                        fomod_picks,
+                        stored_picks,
+                        on_fomod_prompt,
+                    )
+
+            # Picks the caller asked for that nothing could apply must not
+            # vanish: the add succeeds, but it says so.
+            add_warnings: list[str] = []
+            if fomod_picks and not fomod_seen:
+                add_warnings.append(_unused_picks_warning(mod_name, no_extract))
+            config_record = None
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
                         extract_archive(file_path, mods_dir)
+                        config_record = _fomod_config_record(file_path)
                         file_path.unlink()
                 except ExtractionError as e:
                     return AddResult(
                         mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                        success=False, error=f"Extraction error: {e}"
+                        success=False, error=f"Extraction error: {exception_reason(e)}"
                     )
 
             # Register in state as manual
@@ -1569,6 +1837,13 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            if config_record is not None:
+                state.mods[selected_file_id].fomod_config = config_record
+            if resolved_picks:
+                state.mods[selected_file_id].fomod_picks = [
+                    {"step": p.step, "group": p.group, "option": p.option}
+                    for p in resolved_picks
+                ]
             # Registering this mod is an explicit re-add, so its removal
             # tombstone (if any) is cleared with the same commit.
             state.clear_removed(mod_info.mod_id)
@@ -1590,7 +1865,7 @@ class ModManagerService:
             progress("done", 1.0, f"Added {mod_name}")
             return AddResult(
                 mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
-                success=True,
+                success=True, warnings=add_warnings,
             )
 
     def add_local(self, name: str, mods_dir: Path, no_load_order: bool = False) -> int:
@@ -1710,7 +1985,7 @@ class ModManagerService:
                 # the prior state file stands unchanged on any failure.
                 raise StateError(
                     f"Failed to save state after removing mod "
-                    f"{target_mod_id}: {e}"
+                    f"{target_mod_id}: {exception_reason(e)}"
                 ) from e
 
             if not no_load_order:
@@ -1722,7 +1997,7 @@ class ModManagerService:
                     warnings.append(
                         f"Mod {target_mod_id} was removed and the removal "
                         f"was saved, but load order regeneration failed: "
-                        f"{e}. Run 'nexus-dl load-order {mods_dir}' to "
+                        f"{exception_reason(e)}. Run 'nexus-dl load-order {mods_dir}' to "
                         f"retry."
                     )
 
@@ -1750,13 +2025,23 @@ class ModManagerService:
         ]
 
     def pre_deploy_checks(
-        self, state: "CollectionState", game_dir: Path, mods_dir: Path, method: str
+        self, state: "CollectionState", game_dir: Path, mods_dir: Path, method: str,
+        prefix: Path | None = None,
     ) -> list["DeployWarning"]:
-        """Run pre-deployment validation checks."""
+        """Run pre-deployment validation checks.
+
+        Checks report on the effective values for this deploy (the
+        ``game_dir`` and ``prefix`` the caller resolved), not on what
+        happens to be recorded in state. A first deploy of a game the
+        auto-detect list does not know, with ``--game-dir`` and
+        ``--prefix`` given on the command line, must pass: the user did
+        set them.
+        """
         warnings: list[DeployWarning] = []
 
-        # 1. Proton prefix missing
-        if find_proton_prefix(state.game_domain) is None and not state.proton_prefix:
+        # 1. Proton prefix missing (None means nothing resolved one: not
+        # the parameter, not state, not auto-detection).
+        if prefix is None:
             warnings.append(DeployWarning(
                 "no_prefix", "Proton prefix not found - plugins.txt and INI won't be written", "warning"
             ))
@@ -1800,8 +2085,8 @@ class ModManagerService:
                 "warning",
             ))
 
-        # 6. Game not in auto-detect
-        if state.game_domain not in STEAM_APP_IDS and not state.game_dir:
+        # 6. Game not in auto-detect, and no game dir from any source
+        if state.game_domain not in STEAM_APP_IDS and not game_dir:
             warnings.append(DeployWarning(
                 "unknown_game",
                 f"Game '{state.game_domain}' not in auto-detect list - game dir must be set manually",
@@ -1809,8 +2094,8 @@ class ModManagerService:
             ))
 
         # 7. Stale deployment
-        if state.deployed_at and state.game_dir:
-            game_path = Path(state.game_dir)
+        if state.deployed_at and game_dir:
+            game_path = Path(game_dir)
             # Check common game executables
             for exe_name in ["Starfield.exe", "SkyrimSE.exe", "Fallout4.exe"]:
                 exe = game_path / exe_name
@@ -1890,11 +2175,32 @@ class ModManagerService:
                 state.save()
                 journal.clear()
 
-            # Pre-deploy validation
+            # Resolve Proton prefix before the checks, so they report on
+            # the value this deploy will actually use. The parameter wins
+            # over state, and auto-detection is the last resort.
+            if prefix is None and state.proton_prefix:
+                prefix = Path(state.proton_prefix)
+            if prefix is None:
+                prefix = find_proton_prefix(game_domain)
+
+            # Pre-deploy validation.
+            #
+            # Proton/Wine cannot read Linux symlinks that cross outside
+            # the prefix, so a symlink deploy to a Proton game produces
+            # files the game sees by name but cannot load. Force copy
+            # mode whenever a Proton prefix is in play.
             method = "copy" if use_copy else "symlink"
-            check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method)
+            proton_symlink_override = method == "symlink" and prefix
+            if proton_symlink_override:
+                method = "copy"
+            check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
             deploy_warnings = [w.message for w in check_warnings]
             deploy_warnings.extend(reports)
+            if proton_symlink_override:
+                deploy_warnings.append(
+                    "Using copy mode: Proton games cannot read symlinks "
+                    "through the Wine prefix."
+                )
 
             # Block on errors
             errors_found = [w for w in check_warnings if w.severity == "error"]
@@ -1904,12 +2210,6 @@ class ModManagerService:
                     warnings=deploy_warnings,
                 )
 
-            # Resolve Proton prefix
-            if prefix is None and state.proton_prefix:
-                prefix = Path(state.proton_prefix)
-            if prefix is None:
-                prefix = find_proton_prefix(game_domain)
-
             # Preflight: classify BEFORE any destructive removal of the old
             # deployment, so a staging directory with nothing deployable
             # never tears down a working deployment.
@@ -1918,7 +2218,32 @@ class ModManagerService:
             if state.manifest_data:
                 manifest = CollectionManifest.from_dict(state.manifest_data)
                 manifest_choices = manifest.mod_choices
-            plan = classify_files(mods_dir, game_domain, mod_choices=manifest_choices)
+            # FOMOD option picks recorded by standalone adds and imports.
+            fomod_picks = {
+                mod.file_id: mod.fomod_picks
+                for mod in state.mods.values()
+                if mod.fomod_picks
+            }
+            # Installer configs recorded at extract time. The tree cannot
+            # hold more than one (a later mod's fomod/ModuleConfig.xml
+            # overwrites an earlier one), so these copies are what let
+            # deploy plan for every FOMOD mod at once.
+            fomod_configs = {
+                mod.file_id: {**mod.fomod_config, "mod_id": mod.mod_id}
+                for mod in state.mods.values()
+                if mod.fomod_config
+            }
+            plan = classify_files(
+                mods_dir,
+                game_domain,
+                mod_choices=manifest_choices,
+                fomod_picks=fomod_picks,
+                fomod_configs=fomod_configs,
+                mod_names={
+                    mod.file_id: mod.name for mod in state.mods.values()
+                },
+            )
+            deploy_warnings.extend(plan.warnings)
 
             if plan.total_files == 0:
                 errors: list[str] = []
@@ -1974,6 +2299,40 @@ class ModManagerService:
                 )
             if prefix and not result.errors:
                 plugins_src = mods_dir / "plugins.txt"
+                # When the staging plugins.txt has no plugin entries (the
+                # manifest carried no plugin data, or the file is just
+                # comments), build one from what was actually deployed.
+                # The deployed files are the ground truth for plugin names.
+                existing_plugins = ""
+                if plugins_src.exists():
+                    for line in plugins_src.read_text().splitlines():
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith("#"):
+                            existing_plugins = stripped
+                            break
+                if not existing_plugins:
+                    plugin_exts = (".esp", ".esm", ".esl")
+                    seen_plugins: set[str] = set()
+                    plugin_lines: list[str] = []
+                    for df in result.deployed:
+                        if df.kind != "mod":
+                            continue
+                        name = Path(df.dest).name
+                        if not name.lower().endswith(plugin_exts):
+                            continue
+                        if name not in seen_plugins:
+                            seen_plugins.add(name)
+                            plugin_lines.append(f"*{name}")
+                    if plugin_lines:
+                        plugins_src.write_text(
+                            "# Plugin Load Order (generated from deployed files)\n"
+                            "# Generated by nexus-collection-dl\n"
+                            f"# Game: {game_domain}\n"
+                            "#\n"
+                            "# Lines beginning with * are enabled.\n"
+                            "\n"
+                            + "\n".join(plugin_lines) + "\n"
+                        )
                 plugins_dest = get_plugins_txt_dest(prefix, game_domain)
                 if plugins_dest and plugins_src.exists():
                     try:
@@ -1983,7 +2342,7 @@ class ModManagerService:
                             ownership=ownership,
                         )
                     except (DeployError, OSError) as e:
-                        result.errors.append(f"plugins.txt: {e}")
+                        result.errors.append(f"plugins.txt: {exception_reason(e)}")
                 ini_path = get_game_ini_path(prefix, game_domain)
                 if ini_path:
                     try:
@@ -1993,7 +2352,7 @@ class ModManagerService:
                             ownership=ownership,
                         )
                     except (DeployError, OSError) as e:
-                        result.errors.append(f"game INI: {e}")
+                        result.errors.append(f"game INI: {exception_reason(e)}")
 
             # Save state
             state.game_dir = str(game_dir)
@@ -2111,12 +2470,83 @@ class ModManagerService:
         state.load()
         return self._sync_tracked_mods(state)
 
+    def install_fomod_picks(
+        self,
+        mods_dir: Path,
+        file_id: int,
+        picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
+    ) -> str:
+        """Install a FOMOD archive that is waiting on its option choices.
+
+        This is how a ``pending_choices`` entry gets finished: the archive
+        the click kept is extracted with the given picks (or the ones the
+        prompt callback collects) and the mod is recorded as downloaded
+        with those picks stored. Returns a one-line human report.
+
+        Raises the same errors the ``add`` path does: ``PickError`` for a
+        pick the installer does not offer, ``FomodChoicesError`` when
+        there is nothing to pick from and nobody to ask, ``StateError``
+        when the entry or its archive is gone.
+        """
+        with CollectionLock(mods_dir):
+            state = CollectionState(mods_dir)
+            state.load()
+            mod = state.mods.get(file_id)
+            if mod is None:
+                raise StateError(
+                    f"no tracked mod with file id {file_id} in this collection"
+                )
+            archive = mods_dir / mod.filename
+            if not mod.filename or not archive.exists():
+                raise StateError(
+                    f"the archive for {mod.name or mod.filename} is not in "
+                    f"{mods_dir}; click the download link again to fetch it"
+                )
+
+            config = _fomod_config_for_archive(archive)
+            if config is None:
+                raise StateError(f"{archive.name} is not a FOMOD mod")
+
+            resolved = _resolve_fomod_picks(
+                config, archive.name, picks, mod.fomod_picks, on_fomod_prompt
+            )
+            if not resolved:
+                raise FomodChoicesError(archive.name)
+
+            extract_archive(archive, mods_dir)
+            config_record = _fomod_config_record(archive)
+            mod.download_status = "downloaded"
+            mod.browser_url = ""
+            mod.installed_at = datetime.now(timezone.utc).isoformat()
+            mod.fomod_picks = [
+                {"step": p.step, "group": p.group, "option": p.option}
+                for p in resolved
+            ]
+            if config_record is not None:
+                mod.fomod_config = config_record
+            # Finishing the install is explicit re-add intent, so any
+            # removal tombstone for the page goes with the same commit.
+            state.clear_removed(mod.mod_id)
+            state.save()
+            try:
+                archive.unlink()
+            except OSError:
+                pass
+
+        return (
+            f"{mod.name or mod.filename} installed with "
+            f"{len(resolved)} option choice(s)"
+        )
+
     def import_downloads(
         self,
         mods_dir: Path,
         no_load_order: bool = False,
         no_extract: bool = False,
         on_progress: ProgressCallback | None = None,
+        fomod_picks: "Sequence[Pick] | None" = None,
+        on_fomod_prompt: "Callable[..., Sequence[Pick]] | None" = None,
     ) -> ImportResult:
         """Match manually downloaded files to pending mods, extract, and update state.
 
@@ -2134,6 +2564,7 @@ class ModManagerService:
         """
         progress = on_progress or _noop_progress
         errors: list[str] = []
+        import_warnings: list[str] = []
 
         with CollectionLock(mods_dir):
             state = CollectionState(mods_dir)
@@ -2254,20 +2685,67 @@ class ModManagerService:
                 matched += 1
 
                 is_arch = is_archive(match)
+                resolved_picks: list = []
+                config_record = None
+                scoped = None
+                fomod_seen = False
                 try:
+                    from .fomod_select import picks_for_file
+
+                    scoped = (
+                        picks_for_file(fomod_picks, match.name)
+                        if fomod_picks
+                        else None
+                    )
                     if not no_extract and is_arch:
+                        config = _fomod_config_for_archive(match)
+                        if config is not None:
+                            fomod_seen = True
+                            resolved_picks = _resolve_fomod_picks(
+                                config,
+                                match.name,
+                                scoped,
+                                mod_state.fomod_picks,
+                                on_fomod_prompt,
+                            )
                         extract_archive(match, mods_dir)
+                        config_record = _fomod_config_record(match)
                         extracted += 1
+                except FomodInstallerError as e:
+                    # Same contract as a failed extraction: report it and
+                    # leave the item pending rather than abort the batch.
+                    # The message is self-contained, so it is the report.
+                    errors.append(f"{mod_state.name}: {exception_reason(e)}")
+                    continue
+                except (FomodChoicesError, PickError) as e:
+                    # Choices we cannot settle are the same shape of
+                    # refusal: report, keep the archive, leave pending.
+                    errors.append(f"{mod_state.name}: {exception_reason(e)}")
+                    continue
                 except ExtractionError as e:
                     # A failed extraction must never mark the mod downloaded.
                     # The archive stays on disk and the item stays pending;
                     # partially moved content cannot be rolled back.
-                    errors.append(f"Extraction error for {mod_state.name}: {e}")
+                    errors.append(f"Extraction error for {mod_state.name}: {exception_reason(e)}")
                     continue
+
+                # Picks the caller asked for that nothing could apply must
+                # not vanish: the import succeeds, but it says so.
+                if scoped and not fomod_seen:
+                    import_warnings.append(
+                        _unused_picks_warning(mod_state.name, no_extract)
+                    )
 
                 mod_state.download_status = "downloaded"
                 mod_state.browser_url = ""
                 mod_state.installed_at = datetime.now(timezone.utc).isoformat()
+                if config_record is not None:
+                    mod_state.fomod_config = config_record
+                if resolved_picks:
+                    mod_state.fomod_picks = [
+                        {"step": p.step, "group": p.group, "option": p.option}
+                        for p in resolved_picks
+                    ]
                 # Importing this mod's file is an explicit re-add of the mod
                 # page, so any tombstone for it is cleared with the commit.
                 state.clear_removed(mod_state.mod_id)
@@ -2281,7 +2759,7 @@ class ModManagerService:
                     except OSError as e:
                         # The import itself succeeded and is persisted; a leftover
                         # archive is reported but does not roll back the success.
-                        errors.append(f"Could not remove {match.name} after import: {e}")
+                        errors.append(f"Could not remove {match.name} after import: {exception_reason(e)}")
 
                 pct = 0.1 + 0.8 * ((i + 1) / len(pending))
                 progress("import", pct, f"Imported {mod_state.name}")
@@ -2297,14 +2775,14 @@ class ModManagerService:
                 try:
                     load_order_files = self._regen_load_order_from_state(mods_dir, state)
                 except Exception as e:
-                    errors.append(f"Load order regeneration failed: {e}")
+                    errors.append(f"Load order regeneration failed: {exception_reason(e)}")
 
             # Sync tracked mods (same as premium sync does after downloading)
             if matched > 0:
                 try:
                     self._maybe_sync_tracked(state)
                 except Exception as e:
-                    errors.append(f"Track sync failed: {e}")
+                    errors.append(f"Track sync failed: {exception_reason(e)}")
 
             still_pending = len(state.get_pending_mods())
             progress("done", 1.0, f"Imported {matched} mods ({still_pending} still pending)")
@@ -2315,6 +2793,7 @@ class ModManagerService:
                 still_pending=still_pending,
                 errors=errors,
                 load_order_files=load_order_files,
+                warnings=import_warnings,
             )
 
     def add_nxm(
@@ -2426,7 +2905,7 @@ class ModManagerService:
                             dup_warnings.append(
                                 "The file was already downloaded, but the "
                                 "record of its earlier removal could not be "
-                                f"cleared: {e}. Nothing else failed; fix "
+                                f"cleared: {exception_reason(e)}. Nothing else failed; fix "
                                 "the underlying problem (permissions, disk "
                                 "space) and re-run to clear it."
                             )
@@ -2439,6 +2918,7 @@ class ModManagerService:
                         mod_name=existing.name,
                         filename=existing.filename,
                         collection_dir=target,
+                        download_status="downloaded",
                         warnings=dup_warnings,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
@@ -2450,6 +2930,32 @@ class ModManagerService:
                 # retained sane archive lives above (downloaded entries:
                 # already_downloaded no-op) and below (pending entries:
                 # extraction is completed from the archive).
+
+            if (
+                existing is not None
+                and existing.download_status == "pending_choices"
+                and existing.filename
+                and not no_extract
+                and (target / existing.filename).exists()
+            ):
+                # A FOMOD waiting on its option choices: a re-click must
+                # not extract it, and there is nothing to download either.
+                retained = target / existing.filename
+                message = _nxm_fomod_blocker(retained) or (
+                    f"{existing.filename} is a FOMOD mod that still needs "
+                    f"option choices before it can be extracted. Run "
+                    f"'nexus-dl import {target} --fomod-option "
+                    f"\"Group:Option\"' to install it with your choices. "
+                    f"The archive is kept at {retained}."
+                )
+                return self._nxm_failure(
+                    info,
+                    message,
+                    collection_dir=target,
+                    mod_name=existing.name,
+                    filename=existing.filename,
+                    download_status="pending_choices",
+                )
 
             if (
                 existing is not None
@@ -2494,7 +3000,7 @@ class ModManagerService:
                         return self._nxm_failure(
                             info,
                             f"The retained archive at {archive} could not "
-                            f"be extracted: {e}. Run 'nexus-dl import "
+                            f"be extracted: {exception_reason(e)}. Run 'nexus-dl import "
                             f"{target}' to retry, or remove the archive and "
                             "click the download link again for a fresh "
                             "copy.",
@@ -2502,9 +3008,12 @@ class ModManagerService:
                             mod_name=existing.name,
                             filename=existing.filename,
                         )
+                    config_record = _fomod_config_record(archive)
                     existing.download_status = "downloaded"
                     existing.browser_url = ""
                     existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    if config_record is not None:
+                        existing.fomod_config = config_record
                     # Committing this completion is explicit re-add intent,
                     # so the page's removal tombstone (if any) is cleared
                     # with the same save.
@@ -2516,7 +3025,7 @@ class ModManagerService:
                             info,
                             "Extraction from the retained archive succeeded "
                             "but the collection state could not be saved: "
-                            f"{e}. Extracted files were left in place and "
+                            f"{exception_reason(e)}. Extracted files were left in place and "
                             f"the archive is kept at {archive}. Fix the "
                             "underlying problem (permissions, disk space) "
                             f"and run 'nexus-dl import {target}'.",
@@ -2530,14 +3039,14 @@ class ModManagerService:
                     try:
                         self._maybe_sync_tracked(state)
                     except Exception as e:
-                        warnings.append(f"Tracked-mod sync failed: {e}")
+                        warnings.append(f"Tracked-mod sync failed: {exception_reason(e)}")
                     if not no_load_order:
                         progress("loadorder", 0.9, "Regenerating load order...")
                         try:
                             self._regen_load_order_from_state(target, state)
                         except Exception as e:
                             warnings.append(
-                                f"Load order regeneration failed: {e}. Run "
+                                f"Load order regeneration failed: {exception_reason(e)}. Run "
                                 f"'nexus-dl load-order {target}' to retry."
                             )
                     progress("done", 1.0, f"Extracted {existing.name}")
@@ -2551,6 +3060,7 @@ class ModManagerService:
                         filename=existing.filename,
                         collection_dir=target,
                         extracted=True,
+                        download_status="downloaded",
                         warnings=warnings,
                     )
                 # Retained archive failed the sanity checks (missing
@@ -2581,7 +3091,7 @@ class ModManagerService:
                     selected.get("file_name") or selected.get("name")
                 )
             except DownloadError as e:
-                return self._nxm_failure(info, str(e), collection_dir=target)
+                return self._nxm_failure(info, exception_reason(e), collection_dir=target)
 
             mod_name = self._nxm_mod_name(info, existing=existing)
 
@@ -2727,7 +3237,7 @@ class ModManagerService:
             except DownloadError as e:
                 # State is untouched and any previous files are intact:
                 # a failed download never claims completion.
-                message = str(e)
+                message = exception_reason(e)
                 if owned_dest_hint and "refusing to overwrite" in message:
                     message += owned_dest_hint
                 return self._nxm_failure(
@@ -2736,16 +3246,60 @@ class ModManagerService:
                 )
 
             extracted = False
+            config_record = None
             if not no_extract and is_archive(path):
+                blocker = _nxm_fomod_blocker(path)
+                if blocker is not None:
+                    # A FOMOD with no option choices: never extract it.
+                    # Registering the entry as needing choices is what
+                    # lets `import` finish the job with the user's picks.
+                    pending_recorded = False
+                    if existing is None:
+                        download_info["manual"] = True
+                        download_info["download_status"] = "pending_choices"
+                        state.add_mod(download_info)
+                        state.mods[info.file_id].phase = 999
+                        # Same explicit re-add intent as the failed-
+                        # extraction branch below.
+                        state.clear_removed(info.mod_id)
+                        try:
+                            state.save()
+                            pending_recorded = True
+                        except (OSError, StateError):
+                            pending_recorded = False
+                    else:
+                        previous_status = existing.download_status
+                        existing.download_status = "pending_choices"
+                        state.clear_removed(info.mod_id)
+                        try:
+                            state.save()
+                            pending_recorded = True
+                        except (OSError, StateError):
+                            existing.download_status = previous_status
+                    return self._nxm_failure(
+                        info,
+                        blocker,
+                        collection_dir=target,
+                        mod_name=mod_name,
+                        filename=filename,
+                        download_status=(
+                            "pending_choices" if pending_recorded else ""
+                        ),
+                    )
                 try:
                     extract_archive(path, target)
                     extracted = True
+                    config_record = _fomod_config_record(path)
                 except ExtractionError as e:
                     # Extraction failed: never claim completion. The
                     # verified archive stays on disk and the entry stays
                     # (or becomes) pending so `nexus-dl import` can finish
                     # the job without another download.
                     state_note = ""
+                    # Set only when a pending entry actually landed in
+                    # state, so the result can tell "run import to finish"
+                    # apart from "nothing was recorded".
+                    pending_recorded = False
                     if existing is None:
                         download_info["manual"] = True
                         download_info["download_status"] = "pending_download"
@@ -2758,6 +3312,7 @@ class ModManagerService:
                         state.clear_removed(info.mod_id)
                         try:
                             state.save()
+                            pending_recorded = True
                         except (OSError, StateError) as save_exc:
                             # Same honest handling as the sibling branches:
                             # return a failed NxmResult instead of raising
@@ -2767,9 +3322,9 @@ class ModManagerService:
                             return self._nxm_failure(
                                 info,
                                 f"Download succeeded but extraction "
-                                f"failed: {e}. The archive is kept at "
+                                f"failed: {exception_reason(e)}. The archive is kept at "
                                 f"{path}, but the collection state could "
-                                f"not be updated ({save_exc}), so nothing "
+                                f"not be updated ({exception_reason(save_exc)}), so nothing "
                                 f"was recorded and 'nexus-dl import' "
                                 f"cannot see it. Fix the underlying "
                                 f"problem (permissions, disk space), then "
@@ -2800,13 +3355,14 @@ class ModManagerService:
                         state.clear_removed(info.mod_id)
                         try:
                             state.save()
+                            pending_recorded = True
                         except (OSError, StateError) as save_exc:
                             existing.download_status = "downloaded"
                             if removed_snapshot is not None:
                                 state.removed_mods[info.mod_id] = removed_snapshot
                             state_note = (
                                 " The collection state could not be "
-                                f"updated ({save_exc}), so the entry "
+                                f"updated ({exception_reason(save_exc)}), so the entry "
                                 "remains marked as downloaded; fix the "
                                 "underlying problem (permissions, disk "
                                 "space), then remove the archive and "
@@ -2814,12 +3370,15 @@ class ModManagerService:
                             )
                     return self._nxm_failure(
                         info,
-                        f"Download succeeded but extraction failed: {e}. "
+                        f"Download succeeded but extraction failed: {exception_reason(e)}. "
                         f"The archive is kept at {path}; run 'nexus-dl "
                         f"import {target}' to retry.{state_note}",
                         collection_dir=target,
                         mod_name=mod_name,
                         filename=filename,
+                        download_status=(
+                            "pending_download" if pending_recorded else ""
+                        ),
                     )
 
             if existing is not None:
@@ -2830,12 +3389,16 @@ class ModManagerService:
                 version = selected.get("version")
                 if version:
                     existing.version = str(version)
+                if config_record is not None:
+                    existing.fomod_config = config_record
             else:
                 download_info["manual"] = True
                 download_info["download_status"] = "downloaded"
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
+                if config_record is not None:
+                    state.mods[info.file_id].fomod_config = config_record
             # Completing this download is explicit re-add intent, so the
             # page's removal tombstone (if any) is cleared with the same
             # save that marks the file downloaded.
@@ -2853,7 +3416,7 @@ class ModManagerService:
                 return self._nxm_failure(
                     info,
                     f"The download completed but the collection state could "
-                    f"not be saved: {e}. The verified archive is kept at "
+                    f"not be saved: {exception_reason(e)}. The verified archive is kept at "
                     f"{path}.{extracted_note} Nothing was marked as "
                     f"downloaded. Fix the underlying problem (permissions, "
                     f"disk space) and run 'nexus-dl import {target}'"
@@ -2885,14 +3448,14 @@ class ModManagerService:
             try:
                 self._maybe_sync_tracked(state)
             except Exception as e:
-                warnings.append(f"Tracked-mod sync failed: {e}")
+                warnings.append(f"Tracked-mod sync failed: {exception_reason(e)}")
             if not no_load_order:
                 progress("loadorder", 0.9, "Regenerating load order...")
                 try:
                     self._regen_load_order_from_state(target, state)
                 except Exception as e:
                     warnings.append(
-                        f"Load order regeneration failed: {e}. Run "
+                        f"Load order regeneration failed: {exception_reason(e)}. Run "
                         f"'nexus-dl load-order {target}' to retry."
                     )
 
@@ -2907,6 +3470,7 @@ class ModManagerService:
                 filename=filename,
                 collection_dir=target,
                 extracted=extracted,
+                download_status="downloaded",
                 warnings=warnings,
             )
 
@@ -2940,7 +3504,7 @@ class ModManagerService:
                 selected.get("file_name") or selected.get("name")
             )
         except DownloadError as e:
-            return self._nxm_failure(info, str(e))
+            return self._nxm_failure(info, exception_reason(e))
 
         # Refuse ANY existing destination entry BEFORE downloading
         # (regular file, symlink, or dangling symlink): --output must
@@ -3001,7 +3565,7 @@ class ModManagerService:
                 no_clobber=True,
             )
         except DownloadError as e:
-            return self._nxm_failure(info, str(e), filename=filename)
+            return self._nxm_failure(info, exception_reason(e), filename=filename)
 
         # Archive-only drop: a payload without real archive magic (error
         # page, loose file, truncated download) is removed, not left behind.
@@ -3037,6 +3601,7 @@ class ModManagerService:
         mod_name: str = "",
         filename: str = "",
         re_click_required: bool = False,
+        download_status: str = "",
     ) -> NxmResult:
         """Build a failed NxmResult from safe components only."""
         return NxmResult(
@@ -3050,6 +3615,7 @@ class ModManagerService:
             collection_dir=collection_dir,
             error=error,
             re_click_required=re_click_required,
+            download_status=download_status,
         )
 
     def _nxm_premium(self, user_info: dict) -> bool:
@@ -3226,7 +3792,7 @@ class ModManagerService:
             raise
         except Exception as e:
             raise LoadOrderRegenError(
-                f"Load order regeneration failed: {e}"
+                f"Load order regeneration failed: {exception_reason(e)}"
             ) from e
 
     def _regen_load_order_unwrapped(self, mods_dir: Path, state: CollectionState) -> list[str]:
@@ -3271,7 +3837,7 @@ class ModManagerService:
             written_files = [p.name for p in written]
         except Exception as e:
             raise LoadOrderRegenError(
-                f"Load order generation failed: {e}"
+                f"Load order generation failed: {exception_reason(e)}"
             ) from e
 
         if is_bethesda_game(state.game_domain) and is_loot_available():
@@ -3369,7 +3935,7 @@ def _probe_api_key_source() -> tuple[str | None, str | None]:
     try:
         _value, source = resolve_api_key(None)
     except KeyStoreError as e:
-        return None, str(e)
+        return None, exception_reason(e)
     return source, None
 
 
@@ -3510,6 +4076,18 @@ def _health_handler(probes: HealthProbes) -> list[HealthCheck]:
                 "not installed",
                 "Install with 'nexus-dl handler install' to handle "
                 "nxm:// clicks.",
+            )
+        ]
+    if not info.get("executable_exists"):
+        exe = info.get("executable")
+        where = f" at {exe}" if exe else ""
+        return [
+            HealthCheck(
+                "nxm handler",
+                "WARN",
+                f"installed but its executable is missing{where}",
+                "Re-run 'nexus-dl handler install' to point the desktop "
+                "entry at a working nexus-dl.",
             )
         ]
     if info.get("is_default"):
@@ -3693,7 +4271,7 @@ def collect_health(
         try:
             return fn()
         except Exception as e:
-            reason = (str(e) or "").strip().splitlines()
+            reason = (exception_reason(e) or "").strip().splitlines()
             detail = f"check failed ({type(e).__name__})"
             if reason:
                 detail = f"check failed ({type(e).__name__}: {reason[0][:60]})"

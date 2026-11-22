@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+  <moduleName>Choose One</moduleName>
+  <installSteps>
+    <installStep name="Options">
+      <optionalFileGroups>
+        <group name="Pack" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Alpha">
+              <description>The alpha pack.</description>
+              <image path="fomod/alpha.png"/>
+              <files>
+                <file source="alpha/manifest.json" destination="manifest.json" priority="0"/>
+              </files>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Beta">
+              <description>The beta pack.</description>
+              <files>
+                <file source="beta/manifest.json" destination="manifest.json" priority="0"/>
+              </files>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>

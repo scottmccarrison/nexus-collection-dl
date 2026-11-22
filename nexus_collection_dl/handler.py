@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .errmsg import exception_reason
 from .state import STATE_FILENAME, CollectionState, StateError
 
 CONFIG_DIR_NAME = "nexus-dl"
@@ -105,6 +106,22 @@ def state_dir() -> Path:
 
 
 NXM_LOG_FILENAME = "nxm.log"
+EVENTS_FILENAME = ".nexus-events.jsonl"
+
+# One click writes one line, so this cap is thousands of clicks. Rotation
+# exists only to bound a collection directory that accumulates them forever;
+# it is not part of the event protocol.
+_EVENTS_MAX_BYTES = 262144
+_EVENTS_OUTCOMES = frozenset(
+    {
+        "downloaded",
+        "extracted_from_archive",
+        "already_downloaded",
+        "pending_download",
+        "pending_choices",
+        "error",
+    }
+)
 _NXM_LOG_OUTCOMES = frozenset({"success", "warn", "error"})
 _NXM_LOG_MAX_DETAIL = 120
 # Detail text is rebuilt from this bounded charset: alphanumerics plus a
@@ -162,6 +179,92 @@ def append_nxm_log(outcome: str, detail: str = "") -> bool:
     return True
 
 
+def events_path(mods_dir: Path) -> Path:
+    """Per-collection click-event file, beside .nexus-state.json."""
+    return Path(mods_dir) / EVENTS_FILENAME
+
+
+def append_nxm_event(mods_dir: Path, payload: Mapping[str, Any]) -> bool:
+    """Append one click event to a collection's events file. Best-effort.
+
+    A running `nexus-dl shell` tails this file to learn that a browser
+    click landed a mod in a collection it has open. One line per click
+    attempt, written at the end of the attempt, so a new line means the
+    click is finished.
+
+    Values are caller-built display strings (already boundary-redacted
+    upstream); this function never receives URIs, keys, or credentials,
+    and would not write them if it did. The outcome token is restricted
+    to the known set so a stray value cannot invent a new event type.
+
+    Returns True when the line was written. Every failure returns False
+    instead of raising: a broken event log must never fail a download,
+    matching append_nxm_log.
+    """
+    outcome = str(payload.get("outcome", ""))
+    if outcome not in _EVENTS_OUTCOMES:
+        outcome = "error"
+    line = {
+        "v": 1,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "outcome": outcome,
+    }
+    for key in (
+        "collection_name",
+        "collection_dir",
+        "mod_name",
+        "filename",
+        "reason",
+    ):
+        line[key] = str(payload.get(key, ""))
+    for key in ("mod_id", "file_id"):
+        try:
+            line[key] = int(payload.get(key, 0))
+        except (TypeError, ValueError):
+            line[key] = 0
+    line["extracted"] = bool(payload.get("extracted", False))
+
+    raw = json.dumps(line, separators=(",", ":")) + "\n"
+    path = events_path(mods_dir)
+    try:
+        _rotate_events_if_needed(mods_dir, path)
+        # O_APPEND keeps concurrent clicks from interleaving partial
+        # lines; POSIX makes the offset update and the write one step.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, raw.encode("utf-8"))
+        finally:
+            os.close(fd)
+    except Exception:
+        return False
+    return True
+
+
+def _rotate_events_if_needed(mods_dir: Path, path: Path) -> None:
+    """Rename the events file aside once it passes the cap.
+
+    Runs under a non-blocking collection lock so two clicks cannot rotate
+    at the same time. If the lock is busy we simply append: losing the
+    rotation is harmless, losing an event is not. A reader that sees the
+    file shrink resets its offset and continues from the new file.
+    """
+    try:
+        if path.stat().st_size <= _EVENTS_MAX_BYTES:
+            return
+    except OSError:
+        return
+
+    from .state import CollectionLock
+
+    try:
+        with CollectionLock(mods_dir):
+            os.replace(path, path.with_name(path.name + ".1"))
+    except Exception:
+        # Busy or unwritable: append rather than risk dropping an event.
+        return
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write a text file atomically (temp file + fsync + rename)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,11 +298,11 @@ class HandlerConfig:
         except FileNotFoundError:
             return cfg
         except OSError as e:
-            raise HandlerError(f"Could not read handler config {cfg.path}: {e}")
+            raise HandlerError(f"Could not read handler config {cfg.path}: {exception_reason(e)}")
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise HandlerError(f"Handler config {cfg.path} is corrupt: {e}")
+            raise HandlerError(f"Handler config {cfg.path} is corrupt: {exception_reason(e)}")
         if not isinstance(data, dict):
             raise HandlerError(f"Handler config {cfg.path} is corrupt.")
         mappings = data.get("mappings")
@@ -232,7 +335,7 @@ def _load_collection_state(directory: Path) -> CollectionState:
     try:
         state.load()
     except StateError as e:
-        raise HandlerError(f"Could not read collection state in {directory}: {e}")
+        raise HandlerError(f"Could not read collection state in {directory}: {exception_reason(e)}")
     return state
 
 
@@ -1091,7 +1194,7 @@ class DesktopInstaller:
             try:
                 self.entry_path.unlink()
             except OSError as e:
-                raise DesktopEntryError(f"Could not remove {self.entry_path}: {e}")
+                raise DesktopEntryError(f"Could not remove {self.entry_path}: {exception_reason(e)}")
             self._refresh_database()
 
         self.config.desktop = {}

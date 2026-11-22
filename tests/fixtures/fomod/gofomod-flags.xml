@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <moduleName>Flags</moduleName>
+  <installSteps>
+    <installStep name="Pick">
+      <optionalFileGroups>
+        <group name="Mode" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="On">
+              <description>Set the flag.</description>
+              <conditionFlags>
+                <flag name="extra">yes</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Off">
+              <description>Leave it.</description>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies operator="And">
+          <flagDependency flag="extra" value="yes"/>
+        </dependencies>
+        <files>
+          <file source="extra.txt" destination="extra.txt" priority="0"/>
+        </files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>

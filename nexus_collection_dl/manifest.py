@@ -7,6 +7,7 @@ from typing import Any
 
 import requests
 
+from .errmsg import exception_reason
 from .extractor import extract_archive
 
 
@@ -144,7 +145,7 @@ def download_and_parse_manifest(
         try:
             extract_archive(bundle_path, extract_dir)
         except Exception as e:
-            raise ManifestError(f"Failed to extract collection bundle: {e}")
+            raise ManifestError(f"Failed to extract collection bundle: {exception_reason(e)}")
 
         # Find and parse collection.json
         collection_json = _find_collection_json(extract_dir)
@@ -158,7 +159,7 @@ def download_and_parse_manifest(
             with open(collection_json) as f:
                 data = json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            raise ManifestError(f"Failed to parse collection.json: {e}")
+            raise ManifestError(f"Failed to parse collection.json: {exception_reason(e)}")
 
         return _parse_collection_json(data)
 

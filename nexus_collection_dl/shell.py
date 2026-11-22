@@ -69,6 +69,8 @@ Design notes:
 import json
 import os
 import re
+import select
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -81,7 +83,7 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .downloader import DownloadError
 from .extractor import ExtractionError
-from .handler import HandlerError
+from .handler import EVENTS_FILENAME, HandlerError
 from .nxm import NxmParseError
 from .redaction import (
     MIN_REDACT_SECRET_LEN,
@@ -204,6 +206,16 @@ _COMMAND_HELP = (
         ),
     ),
     _CommandHelp(
+        "/deploy [<index|name>]",
+        "deploy a collection to the game directory (dry-run then "
+        "confirm)",
+        (
+            "/deploy",
+            "/deploy 2",
+            "/deploy Clean Visuals",
+        ),
+    ),
+    _CommandHelp(
         "/status [<index|name>]",
         "tool-wide overview and health report, or one collection vs the "
         "latest revision",
@@ -228,6 +240,64 @@ _HELP_BY_NAME = {spec.name: spec for spec in _COMMAND_HELP}
 # and Ctrl-C, aborts with no change.
 _CONFIRM_YES = "yes"
 
+
+class _ShellAsker:
+    """The picker's front-end on the shell's plain ``input()`` lines.
+
+    Mirrors the CLI's click prompts so a click-driven pick and an
+    ``add``-time pick run the same walk and see the same questions.
+    Ctrl-C, Ctrl-D, and any other input failure give no answer rather
+    than a guessed one: a broken stream must not select an option.
+    """
+
+    def __init__(self, shell: "_ShellSession") -> None:
+        self._shell = shell
+
+    def tell(self, text: str) -> None:
+        self._shell._emit(f"  {text}")
+
+    def _read(self, prompt: str) -> str:
+        try:
+            return self._shell.input_fn(prompt)
+        except (KeyboardInterrupt, EOFError):
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
+        except Exception:
+            from .fomod_select import PickAborted
+
+            raise PickAborted from None
+
+    def choose_one(self, prompt: str, count: int, allow_none: bool) -> int | None:
+        while True:
+            raw = self._read(prompt + ": ")
+            raw = raw.strip()
+            if not raw:
+                if allow_none:
+                    return None
+                continue
+            try:
+                n = int(raw)
+            except ValueError:
+                continue
+            if 1 <= n <= count:
+                return n
+
+    def choose_many(self, prompt: str, count: int, at_least_one: bool) -> list[int]:
+        while True:
+            raw = self._read(prompt + ": ")
+            parts = [p.strip() for p in raw.strip().split(",") if p.strip()]
+            if not parts:
+                if not at_least_one:
+                    return []
+                continue
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                continue
+            if all(1 <= n <= count for n in nums):
+                return nums
+
 # Consecutive input-read failures tolerated before the shell gives up on
 # its input stream. One bad read is recoverable (a non-UTF-8 byte on
 # piped stdin, a hiccuping tty); a stream that cannot produce a single
@@ -239,6 +309,37 @@ class _Quit(Exception):
     """Control flow for /quit: unwinds to run(), which exits 0."""
 
 
+IDLE_POLL_SECONDS = 2.0
+"""How often the idle wait checks for click events while nobody types."""
+
+
+def _stdin_pollable() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _select_stdin_waiter(poll_seconds: float):
+    """Waiter: True when a complete input line is ready, else a tick.
+
+    Canonical-mode terminals only report readable on a complete line, so
+    a False tick means nobody is mid-line and click events can be
+    surfaced. Where stdin cannot be polled (pipes, Windows consoles) the
+    waiter answers True immediately and the prompt-boundary drain still
+    applies.
+    """
+
+    def waiter() -> bool:
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], poll_seconds)
+        except (OSError, ValueError, AttributeError):
+            return True
+        return bool(ready)
+
+    return waiter
+
+
 class _ShellSession:
     """One interactive session; see run_shell for the entry point."""
 
@@ -248,11 +349,22 @@ class _ShellSession:
         root: Path,
         input_fn,
         console: Console,
+        waiter=None,
+        poll_seconds: float = IDLE_POLL_SECONDS,
     ):
         self.svc = svc
         self.root = Path(root)
         self.input_fn = input_fn
         self.console = console
+        # None means "no idle waiting": read lines straight through
+        # input_fn, with click events drained at prompt boundaries only
+        # (tests, pipes). A callable waiter turns on live draining.
+        if waiter is not None:
+            self._waiter = waiter
+        elif poll_seconds and _stdin_pollable():
+            self._waiter = _select_stdin_waiter(poll_seconds)
+        else:
+            self._waiter = None
         # Current collection chosen with /use; None until then.
         self.current: CollectionSummary | None = None
         # Literal secret values redacted from everything the session
@@ -262,6 +374,10 @@ class _ShellSession:
         self._secrets: tuple = merge_secrets(
             [str(getattr(svc, "_api_key", "") or "")]
         )
+        # Byte offset into each click-events file, so the drain reports
+        # only events that arrived after the last one consumed. Keyed by
+        # the events file path.
+        self._event_offsets: dict[Path, int] = {}
 
     # ------------------------------------------------------------------
     # rendering
@@ -421,10 +537,12 @@ class _ShellSession:
             "nexus-dl shell. Type /help for commands, /quit to exit."
         )
         self._startup_selection()
+        self._init_event_offsets()
         input_failures = 0
         while True:
+            self._drain_events()
             try:
-                line = self.input_fn(self._prompt())
+                line = self._read_line()
             except EOFError:
                 # Ctrl-D: goodbye, exit 0.
                 self._emit("Goodbye.")
@@ -600,6 +718,354 @@ class _ShellSession:
                 "(see /collections)"
             )
         return self.current
+
+    # ------------------------------------------------------------------
+    # click-event drain
+    # ------------------------------------------------------------------
+
+    def _events_files(self) -> list[Path]:
+        """Every click-events file under root: root itself and each subdir."""
+        candidates = [self.root / EVENTS_FILENAME]
+        try:
+            for child in self.root.iterdir():
+                if child.is_dir():
+                    candidates.append(child / EVENTS_FILENAME)
+        except OSError:
+            pass
+        return [p for p in candidates if p.exists()]
+
+    def _init_event_offsets(self) -> None:
+        """Tail-seed: skip events that predate the session."""
+        self._event_offsets = {}
+        for path in self._events_files():
+            try:
+                self._event_offsets[path] = path.stat().st_size
+            except OSError:
+                pass
+
+    def _read_line(self) -> str:
+        """Read one command line, surfacing click events while idle.
+
+        With no waiter this is exactly ``input_fn(prompt)``. With one,
+        the prompt is drawn up front and the wait wakes either for a
+        complete input line or for an idle tick; a tick runs the event
+        drain, so a browser click shows up and starts its flow without
+        the user pressing anything. The prompt is redrawn after a tick
+        that printed something.
+        """
+        prompt = self._prompt()
+        if self._waiter is None:
+            return self.input_fn(prompt)
+        self._draw_prompt(prompt)
+        while True:
+            if self._waiter():
+                return self.input_fn("")
+            if self._drain_events():
+                self._draw_prompt(prompt)
+
+    def _draw_prompt(self, prompt: str) -> None:
+        """Draw the prompt line without a newline, bypassing rich."""
+        stream = self.console.file or sys.stdout
+        stream.write(prompt)
+        stream.flush()
+
+    def _drain_events(self) -> bool:
+        """Read and report click events since the last drain.
+
+        Called once per loop iteration, before the prompt, and from the
+        idle wait while nobody types. One report block for the whole
+        drain, then one deploy prompt per collection that saw at least
+        one deployable event. Returns True when the drain printed
+        anything, so the idle wait can redraw the prompt line.
+        """
+        new_events: list[dict] = []
+        for path in self._events_files():
+            offset = self._event_offsets.get(path, 0)
+            try:
+                size = path.stat().st_size
+                if size < offset:
+                    offset = 0  # rotated or truncated
+                if size == offset:
+                    self._event_offsets[path] = offset
+                    continue
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    raw = f.read()
+            except OSError:
+                continue
+
+            last_nl = raw.rfind(b"\n")
+            if last_nl == -1:
+                continue  # no complete line yet
+            complete_bytes = raw[: last_nl + 1]
+            self._event_offsets[path] = offset + len(complete_bytes)
+
+            for line_bytes in complete_bytes.splitlines():
+                line = line_bytes.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    if isinstance(event, dict):
+                        new_events.append(event)
+                except (json.JSONDecodeError, ValueError):
+                    continue  # skip malformed lines silently
+
+        if not new_events:
+            return False
+
+        count = len(new_events)
+        header = "Click activity while the shell was running"
+        if count > 1:
+            header += f" ({count} events)"
+        self._emit(header + ":")
+
+        deployable: dict[str, list[dict]] = {}
+        need_choices: dict[str, list[dict]] = {}
+        for event in new_events:
+            self._emit(f"  {self._format_event_line(event)}")
+            outcome = str(event.get("outcome", ""))
+            if outcome in ("downloaded", "extracted_from_archive"):
+                coll = str(event.get("collection_name", ""))
+                deployable.setdefault(coll, []).append(event)
+            elif outcome == "pending_choices":
+                coll = str(event.get("collection_name", ""))
+                need_choices.setdefault(coll, []).append(event)
+
+        # FOMOD mods waiting on their option choices, before the deploy
+        # question: what they install is only known once the picks are in,
+        # and a collection that just gained files should be offered the
+        # deploy that would place them.
+        for coll_name, events in need_choices.items():
+            sample = events[0]
+            coll_dir = sample.get("collection_dir", "")
+            if coll_dir and not Path(coll_dir).is_dir():
+                self._emit(
+                    f"'{_safe_text(coll_name)}' (directory gone; "
+                    "nothing to choose for)"
+                )
+                continue
+            count = len(events)
+            plural = "s" if count != 1 else ""
+            answer = self._confirm(
+                f"{count} FOMOD mod{plural} in '{_safe_text(coll_name)}' "
+                f"need option choices. Choose now? [yes/no]: "
+            )
+            if answer != _CONFIRM_YES:
+                continue
+            for event in events:
+                if self._offer_fomod_choices(Path(coll_dir), event):
+                    deployable.setdefault(coll_name, []).append(event)
+
+        for coll_name, events in deployable.items():
+            # One prompt per collection regardless of how many events.
+            # The event's own collection_dir is authoritative; a vanished
+            # directory is noted and skipped.
+            sample = events[0]
+            coll_dir = sample.get("collection_dir", "")
+            if coll_dir and not Path(coll_dir).is_dir():
+                self._emit(
+                    f"'{_safe_text(coll_name)}' (directory gone; "
+                    "nothing to deploy)"
+                )
+                continue
+            answer = self._confirm(
+                f"Deploy '{_safe_text(coll_name)}' now? [yes/no]: "
+            )
+            if answer == _CONFIRM_YES:
+                self._deploy_by_path(Path(coll_dir))
+        return True
+
+    def _offer_fomod_choices(self, coll_dir: Path, event: dict) -> bool:
+        """Prompt for one clicked FOMOD mod's options and install it.
+
+        Returns True when it installed, so the caller can offer the
+        deploy that places the new files. Nothing is installed without an
+        explicit pick; a mod with no answers stays pending.
+        """
+        from .fomod_select import prompt_for_picks
+
+        mod_name = _safe_text(str(event.get("mod_name", "")))
+        file_id = event.get("file_id", 0)
+        try:
+            file_id = int(file_id)
+        except (TypeError, ValueError):
+            self._emit_failure(f"cannot pick options for '{mod_name}': no file id")
+            return False
+
+        def ask(config, archive_name, kept):
+            return prompt_for_picks(config, archive_name, kept, _ShellAsker(self))
+
+        try:
+            report = self.svc.install_fomod_picks(
+                coll_dir, file_id, on_fomod_prompt=ask
+            )
+        except Exception as e:
+            from .fomod_select import PickAborted
+
+            if isinstance(e, PickAborted):
+                self._emit(f"  '{mod_name}' left pending; nothing installed.")
+                return False
+            self._emit_failure(f"'{mod_name}': {_safe_text(str(e))}")
+            return False
+        self._emit(f"  {_safe_text(report)}")
+        return True
+
+    def _format_event_line(self, event: dict) -> str:
+        """One human line for a click event; all values display-safe."""
+        mod = _safe_text(event.get("mod_name", ""))
+        fid = event.get("file_id", 0)
+        coll = _safe_text(event.get("collection_name", ""))
+        outcome = str(event.get("outcome", ""))
+        if outcome == "downloaded":
+            return f"'{mod}' (file {fid}) downloaded into '{coll}'"
+        if outcome == "extracted_from_archive":
+            return f"'{mod}' (file {fid}) extracted into '{coll}'"
+        if outcome == "already_downloaded":
+            return f"'{mod}' (file {fid}) is already downloaded in '{coll}'"
+        if outcome == "pending_download":
+            return f"'{mod}' (file {fid}) is awaiting import in '{coll}'"
+        if outcome == "pending_choices":
+            return (
+                f"'{mod}' (file {fid}) needs FOMOD option choices in "
+                f"'{coll}' (run import --fomod-option to install it)"
+            )
+        # error
+        reason = _safe_text(event.get("reason", ""))
+        if mod and fid:
+            return f"'{mod}' (file {fid}) failed ({reason})"
+        return f"download failed ({reason})"
+
+    def _deploy_by_path(self, coll_dir: Path) -> None:
+        """Deploy a collection by its directory (from an event line)."""
+        colls = self._collection_listing()
+        for c in colls:
+            if c.path == coll_dir:
+                self._deploy_flow(c)
+                return
+        self._emit_failure(
+            f"collection directory not found under root: "
+            f"{_safe_text(str(coll_dir))}"
+        )
+
+    # ------------------------------------------------------------------
+    # deploy
+    # ------------------------------------------------------------------
+
+    def _deploy_flow(self, target: CollectionSummary) -> None:
+        """Dry-run, confirm, deploy. Shared by /deploy and the event drain.
+
+        Nothing touches the game directory until the user answers yes to
+        the second prompt. add_nxm's guarantee stands: nothing is ever
+        deployed automatically.
+        """
+        from .deploy import DeployError, classify_files
+        from .state import CollectionState
+        from .steam import find_game_dir
+
+        try:
+            state = CollectionState(target.path)
+            state.load()
+        except StateError as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        game_dir: Path | None = None
+        if state.game_dir:
+            game_dir = Path(state.game_dir)
+        if game_dir is None:
+            game_dir = find_game_dir(state.game_domain)
+        if game_dir is None:
+            self._emit_error("Could not find game directory.")
+            return
+
+        manifest_choices: dict = {}
+        if state.manifest_data:
+            from .manifest import CollectionManifest
+
+            manifest = CollectionManifest.from_dict(state.manifest_data)
+            manifest_choices = manifest.mod_choices
+
+        # The same picks and recorded configs the real deploy uses: the
+        # preview has to describe that deployment, not a different one.
+        fomod_picks = {
+            mod.file_id: mod.fomod_picks
+            for mod in state.mods.values()
+            if mod.fomod_picks
+        }
+        fomod_configs = {
+            mod.file_id: {**mod.fomod_config, "mod_id": mod.mod_id}
+            for mod in state.mods.values()
+            if mod.fomod_config
+        }
+
+        try:
+            plan = classify_files(
+                target.path,
+                state.game_domain,
+                mod_choices=manifest_choices,
+                fomod_picks=fomod_picks,
+                fomod_configs=fomod_configs,
+                mod_names={mod.file_id: mod.name for mod in state.mods.values()},
+            )
+        except (StateError, OSError, ValueError) as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        self._emit(
+            f"Would deploy {plan.total_files} files to "
+            f"{_safe_text(str(game_dir))} "
+            f"({len(plan.game_root_files)} game root, "
+            f"{len(plan.data_files)} data, {len(plan.skipped)} skipped)."
+        )
+        for w in plan.warnings:
+            self._emit_warning(str(w))
+
+        answer = self._confirm(
+            f"Deploy '{_safe_text(target.name)}' now? [yes/no]: "
+        )
+        if answer != _CONFIRM_YES:
+            self._emit("Deploy cancelled.")
+            return
+
+        try:
+            result = self.svc.deploy(target.path, game_dir=game_dir, use_copy=False)
+        except DeployError as e:
+            self._emit_error(str(e) or type(e).__name__)
+            return
+
+        if result.errors:
+            for err in result.errors:
+                self._emit_error(err)
+        if result.conflicts:
+            self._emit(f"Conflicts ({len(result.conflicts)}):")
+            for conflict in result.conflicts[:10]:
+                self._emit(f"  ! {_safe_text(str(conflict))}")
+            if len(result.conflicts) > 10:
+                self._emit(
+                    f"  ... and {len(result.conflicts) - 10} more"
+                )
+        if result.warnings:
+            for w in result.warnings:
+                self._emit_warning(str(w))
+
+        if result.errors:
+            self._emit_error(
+                f"Deploy incomplete: {result.deployed_count} file(s) "
+                f"deployed, {len(result.errors)} error(s)."
+            )
+        else:
+            self._emit(
+                f"Deployed {result.deployed_count} files "
+                f"({len(result.conflicts)} conflicts, "
+                f"{len(result.errors)} errors)"
+            )
+
+    def _cmd_deploy(self, rest: str) -> None:
+        target = (
+            self._resolve_collection(rest) if rest else self._require_current()
+        )
+        self._deploy_flow(target)
 
     # ------------------------------------------------------------------
     # commands
@@ -1199,6 +1665,7 @@ class _ShellSession:
         "/add": _cmd_add,
         "/sync": _cmd_sync,
         "/remove": _cmd_remove,
+        "/deploy": _cmd_deploy,
         "/status": _cmd_status,
     }
 
@@ -1293,15 +1760,25 @@ def run_shell(
     root: Path,
     input_fn=input,
     console: Console | None = None,
+    waiter=None,
+    poll_seconds: float = IDLE_POLL_SECONDS,
 ) -> int:
     """Run the interactive shell; returns the process exit code.
 
     ``input_fn`` is injectable for tests (it must behave like input():
     return one line per call, raise EOFError at end of input and
     KeyboardInterrupt on interrupt). ``console`` defaults to a fresh
-    rich Console.
+    rich Console. ``waiter`` is injectable for tests: it answers True
+    when an input line is ready and False on an idle tick; left as None,
+    a real tty gets a select-based waiter so click events surface while
+    nobody types, and everything else keeps the prompt-boundary drain.
     """
     session = _ShellSession(
-        svc, root, input_fn, console if console is not None else Console()
+        svc,
+        root,
+        input_fn,
+        console if console is not None else Console(),
+        waiter=waiter,
+        poll_seconds=poll_seconds,
     )
     return session.run()

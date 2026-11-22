@@ -2,7 +2,7 @@
 
 A hostile or compromised Nexus endpoint controls every byte of a response body
 and can echo request contents back. Those messages are reachable from CLI
-output and from web task results, so anything the endpoint controls must not
+output and from result fields, so anything the endpoint controls must not
 survive into them.
 
 The download-link case is the sharpest: that response carries the signed-link

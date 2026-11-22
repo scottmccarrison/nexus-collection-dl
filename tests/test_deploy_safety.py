@@ -521,6 +521,71 @@ def test_service_rejects_staging_game_overlap(svc, tmp_path):
     assert any("inside the staging directory" in e for e in result.errors)
 
 
+# ---------------------------------------------------------------------------
+# Counts: files, not writes
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_counts_destinations_not_writes(env):
+    """Two entries writing one destination are one file and one conflict.
+
+    The count a deploy reports has to be what lands in the game dir, not
+    how many plan entries were executed: an overwritten entry is gone.
+    """
+    a = _src(env, "a/plugin.esp")
+    b = _src(env, "b/plugin.esp")
+    plan = DeploymentPlan(
+        data_files=[(a, Path("mod.esp")), (b, Path("mod.esp"))],
+    )
+    assert plan.total_files == 1
+
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    assert len(result.deployed) == 1
+    assert len(result.conflicts) == 1
+    assert len(env.ownership) == 1
+
+
+def test_undeploy_counts_mod_files_only(env):
+    """plugins.txt and the game INI are managed game config, not 'files'.
+
+    Both are removed with everything else, but counting them makes undeploy
+    disagree with the deploy that wrote them and with the file count in the
+    game directory.
+    """
+    from nexus_collection_dl.deploy import write_plugins_txt
+
+    mod = _src(env, "mod.esp")
+    plugins_src = _src(env, "plugins.txt", b"mod.esp\n")
+    _deploy(env, [(mod, Path("mod.esp"))])
+    write_plugins_txt(
+        plugins_src, env.game / "plugins.txt",
+        root=env.game, backups=env.backups, journal=env.journal,
+        ownership=env.ownership,
+    )
+    assert {r.get("kind", "mod") for r in env.ownership.values()} == {"mod", "plugins"}
+
+    kept, _problems, _notes, cleared = _undeploy(env)
+    assert cleared == 1
+    assert not kept
+    assert not env.ownership
+
+
+def test_service_deploy_and_undeploy_report_the_same_count(svc, tmp_path):
+    mods, _game, _prefix = _svc_env(tmp_path, {
+        "ModA/plugin.esp": b"a",
+        "ModB/other.esp": b"b",
+        "plugins.txt": b"plugin.esp\n",
+    })
+    result = svc.deploy(mods)
+    assert result.deployed_count == 2, result.errors
+
+    removed = svc.undeploy(mods)
+    assert removed == 2
+
+
 def test_service_rejects_staging_inside_game(svc, tmp_path):
     game = tmp_path / "game2"
     mods = game / "mods"
@@ -534,6 +599,50 @@ def test_service_rejects_staging_inside_game(svc, tmp_path):
     result = svc.deploy(mods, game_dir=game)
     assert result.deployed_count == 0
     assert any("inside the game directory" in e for e in result.errors)
+
+
+def test_first_deploy_honours_game_dir_and_prefix_params(svc, tmp_path):
+    """--game-dir and --prefix must satisfy the checks on a first deploy.
+
+    State has recorded neither and the game is not in the auto-detect
+    list (Cyberpunk via Heroic is the reported case). The checks used to
+    read state instead of the effective values, error out on
+    "not in auto-detect list", and stop the deploy.
+    """
+    mods, game, prefix = _svc_env(tmp_path)
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/cyberpunk2077/collections/test",
+        "Test Collection", 1, "cyberpunk2077",
+    )
+    state.game_dir = ""
+    state.proton_prefix = ""
+    state.save()
+
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
+
+    assert result.errors == []
+    assert result.deployed_count == 1
+    assert not any("not in auto-detect" in w for w in result.warnings)
+    assert not any("Proton prefix not found" in w for w in result.warnings)
+
+
+def test_pre_deploy_checks_still_report_a_missing_prefix(svc, tmp_path):
+    """The warning is right when nothing resolved a prefix; it is only
+    wrong when one was passed in."""
+    mods, game, _prefix = _svc_env(tmp_path)
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/cyberpunk2077/collections/test",
+        "Test Collection", 1, "cyberpunk2077",
+    )
+    state.game_dir = ""
+    state.proton_prefix = ""
+    state.save()
+
+    warnings = svc.pre_deploy_checks(state, game, mods, "copy", None)
+    assert [w.code for w in warnings] == ["no_prefix"]
+    assert not any(w.severity == "error" for w in warnings)
 
 
 def test_busy_lock_serializes_deploy_and_undeploy(svc, tmp_path):
@@ -730,7 +839,7 @@ def test_service_deploy_undeploy_full_cycle(svc, tmp_path):
     assert not result.errors
 
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()  # copy mode: Proton cannot follow symlinks
     ini_path = get_game_ini_path(prefix, DOMAIN)
     assert ini_path.exists()
     ini_text = ini_path.read_text()
@@ -855,13 +964,13 @@ def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkey
     assert state.deployed_files == []
     assert (mods / ".nexus-journal.jsonl").exists()
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()
 
     # Next deploy recovers ownership from the journal, removes the old
     # deployment safely, and redeploys.
     result = svc.deploy(mods, game_dir=game)
     assert result.deployed_count == 1, result.errors
-    assert dest.is_symlink()
+    assert dest.is_file()
     state = CollectionState(mods)
     state.load()
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
@@ -882,7 +991,7 @@ def test_service_nothing_to_deploy_keeps_existing_deployment(svc, tmp_path):
     assert result2.deployed_count == 0
     assert any("left in place" in e for e in result2.errors)
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()  # still deployed
+    assert dest.is_file()  # still deployed
     state = CollectionState(mods)
     state.load()
     assert state.deployed_files  # ownership retained
@@ -1052,7 +1161,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
     monkeypatch.setattr(os, "replace", real_replace)
 
     # Failed run: error surfaced, destination untouched, journal NOT cleared
-    assert result.errors and any(str(orig_b) in e for e in result.errors)
+    assert result.errors and any("other.esp" in e for e in result.errors)
     assert orig_b.read_bytes() == b"USER ORIGINAL B"
     assert (mods / ".nexus-journal.jsonl").exists()
     state = CollectionState(mods)
@@ -1092,7 +1201,7 @@ def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeyp
 
     assert not result.errors, result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
-    assert dest.is_symlink()
+    assert dest.is_file()
     state = CollectionState(mods)
     state.load()
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
@@ -1281,3 +1390,143 @@ def test_symlink_over_original_symlink_replaced_by_regular_file_refused(env: Env
     assert len(result.errors) == 1 and "changed outside" in result.errors[0]
     assert dest.read_bytes() == b"mod content"
     assert not dest.is_symlink()
+
+
+# ---------------------------------------------------------------------------
+# What deploy refuses to write, and what it says when two mods collide
+# ---------------------------------------------------------------------------
+
+
+def test_packaging_cruft_is_not_deployed(tmp_path):
+    """Vortex metadata, VCS files and licence text are not game content.
+
+    They ride along in real archives when a mod author packs their whole
+    working folder, and they belong with the mod's docs, not in the game
+    directory.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    for name in ("meta.ini", ".gitignore", "LICENSE", "License.txt", "mod.esp"):
+        (tmp_path / name).write_text("x")
+
+    plan = classify_files(tmp_path, "skyrimspecialedition")
+    deployed = {src.name for src, _dest in plan.game_root_files + plan.data_files}
+    assert deployed == {"mod.esp"}, [
+        (rel.as_posix(), why) for rel, why in plan.skipped
+    ]
+
+
+def test_conflict_messages_name_the_source_paths(env):
+    """Two mods shipping one destination: the message has to say which files.
+
+    The basenames are identical in the case that matters (two mods both
+    shipping ``x.nif`` to the same path), so naming them alone says
+    nothing at all. The numbered wrappers are the real collision shape:
+    they strip away, and the two options land on one destination.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    _src(env, "01 TBBP/meshes/actors/x.nif")
+    _src(env, "02 HDT/meshes/actors/x.nif")
+
+    plan = classify_files(env.staging, "skyrimspecialedition")
+    result = run_deploy(
+        plan, env.game, method="symlink", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "01 TBBP/meshes/actors/x.nif" in msg, msg
+    assert "02 HDT/meshes/actors/x.nif" in msg, msg
+
+
+# ---------------------------------------------------------------------------
+# Gate findings: Proton symlink override, plugins.txt generation
+# ---------------------------------------------------------------------------
+
+
+def test_proton_deploy_forces_copy_mode(svc, tmp_path):
+    """Symlinks are not readable through the Wine prefix.  When a Proton
+    prefix is in play, the deploy must use copy mode even when the caller
+    did not ask for it, and say so in the warnings."""
+    mods, game, _prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    dest = game / "Data" / "ModA" / "plugin.esp"
+    assert dest.is_file()
+    assert not dest.is_symlink()
+    assert any("copy mode" in w.lower() for w in result.warnings)
+
+
+def test_no_prefix_deploy_still_uses_symlinks(svc, tmp_path, monkeypatch):
+    """A native-Linux deploy (no Proton prefix) keeps the symlink default."""
+    monkeypatch.setattr(
+        "nexus_collection_dl.service.find_proton_prefix", lambda d: None
+    )
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    game = tmp_path / "game"
+    game.mkdir()
+    (mods / "ModA").mkdir()
+    (mods / "ModA" / "plugin.esp").write_bytes(b"esp")
+    state = CollectionState(mods)
+    state.set_collection_info(
+        "https://next.nexusmods.com/skyrimspecialedition/collections/test",
+        "Test Collection", 1, DOMAIN,
+    )
+    state.game_dir = str(game)
+    state.save()
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    dest = game / "Data" / "ModA" / "plugin.esp"
+    assert dest.is_symlink()
+
+
+def test_plugins_txt_generated_from_mod_files_when_manifest_empty(tmp_path):
+    """When the collection manifest carries no plugin list, plugins.txt is
+    built from the mod files that are themselves plugins (.esp/.esm/.esl),
+    with Skyrim-style * prefixes marking them enabled."""
+    from nexus_collection_dl.loadorder import LoadOrderGenerator
+    from nexus_collection_dl.manifest import CollectionManifest
+
+    manifest = CollectionManifest.from_dict({
+        "name": "Test",
+        "game_domain": "skyrimspecialedition",
+        "mods": [],
+    })
+    mods = [
+        {"mod_id": 1, "file_id": 10, "mod_name": "A", "filename": "A.esp", "optional": False},
+        {"mod_id": 2, "file_id": 20, "mod_name": "B", "filename": "B.esm", "optional": False},
+        {"mod_id": 3, "file_id": 30, "mod_name": "C", "filename": "C.zip", "optional": False},
+        {"mod_id": 4, "file_id": 40, "mod_name": "D", "filename": "D.esl", "optional": False},
+    ]
+    gen = LoadOrderGenerator(manifest, mods, {}, "skyrimspecialedition")
+    out = tmp_path / "out"
+    out.mkdir()
+    gen.generate(out)
+    plugins_text = (out / "plugins.txt").read_text()
+    assert "*A.esp" in plugins_text
+    assert "*B.esm" in plugins_text
+    assert "*D.esl" in plugins_text
+    assert "C.zip" not in plugins_text  # not a plugin
+
+
+def test_deploy_generates_plugins_txt_from_deployed_files(svc, tmp_path):
+    """When the staging plugins.txt has no plugin entries (community
+    collections often omit manifest plugin data), the deploy builds one
+    from the deployed .esp/.esm/.esl files with * prefixes."""
+    mods, game, prefix = _svc_env(
+        tmp_path,
+        staging_files={
+            "ModA/HSPlayerHomes - Breezehome.esp": b"esp a",
+            "ModB/HSResources.esl": b"esl b",
+            "ModC/texture.dds": b"dds",
+        },
+    )
+    plugins_dest = get_plugins_txt_dest(prefix, DOMAIN)
+
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    plugins_text = plugins_dest.read_text()
+    assert "*HSPlayerHomes - Breezehome.esp" in plugins_text
+    assert "*HSResources.esl" in plugins_text
+    assert "texture.dds" not in plugins_text

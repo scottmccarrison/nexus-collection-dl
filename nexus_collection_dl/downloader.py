@@ -1,6 +1,7 @@
 """Download manager with progress tracking and integrity verification."""
 
 import hashlib
+import io
 import os
 import re
 import tempfile
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from rich.console import Console
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -26,6 +28,7 @@ from .api import (
     redact_secret_values,
     suppress_http_debug_logging,
 )
+from .errmsg import exception_reason
 
 # Seconds: (connect timeout, per-read timeout) for download requests.
 CONNECT_TIMEOUT = 15
@@ -113,7 +116,7 @@ def _safe_error(exc: Exception, secrets: tuple = ()) -> str:
         return "connection error"
     if isinstance(exc, requests.RequestException):
         return f"network error ({type(exc).__name__})"
-    return redact_secret_values(f"{type(exc).__name__}: {exc}", secrets)
+    return exception_reason(exc)
 
 
 def _expected_size(mod_info: dict[str, Any]) -> int | None:
@@ -193,7 +196,7 @@ class Downloader:
 
         Args:
             on_progress: Optional callback(bytes_downloaded, total_bytes) for
-                         generic progress reporting (used by web UI / service layer).
+                         generic progress reporting (used by the service layer).
             signed: Optional website-issued key/expires pair (free-account
                     nxm:// links). Transient: forwarded to the download-link
                     request only, never persisted.
@@ -350,6 +353,7 @@ class Downloader:
         target_dir: Path,
         on_complete: Callable[[dict[str, Any], Path], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        show_progress: bool = True,
     ) -> list[tuple[dict[str, Any], Path]]:
         """
         Download multiple mods with a unified progress display.
@@ -363,12 +367,20 @@ class Downloader:
                          generic progress (passed through to download_mod).
                          When provided, the Rich progress bar is still shown for
                          CLI usage, and the callback fires alongside it.
+            show_progress: Write the Rich progress bar and per-mod lines to
+                         stdout. Pass False for machine-readable output, where
+                         stdout must stay parseable; the loop runs identically
+                         and only the console is redirected away.
 
         Returns list of (mod_info, downloaded_path) tuples.
         """
         results = []
         total_mods = len(mods)
 
+        # The Progress object doubles as the output console (progress.console
+        # is where per-mod lines and errors go), so redirecting its console
+        # suppresses every write while leaving the download loop untouched.
+        progress_console = None if show_progress else Console(file=io.StringIO())
         with Progress(
             TextColumn("[bold blue]{task.fields[filename]}", justify="right"),
             BarColumn(bar_width=30),
@@ -376,6 +388,7 @@ class Downloader:
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
+            console=progress_console,
         ) as progress:
             for i, mod in enumerate(mods, 1):
                 try:

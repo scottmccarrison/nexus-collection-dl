@@ -144,7 +144,7 @@ def patch_download_mods(monkeypatch):
     recorded: list[dict] = []
 
     def fake_download_mods(self, game_domain, mods, target_dir,
-                           on_complete=None, on_progress=None):
+                           on_complete=None, on_progress=None, show_progress=True):
         out = []
         for m in mods:
             p = Path(target_dir) / m["filename"]

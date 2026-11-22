@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://qconsulting.ca/fo3/ModConfig5.0.xsd">
+  <moduleName>Invisible Step Test</moduleName>
+  <installSteps order="Explicit">
+    <!-- Step 1: Visible step where Option B sets a flag to show Step 2 -->
+    <installStep name="Step1">
+      <optionalFileGroups order="Explicit">
+        <group name="Group1" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Option A (hides Step 2)">
+              <description>Selecting this option will NOT show Step 2 (no flag set)</description>
+              <files>
+                <file source="visible_step\visible_file.txt" destination="visible_file.txt" priority="0" />
+              </files>
+              <typeDescriptor>
+                <type name="Recommended"/>
+              </typeDescriptor>
+            </plugin>
+            <plugin name="Option B (shows Step 2)">
+              <description>Selecting this option will show Step 2</description>
+              <files>
+                <file source="visible_step\visible_file.txt" destination="visible_file.txt" priority="0" />
+              </files>
+              <conditionFlags>
+                <flag name="ShowStep2">true</flag>
+              </conditionFlags>
+              <typeDescriptor>
+                <type name="Optional"/>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+    <!-- Step 2: Only visible if ShowStep2 flag is set to "true" (i.e., Option B was selected) -->
+    <installStep name="Step2">
+      <visible>
+        <flagDependency flag="ShowStep2" value="true" />
+      </visible>
+      <optionalFileGroups order="Explicit">
+        <group name="InvisibleGroup" type="SelectExactlyOne">
+          <plugins order="Explicit">
+            <plugin name="Invisible Option">
+              <description>This option should not be selectable if Step 2 is hidden</description>
+              <files>
+                <file source="invisible_step\should_not_install.txt" destination="should_not_install.txt" priority="0" />
+              </files>
+              <typeDescriptor>
+                <type name="Recommended"/>
+              </typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>

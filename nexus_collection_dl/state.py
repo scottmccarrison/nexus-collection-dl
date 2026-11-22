@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from typing_extensions import Self
 
+from .errmsg import exception_reason
+
 try:
     import fcntl
 except ImportError:  # non-POSIX platforms: locking degrades to a no-op
@@ -32,7 +34,7 @@ class LoadOrderRegenError(StateError):
     The underlying state change (a removal, an import, a download) is
     already persisted when this fires: callers report it as a warning or
     error on their result instead of rolling back. Subclasses StateError
-    so every CLI/web surface that already handles state failures handles
+    so every surface that already handles state failures handles
     regeneration failures cleanly too.
     """
 
@@ -102,6 +104,8 @@ class ModState:
         manual: bool = False,
         download_status: str = "downloaded",
         browser_url: str = "",
+        fomod_picks: list[dict[str, str]] | None = None,
+        fomod_config: dict[str, str] | None = None,
     ):
         self.file_id = file_id
         self.mod_id = mod_id
@@ -116,6 +120,17 @@ class ModState:
         self.manual = manual
         self.download_status = download_status
         self.browser_url = browser_url
+        # FOMOD option picks, as {"step", "group", "option"} triples.
+        # Stored so a later deploy installs the same options the user
+        # chose instead of the schema defaults, and so a re-add can tell
+        # which picks still name real options in a changed installer.
+        self.fomod_picks = list(fomod_picks or [])
+        # The mod's FOMOD installer config, captured from the archive at
+        # extract time as {"member": <archive-relative path>, "xml": <text>}.
+        # Extraction merges every archive into one tree, so a second mod's
+        # fomod/ModuleConfig.xml overwrites the first; without this record
+        # deploy can only plan for whichever mod extracted last.
+        self.fomod_config = dict(fomod_config) if fomod_config else None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +146,8 @@ class ModState:
             "manual": self.manual,
             "download_status": self.download_status,
             "browser_url": self.browser_url,
+            "fomod_picks": self.fomod_picks,
+            "fomod_config": self.fomod_config,
         }
 
     @classmethod
@@ -149,6 +166,8 @@ class ModState:
             manual=data.get("manual", False),
             download_status=data.get("download_status", "downloaded"),
             browser_url=data.get("browser_url", ""),
+            fomod_picks=data.get("fomod_picks"),
+            fomod_config=data.get("fomod_config"),
         )
 
 
@@ -199,7 +218,7 @@ class CollectionState:
             with open(self.state_file) as f:
                 data = json.load(f)
         except json.JSONDecodeError as e:
-            raise StateError(f"Invalid state file: {e}")
+            raise StateError(f"Invalid state file: {exception_reason(e)}")
 
         self.collection_url = data.get("collection_url", "")
         self.collection_name = data.get("collection_name", "")
@@ -325,8 +344,19 @@ class CollectionState:
         )
 
     def get_pending_mods(self) -> list[ModState]:
-        """Return mods with pending_download status."""
-        return [ms for ms in self.mods.values() if ms.download_status == "pending_download"]
+        """Return mods that are not installed yet and still need work.
+
+        Two flavours: ``pending_download`` (nothing usable on disk yet)
+        and ``pending_choices`` (the FOMOD archive is on disk but needs
+        option choices before it can be extracted). Both are what
+        ``import`` finishes, and both count as pending everywhere a
+        "you still have work to do" number is reported.
+        """
+        return [
+            ms
+            for ms in self.mods.values()
+            if ms.download_status in ("pending_download", "pending_choices")
+        ]
 
     def remove_mod_file(self, file_id: int) -> None:
         """Remove a specific file from the state."""

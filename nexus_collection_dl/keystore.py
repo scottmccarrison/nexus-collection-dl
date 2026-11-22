@@ -23,6 +23,7 @@ import re
 import tempfile
 from pathlib import Path
 
+from .errmsg import exception_reason
 from .handler import config_dir
 
 API_KEY_FILENAME = "api-key"
@@ -97,14 +98,14 @@ def _atomic_write_secret(path: Path, content: str) -> None:
     except OSError as e:
         raise KeyStoreError(
             f"Could not create config directory {path.parent}: "
-            f"{e.strerror or e}"
+            f"{exception_reason(e)}"
         )
     try:
         fd, tmp_name = tempfile.mkstemp(
             dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
         )
     except OSError as e:
-        raise KeyStoreError(f"Could not write {path}: {e.strerror or e}")
+        raise KeyStoreError(f"Could not write {path}: {exception_reason(e)}")
     try:
         with os.fdopen(fd, "w") as f:
             # fchmod is absolute (umask does not apply), so the secret
@@ -118,7 +119,7 @@ def _atomic_write_secret(path: Path, content: str) -> None:
     except OSError as e:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
-        raise KeyStoreError(f"Could not write {path}: {e.strerror or e}")
+        raise KeyStoreError(f"Could not write {path}: {exception_reason(e)}")
 
 
 def store_api_key(key: str) -> Path:
@@ -149,7 +150,7 @@ def load_api_key() -> str | None:
     except OSError as e:
         raise KeyStoreError(
             f"Could not read the stored API key at {path}: "
-            f"{e.strerror or e}. Fix the file, or run 'nexus-dl handler "
+            f"{exception_reason(e)}. Fix the file, or run 'nexus-dl handler "
             "remove-api-key' and store the key again."
         )
     value = raw.strip()
@@ -168,7 +169,7 @@ def remove_api_key() -> bool:
     except FileNotFoundError:
         return False
     except OSError as e:
-        raise KeyStoreError(f"Could not remove {path}: {e.strerror or e}")
+        raise KeyStoreError(f"Could not remove {path}: {exception_reason(e)}")
     return True
 
 

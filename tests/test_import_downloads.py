@@ -897,3 +897,25 @@ def test_track_sync_failure_reported_not_fatal(monkeypatch, tmp_path, svc, extra
     assert result.matched == 1
     assert any("Track sync failed" in e for e in result.errors)
     assert _reload(tmp_path).mods[10].download_status == "downloaded"
+
+
+def test_import_with_picks_on_a_non_fomod_warns_instead_of_ignoring(tmp_path, svc):
+    """The add path's rule applies to import too: picks never vanish."""
+    from nexus_collection_dl.fomod_select import Pick
+
+    _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip", inner_name="mod/plugin.esp")
+    _write_state(tmp_path, [{
+        "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
+        "filename": "Foo-1234-1-0-1699999999.zip", "version": "1.0",
+    }])
+
+    result = svc.import_downloads(
+        tmp_path,
+        no_load_order=True,
+        fomod_picks=[Pick("", "G", "OptB")],
+    )
+    assert result.matched == 1
+    assert result.errors == []
+    assert result.warnings, "picks for a non-FOMOD mod must not vanish silently"
+    assert "no FOMOD installer" in result.warnings[0]
+    assert "not used" in result.warnings[0]

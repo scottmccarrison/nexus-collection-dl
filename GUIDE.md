@@ -6,7 +6,7 @@ A step-by-step walkthrough for downloading and managing Nexus Mods collections o
 
 `nexus-dl` lets you download entire mod collections from [Nexus Mods](https://www.nexusmods.com/) on Linux. Collections are curated mod packs that other players put together - think of them as "mod playlists" where someone has already figured out which mods work well together and in what order they should load.
 
-Normally, downloading collections requires Vortex or the Nexus Mods app, which only run on Windows. This tool does the same thing from a Linux terminal (or from a local web page in your browser if you prefer clicking over typing).
+Normally, downloading collections requires Vortex or the Nexus Mods app, which only run on Windows. This tool does the same thing from a Linux terminal.
 
 It works with any game on Nexus Mods - Baldur's Gate 3, Starfield, Cyberpunk 2077, Skyrim, Stardew Valley, and everything else.
 
@@ -276,6 +276,45 @@ To preview what would change without actually downloading:
 nexus-dl update --dry-run ~/mods/bg3
 ```
 
+## Removing a mod
+
+Want a mod out of your collection? For example one that conflicts, or one you simply do not want.
+
+The commands below work on the collection folder: the named subfolder the download created inside `~/mods/bg3`, the one with the `.nexus-state.json` file in it. To avoid retyping it, point a variable at it once (use `$HOME`, and replace `My Collection` with your folder's name):
+
+```bash
+COLL=$HOME/mods/bg3/"My Collection"
+```
+
+First, see what is tracked and find the mod's `file_id`:
+
+```bash
+nexus-dl mods "$COLL"
+```
+
+You get a table of name, version, `file_id`, `mod_id`, and download status. Note the `file_id` of the mod you want to remove.
+
+Preview the removal. This shows what would go and changes nothing:
+
+```bash
+nexus-dl remove "$COLL" --file-id 12345 --dry-run
+```
+
+When that is the right mod, remove it:
+
+```bash
+nexus-dl remove "$COLL" --file-id 12345
+```
+
+What this does:
+- Removes the mod from the collection's records (every tracked file of that mod at once)
+- Keeps it gone: later `sync` or `update` runs will not bring it back
+- Leaves downloaded files on disk (to clean files out of your game folder, see [Removing deployed mods](#removing-deployed-mods))
+
+Changed your mind? Re-add the mod with `nexus-dl add` (or a "Mod manager download" link) and it comes back into the collection.
+
+You can also target the whole mod page with `--mod-id 123` instead of `--file-id 12345`. Pass exactly one of the two.
+
 ## Deploying to your game
 
 Downloading mods is only half the job - the game needs to find them. The `deploy` command puts the mod files where the game expects them.
@@ -294,7 +333,7 @@ You only need to specify `--game-dir` once. The tool remembers it for future dep
 
 ### What "deploying" actually does
 
-The tool creates **symlinks** (shortcuts) from your mod staging directory into the game's install directory. The original mod files stay in `~/mods/bg3`, but the game sees them as if they're in its own folder.
+The tool creates **symlinks** (shortcuts) from your mod staging directory into the game's install directory. The original mod files stay in `~/mods/bg3`, but the game sees them as if they're in its own folder. Proton/Wine games always get real copies instead: the game cannot read through Linux symlinks that cross outside the Wine prefix.
 
 This means:
 - Mod files aren't duplicated (saves disk space)
@@ -531,45 +570,37 @@ Pasting an `nxm://` link on a line by itself is the same as `/add` with that lin
 
 If you're pasting links here because clicking **Mod manager download** in the browser produced nothing visible, that's usually the click-through side rather than the shell: desktop notifications are switched off, or the handler isn't installed. Start with "Clicking a link seems to do nothing" in [Troubleshooting](#troubleshooting); the short version is to check `~/.local/state/nexus-dl/nxm.log` first, because a new line there means the click ran and only the feedback is missing.
 
-## Using the web UI
+### Reacting to clicks from the shell
 
-If you do not want to memorize terminal commands, the web UI is probably the better option for day-to-day mod management. The CLI is faster for one-off operations and scripting, but the web UI lets you do almost everything from a browser with real-time progress feedback.
+When `nexus-dl shell` is open and you click **Mod manager download** in your browser, the shell notices while you sit at the prompt - no keystroke needed. You'll see something like:
 
-To start it:
-
-```bash
-nexus-dl serve ~/mods/bg3
+```
+Click activity while the shell was running (2 events):
+  'SkyUI' (file 456) downloaded into 'Clean Visuals'
+  'SKSE64' (file 111) is already downloaded in 'Clean Visuals'
 ```
 
-Then open your browser to `http://127.0.0.1:5000`. To use a different port:
+Then, for each collection that got a new file, the shell asks once:
 
-```bash
-nexus-dl serve ~/mods/bg3 --port 8080
+```
+Deploy 'Clean Visuals' now? [yes/no]:
 ```
 
-### What you get
+Answer `yes` and it shows what would be deployed (file counts and the game directory), asks again, and only then touches the game directory. Answer `no` at any point and nothing happens. Three clicks on the same collection produce one report and one prompt, not three.
 
-The web UI has two pages:
+A click on a **FOMOD mod** is different: those need option choices before anything can be extracted, so the mod waits and the shell offers the choices instead:
 
-**Dashboard** - Shows your collection at a glance: collection name, game, installed revision, how many mods, whether updates are available, and deployment status. From here you can sync a collection (paste the URL into a text box), update, deploy, undeploy, regenerate the load order, and manage tracked-mod sync. All with buttons instead of commands.
+```
+Click activity while the shell was running (1 events):
+  'XPMSE' (file 456) needs FOMOD option choices in 'Clean Visuals' (run import --fomod-option to install it)
+1 FOMOD mod in 'Clean Visuals' need option choices. Choose now? [yes/no]:
+```
 
-**Mods** - Lists every installed mod with status badges (up to date, update available, removed from collection, manual, etc.), version numbers, and load phases. You can add a mod by URL or register a local mod from this page.
+Answer `yes` and the installer's groups are shown one at a time, exactly as `add` shows them at a terminal (numbered options, the recommended one marked, Enter for none where a group allows it). The picks are recorded and the mod installs right there, then the deploy question follows as usual. Press **Ctrl-C** at any prompt to abort: the mod stays waiting, nothing is installed from a partial set of answers, and the shell keeps running. Answer `no` and the mod stays waiting: `nexus-dl import <collection> --fomod-option 'Group:Option'` picks it up later, and nothing is ever installed from a guess.
 
-### Real-time progress
+The shell reads a small events file each collection keeps at `<collection folder>/.nexus-events.jsonl`. You never need to touch it. Only collections under the shell's root folder are visible: if you clicked a mod into a collection the shell can't see, use `/collections` or `/mods` to check. Events that arrived before the shell started are not replayed; you'll see only clicks that happened while it was running.
 
-Long-running operations (syncing a big collection, downloading updates) stream progress to the browser in real time. You will see a progress bar and status messages as each mod downloads. This is one area where the web UI is nicer than the CLI, which just prints log lines.
-
-### CLI vs. web UI
-
-Both interfaces share the same code underneath, so the results are identical. The main differences:
-
-- The CLI has `--dry-run` for deploy and update (preview without acting). The web UI does not.
-- The CLI has `--no-load-order` and `--prefix` flags for more granular control.
-- The web UI shows progress bars and visual status badges. The CLI prints text.
-
-If you are just getting started, the web UI is the easier path. You only need the terminal to run `nexus-dl serve` and then everything else happens in the browser.
-
-Press `Ctrl + C` in the terminal to stop the web server when you are done.
+You can also deploy at any time without waiting for a click, using `/deploy` (or `/deploy 2` or `/deploy Clean Visuals` to pick a collection). It works the same way: dry-run counts, a confirmation, then the deploy.
 
 ## The --no-extract flag
 

@@ -25,8 +25,13 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from .fomod_plan import InstallPlan, ModuleConfig
+
+from .errmsg import exception_reason
 
 # Bethesda plugin/archive extensions
 BETHESDA_EXTENSIONS = {".esm", ".esp", ".esl", ".ba2"}
@@ -85,6 +90,8 @@ SKIP_PATTERNS = {
     ".nexus-state.json",
     "load-order.txt",
     "plugins.txt",
+    "meta.ini",
+    ".gitignore",
     "__folder_managed_by_vortex",
     "__macosx",
 }
@@ -138,7 +145,7 @@ GAME_APPDATA_NAMES = {
 }
 
 # Pattern for numbered option folders (e.g., "00 - Base", "01 - Main Files")
-NUMBERED_OPTION_RE = re.compile(r"^\d{2,3}\s*[-_]\s*")
+NUMBERED_OPTION_RE = re.compile(r"^\d{2,3}[\s\-_]+")
 
 # Pattern for versioned SFSE directories (e.g., "sfse_0_2_18")
 SFSE_VERSION_DIR_RE = re.compile(r"^sfse_[\d_]+$", re.IGNORECASE)
@@ -182,15 +189,40 @@ class DeployedFile:
 
 @dataclass
 class DeploymentPlan:
-    """Classification of files to deploy."""
+    """Classification of files to deploy.
+
+    ``source_root`` is the staging directory the sources live under. It
+    is only used to report sources in paths a human can place (a conflict
+    message naming two files called ``CapeAF_0.nif`` says nothing);
+    ``None`` falls back to whatever the source path is on its own.
+    """
 
     game_root_files: list[tuple[Path, Path]] = field(default_factory=list)
     data_files: list[tuple[Path, Path]] = field(default_factory=list)
     skipped: list[tuple[Path, str]] = field(default_factory=list)
+    source_root: Path | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def root_destinations(self) -> int:
+        """Distinct game-root destinations this plan writes."""
+        return len({str(d) for _s, d in self.game_root_files})
+
+    @property
+    def data_destinations(self) -> int:
+        """Distinct Data/ destinations this plan writes."""
+        return len({str(d) for _s, d in self.data_files})
 
     @property
     def total_files(self) -> int:
-        return len(self.game_root_files) + len(self.data_files)
+        """Destinations this plan writes, not entries.
+
+        Two entries can name one destination (the later one wins and the
+        overwrite is reported as a conflict); that is one file in the game
+        dir, so it counts once. Root and data destinations are counted
+        separately because they land in different directories.
+        """
+        return self.root_destinations + self.data_destinations
 
 
 @dataclass
@@ -201,6 +233,7 @@ class DeployResult:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     conflicts: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def _is_bg3_game(game_domain: str) -> bool:
@@ -233,6 +266,8 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     if name_lower in {p.lower() for p in SKIP_PATTERNS}:
         return None
     if name_lower.startswith("readme"):
+        return None
+    if name_lower.startswith(("license", "licence")):
         return None
     if suffix_lower in SKIP_EXTENSIONS and suffix_lower not in BETHESDA_EXTENSIONS:
         return None
@@ -330,16 +365,288 @@ def classify_file(rel_path: Path, game_domain: str) -> tuple[str, Path] | None:
     return ("data", rel_path)
 
 
+def _fomod_plans(
+    mods_dir: Path,
+    mod_choices: dict[int, dict],
+    fomod_picks: dict[int, list[dict]] | None = None,
+    fomod_configs: dict[int, dict] | None = None,
+    mod_names: dict[int, str] | None = None,
+) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...]]], list[str]]:
+    """Install plans for every readable ModuleConfig of this tree.
+
+    Each plan carries the directory its sources are relative to (the
+    config's own position decides that, see ``plan_source_root``) and the
+    source paths the config mentions at all, selected or not. The latter
+    is ownership: a file under one of them belongs to this mod, and a
+    file outside all of them belongs to whatever else shares the tree.
+
+    Configs come from two places. ``fomod_configs`` is the copy each
+    mod's extract recorded (``{"member", "xml", "mod_id"}`` keyed by
+    file_id): extraction merges every archive into one tree, so a second
+    mod's ``fomod/ModuleConfig.xml`` overwrites the first and the tree
+    alone can only ever show one of them. Configs still sitting in the
+    tree cover collections extracted before copies were recorded; one
+    whose path a record already represents is skipped, so a mod is never
+    planned twice.
+
+    Choices come from two places: ``fomod_picks`` are the (step, group,
+    option) triples a standalone install stored, and ``mod_choices`` is
+    the collection manifest's structure. Picks win, because they are the
+    more specific record. When the identity is known (a record's own
+    file_id and mod_id) only that mod's choices are tried; a config with
+    no identity falls back to trying every stored set, which is what
+    single-config trees always did.
+
+    A plan is ``None`` when its conditions could not all be evaluated.
+    Those mods keep the legacy folder heuristic rather than shipping a
+    guessed install.
+    """
+    from .fomod_plan import (
+        load_module_config,
+        load_module_config_text,
+        plan_source_root,
+        resolve_install_plan,
+        selections_from_manifest,
+    )
+    from .fomod_select import Pick, PickError, picks_to_selections
+
+    warnings: list[str] = []
+
+    def _label(file_id: int | None, where: str) -> str:
+        if file_id is not None and mod_names and mod_names.get(file_id):
+            return str(mod_names[file_id])
+        return where
+
+    def picks_to_selections_safe(
+        config: "ModuleConfig", stored: list[dict]
+    ) -> tuple[dict, list[str], str]:
+        """This mod's picks, keeping whatever still matches.
+
+        A pick that no longer names a real option is reported, never
+        allowed to erase the picks that still do. The third value is the
+        matcher's own refusal reason when the picks could not be read at
+        all (an ambiguous name, say): that is not "the option vanished"
+        and must not read as if it were.
+        """
+        try:
+            matched, unmatched = picks_to_selections(
+                [
+                    Pick(
+                        step=str(d.get("step", "")),
+                        group=str(d.get("group", "")),
+                        option=str(d.get("option", "")),
+                    )
+                    for d in stored
+                ],
+                config,
+            )
+        except PickError as e:
+            return {}, [], exception_reason(e)
+        return (
+            dict(matched),
+            [f"{p.step}:{p.group}:{p.option}" for p in unmatched],
+            "",
+        )
+
+    def selections_for(
+        config: "ModuleConfig", file_id: int | None, mod_id: int | None, where: str
+    ) -> dict:
+        """This mod's own picks first, then its own manifest choices."""
+        label = _label(file_id, where)
+        stale_note = ""
+        if file_id is not None and fomod_picks and file_id in fomod_picks:
+            stored = fomod_picks[file_id]
+            sel, stale, refusal = picks_to_selections_safe(config, stored)
+            if refusal:
+                warnings.append(
+                    f"{label}: the stored FOMOD options could not be read "
+                    f"({refusal})"
+                )
+            elif stale:
+                warnings.append(
+                    f"{label}: stored FOMOD options that are not in this "
+                    f"installer any more were not used: {', '.join(stale)}"
+                )
+            if sel:
+                return sel
+            if stored:
+                stale_note = (
+                    "the stored FOMOD options could not be applied"
+                    if refusal
+                    else (
+                        "none of the stored FOMOD options match this "
+                        "installer any more"
+                    )
+                )
+        if mod_id is not None and mod_choices.get(mod_id):
+            sel = selections_from_manifest(mod_choices[mod_id], config)
+            if sel:
+                if stale_note:
+                    warnings.append(
+                        f"{label}: {stale_note}; using the collection "
+                        "manifest's choices"
+                    )
+                return sel
+        if stale_note:
+            warnings.append(
+                f"{label}: {stale_note}; installing the installer's own defaults"
+            )
+        return {}
+
+    def selections_guessing(config: "ModuleConfig", where: str) -> dict:
+        """Last resort for a config with no recorded identity.
+
+        Only picks and manifest choices no recorded config owns are
+        eligible: a recorded mod's options are never guessed onto another
+        mod's installer. Whatever matches is a guess and says so.
+        """
+        for file_id, stored in (fomod_picks or {}).items():
+            if fomod_configs and file_id in fomod_configs:
+                continue
+            sel, stale, refusal = picks_to_selections_safe(config, stored)
+            if sel and not stale and not refusal:
+                warnings.append(
+                    f"{where}: FOMOD options were matched by name from other "
+                    "stored choices (this installer has no recorded choices "
+                    "of its own)"
+                )
+                return sel
+        for mod_id, choices in mod_choices.items():
+            if fomod_configs and any(
+                rec.get("mod_id") == mod_id for rec in fomod_configs.values()
+            ):
+                continue
+            matched = selections_from_manifest(choices, config)
+            if matched:
+                warnings.append(
+                    f"{where}: FOMOD options were matched by name from other "
+                    "stored choices (this installer has no recorded choices "
+                    "of its own)"
+                )
+                return dict(matched)
+        return {}
+
+    def plan_entry(
+        source_root: Path, config: "ModuleConfig", selections: dict, where: str
+    ) -> tuple[Path, "InstallPlan | None", tuple[str, ...]]:
+        resolved = resolve_install_plan(config, selections)
+        owned = tuple(entry.source.lower() for entry in config.all_entries())
+        if resolved.indeterminate:
+            message = (
+                f"{where}: installer conditions could not be evaluated "
+                "without game state; using the folder-based install"
+            )
+            detail = "; ".join(resolved.notes)
+            if detail:
+                message = f"{message} ({detail})"
+            warnings.append(message)
+        return (source_root, None if resolved.indeterminate else resolved, owned)
+
+    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
+
+    recorded: set[str] = set()
+    for file_id, rec in (fomod_configs or {}).items():
+        member = str(rec.get("member") or "").replace("\\", "/")
+        config = load_module_config_text(str(rec.get("xml") or ""))
+        if not member or config is None:
+            warnings.append(
+                f"{_label(file_id, member or 'a recorded installer')}: the "
+                "recorded installer config could not be read; its stored "
+                "options cannot be applied"
+            )
+            continue
+        recorded.add(member.lower())
+        plans.append(
+            plan_entry(
+                plan_source_root(mods_dir / member),
+                config,
+                selections_for(config, file_id, rec.get("mod_id"), member),
+                member,
+            )
+        )
+
+    for config_path in sorted(mods_dir.rglob("*")):
+        if not config_path.is_file() or config_path.name.lower() != "moduleconfig.xml":
+            continue
+        rel = config_path.relative_to(mods_dir)
+        if len(rel.parts) > 3:
+            continue
+        if rel.as_posix().replace("\\", "/").lower() in recorded:
+            continue
+        where = rel.as_posix()
+        config = load_module_config(config_path)
+        if config is None:
+            continue
+        plans.append(
+            plan_entry(
+                plan_source_root(config_path),
+                config,
+                selections_guessing(config, where),
+                where,
+            )
+        )
+    return plans, warnings
+
+
+def _plan_lookup(
+    file_path: Path,
+    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...]]],
+) -> tuple["InstallPlan | None", str] | None:
+    """Locate the plan that owns ``file_path``, if any.
+
+    Returns ``(plan, path under the source root)`` for the config whose
+    entry sources claim the file. A config must not claim another mod's
+    files, so a path under some config's source root but under none of
+    its entries is owned by nobody and gets no plan. When several configs
+    share a source root (two FOMOD mods in one collection), the one that
+    owns the file wins rather than whichever came first.
+
+    ``file_path`` must be absolute: source roots come from the config's
+    own location and are absolute too, and a relative path silently
+    matches nothing.
+    """
+    for source_root, plan, owned_prefixes in plans:
+        try:
+            under = file_path.relative_to(source_root)
+        except ValueError:
+            continue
+        under_s = under.as_posix()
+        if any(
+            under_s.lower() == prefix or under_s.lower().startswith(prefix + "/")
+            for prefix in owned_prefixes
+        ):
+            return plan, under_s
+    return None
+
+
 def classify_files(
     mods_dir: Path,
     game_domain: str,
     mod_choices: dict[int, dict] | None = None,
+    fomod_picks: dict[int, list[dict]] | None = None,
+    fomod_configs: dict[int, dict] | None = None,
+    mod_names: dict[int, str] | None = None,
 ) -> DeploymentPlan:
-    """Walk the staging directory and classify all files for deployment."""
+    """Walk the staging directory and classify all files for deployment.
+
+    Files a FOMOD config claims are installed from its install plan, at
+    the destination the config names. ``fomod_picks`` carries the option
+    choices a standalone install recorded; ``mod_choices`` is the
+    collection manifest's. ``fomod_configs`` is the installer config each
+    mod's extract recorded, which is what keeps two FOMOD mods in one
+    collection from planning over each other. Everything else keeps the
+    folder heuristics: numbered option wrappers, SFSE version directories,
+    and the top-level skip set for mods whose config could not be read.
+    ``mod_names`` (file id to display name) only improves the wording of
+    the plan's warnings.
+    """
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
+    fomod_plans, plan_warnings = _fomod_plans(
+        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names
+    )
 
-    plan = DeploymentPlan()
+    plan = DeploymentPlan(source_root=mods_dir, warnings=plan_warnings)
 
     for file_path in sorted(mods_dir.rglob("*")):
         if not file_path.is_file():
@@ -352,6 +659,22 @@ def classify_files(
         if parts[0].startswith("."):
             plan.skipped.append((rel, "hidden file"))
             continue
+
+        # Files a readable FOMOD config claims follow its install plan.
+        hit = _plan_lookup(file_path, fomod_plans)
+        if hit is not None:
+            fomod_plan, under = hit
+            if fomod_plan is not None:
+                found = fomod_plan.lookup(under)
+                if found is None:
+                    plan.skipped.append((rel, "not in the FOMOD install plan"))
+                    continue
+                plan_dest, _priority = found
+                if not plan_dest:
+                    plan.skipped.append((rel, "empty FOMOD destination"))
+                    continue
+                plan.data_files.append((file_path, Path(plan_dest)))
+                continue
 
         # Skip unselected FOMOD option folders
         if parts[0] in fomod_skip:
@@ -422,7 +745,7 @@ class DeployError(Exception):
 class UndeployError(DeployError):
     """Raised when undeploy could not safely remove everything.
 
-    Carries structured detail so CLI/web callers can show exactly which
+    Carries structured detail so callers can show exactly which
     paths were refused or failed instead of reporting a clean success.
     """
 
@@ -452,7 +775,7 @@ def sha256_file(path: Path) -> str:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 h.update(chunk)
     except OSError as e:
-        raise DeployError(f"cannot read {path}: {e}")
+        raise DeployError(f"cannot read {path}: {exception_reason(e)}")
     return h.hexdigest()
 
 
@@ -812,7 +1135,7 @@ def _restore_original(
             os.replace(tmp_link, dest)
             return True, ""
         except OSError as e:
-            return False, f"could not restore original symlink at {dest}: {e}"
+            return False, f"could not restore original symlink at {dest}: {exception_reason(e)}"
         finally:
             try:
                 tmp_link.unlink(missing_ok=True)  # no-op once replaced
@@ -831,7 +1154,7 @@ def _restore_original(
     try:
         backup_path = backups.path_for(backup_name)
     except DeployError as e:
-        return False, str(e)
+        return False, exception_reason(e)
 
     tmp: Path | None = None
     try:
@@ -858,7 +1181,7 @@ def _restore_original(
         os.replace(tmp, dest)
         tmp = None
     except OSError as e:
-        return False, f"could not restore original at {dest}: {e}"
+        return False, f"could not restore original at {dest}: {exception_reason(e)}"
     finally:
         if tmp is not None:
             try:
@@ -913,7 +1236,7 @@ def recover_ownership(
         try:
             validate_dest(dest, root, create_parents=False)
         except DeployError as e:
-            return False, str(e)
+            return False, exception_reason(e)
         return _restore_original(dest, rec, backups)
 
     for entry in entries:
@@ -1087,7 +1410,7 @@ def prepare_deploy(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
 
     if st is not None and not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
         raise DeployError(
@@ -1188,7 +1511,7 @@ def install_deploy(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
 
     if (st is not None) != current["exists"]:
         raise DeployError(
@@ -1226,7 +1549,7 @@ def install_deploy(
         try:
             os.replace(tmp_link, dest)
         except OSError as e:
-            raise DeployError(f"could not publish the symlink at {dest}: {e}")
+            raise DeployError(f"could not publish the symlink at {dest}: {exception_reason(e)}")
         finally:
             try:
                 tmp_link.unlink(missing_ok=True)  # no-op once replaced
@@ -1316,7 +1639,7 @@ def deploy_tracked_content(
     except FileNotFoundError:
         st = None
     except OSError as e:
-        raise DeployError(f"cannot inspect destination {dest}: {e}")
+        raise DeployError(f"cannot inspect destination {dest}: {exception_reason(e)}")
     if st is not None and not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
         raise DeployError(
             f"refused: {dest} is not a regular file or symlink; cannot write over it"
@@ -1435,14 +1758,14 @@ def undeploy_record(
         if dest.parent.exists():
             validate_dest(dest, root, create_parents=False)
     except DeployError as e:
-        return "refused", str(e)
+        return "refused", exception_reason(e)
 
     try:
         st = os.lstat(dest)
     except FileNotFoundError:
         st = None
     except OSError as e:
-        return "failed", f"{dest}: cannot inspect destination: {e}"
+        return "failed", f"{dest}: cannot inspect destination: {exception_reason(e)}"
 
     kind = rec.get("kind", "mod")
 
@@ -1454,7 +1777,7 @@ def undeploy_record(
             try:
                 os.unlink(dest)
             except OSError as e:
-                return "failed", f"{dest}: could not remove deployed file: {e}"
+                return "failed", f"{dest}: could not remove deployed file: {exception_reason(e)}"
             _cleanup_empty_parents(dest.parent, root)
             return "removed", (
                 f"{dest}: removed pre-0.2.1 deployment; any original file at "
@@ -1527,7 +1850,7 @@ def undeploy_record(
     try:
         os.unlink(dest)
     except OSError as e:
-        return "failed", f"{dest}: could not remove deployed file: {e}"
+        return "failed", f"{dest}: could not remove deployed file: {exception_reason(e)}"
 
     _cleanup_empty_parents(dest.parent, root)
     return "removed", ""
@@ -1548,6 +1871,11 @@ def undeploy_records(
     messages about cleared entries. Backups of successfully restored
     originals are dropped only when no remaining record references them; on
     any failure all backups are retained.
+
+    ``cleared_count`` counts mod files only. ``plugins.txt`` and the game
+    INI are cleared like everything else, but a deploy never counted them
+    as deployed files either, and counting them here is what made undeploy
+    report a different number from the deploy it undoes.
     """
     kept: list[dict] = []
     problems: list[str] = []
@@ -1561,7 +1889,8 @@ def undeploy_records(
         status, msg = undeploy_record(rec, roots, backups)
         if status in ("removed", "restored", "gone"):
             ownership.pop(dest_str, None)
-            cleared += 1
+            if rec.get("kind", "mod") == "mod":
+                cleared += 1
             backup_name = rec.get("backup")
             if status == "restored" and backup_name and not any(
                 r.get("backup") == backup_name for r in ownership.values()
@@ -1576,6 +1905,16 @@ def undeploy_records(
             problems.append(msg or f"{dest_str}: {status}")
 
     return kept, problems, notes, cleared
+
+
+def _source_label(src: Path, source_root: Path | None) -> str:
+    """A source path a reader can place: relative to the staging root."""
+    if source_root is not None:
+        try:
+            return src.relative_to(source_root).as_posix()
+        except ValueError:
+            pass
+    return str(src)
 
 
 def deploy(
@@ -1603,7 +1942,7 @@ def deploy(
             "non-dry-run deployments"
         )
 
-    result = DeployResult()
+    result = DeployResult(warnings=list(plan.warnings))
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
 
@@ -1622,10 +1961,10 @@ def deploy(
             journal.deploy_intent(record)
             install_deploy(record, src, current, backups)
         except DeployError as e:
-            result.errors.append(str(e))
+            result.errors.append(exception_reason(e))
             return
         except OSError as e:
-            result.errors.append(f"{dest_rel}: {e}")
+            result.errors.append(f"{dest_rel}: {exception_reason(e)}")
             return
         # Installed: record ownership before anything else so the file stays
         # tracked even if the completion line cannot be written.
@@ -1642,7 +1981,8 @@ def deploy(
         dest = game_dir / dest_rel
         if dest in seen_dests:
             result.conflicts.append(
-                f"{dest_rel}: overwritten by {src.name} (was {seen_dests[dest].name})"
+                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
+                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
             )
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
@@ -1652,10 +1992,18 @@ def deploy(
         dest = data_dir / dest_rel
         if dest in seen_dests:
             result.conflicts.append(
-                f"{dest_rel}: overwritten by {src.name} (was {seen_dests[dest].name})"
+                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
+                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
             )
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+
+    # One entry per destination: the write that won is the file that is
+    # there. The overwrites themselves are already in `conflicts`.
+    by_dest: dict[str, DeployedFile] = {}
+    for deployed in result.deployed:
+        by_dest[deployed.dest] = deployed
+    result.deployed = list(by_dest.values())
 
     return result
 
@@ -1766,7 +2114,7 @@ def get_plugins_txt_dest(prefix: Path, game_domain: str) -> Path | None:
         / "AppData"
         / "Local"
         / appdata_name
-        / "plugins.txt"
+        / "Plugins.txt"
     )
 
 

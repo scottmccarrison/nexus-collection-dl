@@ -272,25 +272,3 @@ def test_concurrent_writer_serializes_without_lost_writes(svc, tmp_path):
     assert names == {"First Mod", "Second Mod"}   # sequential, no lost writes
     assert "Blocked Mod" not in names             # the failed call wrote nothing
 
-
-# ---------------------------------------------------------------------------
-# Web boundary: busy surfaces as a clean JSON error, not a 500
-# ---------------------------------------------------------------------------
-
-def test_web_add_local_busy_surfaces_as_json_400(tmp_path):
-    from nexus_collection_dl.web.app import create_app
-
-    cdir = make_collection(tmp_path)
-    app = create_app(api_key="test-key-unused", mods_dir=cdir)
-    client = app.test_client()
-
-    with CollectionLock(cdir):
-        resp = client.post("/api/add-local", json={"name": "Local Mod"})
-
-    assert resp.status_code == 400
-    body = resp.get_json()
-    assert "already running" in body["error"]
-    assert state_raw(cdir) == state_raw(cdir)     # sanity: file still readable
-    state = CollectionState(cdir)
-    state.load()
-    assert state.mods == {}                       # nothing was written
