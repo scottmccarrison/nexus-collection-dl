@@ -2114,7 +2114,7 @@ def get_plugins_txt_dest(prefix: Path, game_domain: str) -> Path | None:
         / "AppData"
         / "Local"
         / appdata_name
-        / "plugins.txt"
+        / "Plugins.txt"
     )
 
 
