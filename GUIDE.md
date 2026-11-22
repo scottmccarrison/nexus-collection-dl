@@ -596,7 +596,7 @@ Click activity while the shell was running (1 events):
 1 FOMOD mod in 'Clean Visuals' need option choices. Choose now? [yes/no]:
 ```
 
-Answer `yes` and the installer's groups are shown one at a time, exactly as `add` shows them at a terminal (numbered options, the recommended one marked, Enter for none where a group allows it). The picks are recorded and the mod installs right there, then the deploy question follows as usual. Answer `no` and the mod stays waiting: `nexus-dl import <collection> --fomod-option 'Group:Option'` picks it up later, and nothing is ever installed from a guess.
+Answer `yes` and the installer's groups are shown one at a time, exactly as `add` shows them at a terminal (numbered options, the recommended one marked, Enter for none where a group allows it). The picks are recorded and the mod installs right there, then the deploy question follows as usual. Press **Ctrl-C** at any prompt to abort: the mod stays waiting, nothing is installed from a partial set of answers, and the shell keeps running. Answer `no` and the mod stays waiting: `nexus-dl import <collection> --fomod-option 'Group:Option'` picks it up later, and nothing is ever installed from a guess.
 
 The shell reads a small events file each collection keeps at `<collection folder>/.nexus-events.jsonl`. You never need to touch it. Only collections under the shell's root folder are visible: if you clicked a mod into a collection the shell can't see, use `/collections` or `/mods` to check. Events that arrived before the shell started are not replayed; you'll see only clicks that happened while it was running.
 
