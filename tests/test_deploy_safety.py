@@ -1508,3 +1508,25 @@ def test_plugins_txt_generated_from_mod_files_when_manifest_empty(tmp_path):
     assert "*B.esm" in plugins_text
     assert "*D.esl" in plugins_text
     assert "C.zip" not in plugins_text  # not a plugin
+
+
+def test_deploy_generates_plugins_txt_from_deployed_files(svc, tmp_path):
+    """When the staging plugins.txt has no plugin entries (community
+    collections often omit manifest plugin data), the deploy builds one
+    from the deployed .esp/.esm/.esl files with * prefixes."""
+    mods, game, prefix = _svc_env(
+        tmp_path,
+        staging_files={
+            "ModA/HSPlayerHomes - Breezehome.esp": b"esp a",
+            "ModB/HSResources.esl": b"esl b",
+            "ModC/texture.dds": b"dds",
+        },
+    )
+    plugins_dest = get_plugins_txt_dest(prefix, DOMAIN)
+
+    result = svc.deploy(mods, game_dir=game)
+    assert not result.errors
+    plugins_text = plugins_dest.read_text()
+    assert "*HSPlayerHomes - Breezehome.esp" in plugins_text
+    assert "*HSResources.esl" in plugins_text
+    assert "texture.dds" not in plugins_text
