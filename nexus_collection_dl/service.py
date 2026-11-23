@@ -2324,6 +2324,14 @@ class ModManagerService:
                 for mod in state.mods.values()
                 if mod.fomod_config
             }
+            # What the game looks like from here: the load order the
+            # installer's fileDependency/gameDependency conditions are
+            # answered against. Without it those conditions are
+            # undecidable and multi-game installers fall back to the
+            # folder heuristic.
+            from .game_state import read_game_state
+
+            game_state = read_game_state(prefix, game_domain)
             plan = classify_files(
                 mods_dir,
                 game_domain,
@@ -2333,6 +2341,7 @@ class ModManagerService:
                 mod_names={
                     mod.file_id: mod.name for mod in state.mods.values()
                 },
+                game=game_state,
             )
 
             # A disabled mod is "temporarily not installed": its state
