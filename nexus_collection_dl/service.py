@@ -1012,6 +1012,60 @@ def list_games(root: Path) -> list[GameSummary]:
     ]
 
 
+def _requirements_from_mod_info(info: dict | None) -> list[int]:
+    """Requirement mod_ids from a mod-info payload, or [].
+
+    The Nexus GraphQL collection query carries these under
+    ``modRequirements.nexusRequirements.nodes[].modId``. The REST mod
+    endpoint may or may not carry an equivalent. Both shapes are
+    accepted; anything else is "no list", not "no requirements", so the
+    caller stays silent rather than inventing an all-clear.
+    """
+    if not isinstance(info, dict):
+        return []
+    direct = info.get("requirements") or info.get("dependencies")
+    if isinstance(direct, list):
+        out: list[int] = []
+        for item in direct:
+            if isinstance(item, int):
+                out.append(item)
+            elif isinstance(item, dict) and "modId" in item:
+                try:
+                    out.append(int(item["modId"]))
+                except (TypeError, ValueError):
+                    continue
+        return out
+    nested = info.get("modRequirements") or {}
+    nexus = nested.get("nexusRequirements") or {}
+    nodes = nexus.get("nodes") or []
+    out = []
+    for node in nodes:
+        if isinstance(node, dict) and "modId" in node:
+            try:
+                out.append(int(node["modId"]))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def missing_requirements(state: CollectionState, requirements: list[int] | None) -> list[int]:
+    """Required mod_ids this collection does not have.
+
+    The check behind the `add` dependency warning. Collections handle
+    dependencies implicitly (the author includes them); `add` takes one
+    mod and has no idea what else that mod needs.
+
+    Warn, never block: a missing dependency is a thing the user may know
+    about and have decided against. And an empty or absent list means
+    "nothing known", not "nothing needed": we cannot check what we
+    cannot see, and a false warning is worse than none.
+    """
+    if not requirements:
+        return []
+    installed = {ms.mod_id for ms in state.mods.values()}
+    return [r for r in requirements if r not in installed]
+
+
 def list_mods(mods_dir: Path) -> list[ModSummary]:
     """List tracked mods from local state only (read-only, no network).
 
@@ -1480,10 +1534,12 @@ class ModManagerService:
             for i, (mod_info, file_path) in enumerate(results):
                 try:
                     config_record = None
+                    contributed: list[str] = []
                     if not no_extract and is_archive(file_path):
                         final_files = extract_archive(file_path, mods_dir)
                         for ef in final_files:
                             rel = str(ef.relative_to(mods_dir))
+                            contributed.append(rel)
                             prev_owner = file_owners.get(rel)
                             if prev_owner:
                                 conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
@@ -1493,6 +1549,7 @@ class ModManagerService:
                         extracted += 1
                     else:
                         rel = str(file_path.relative_to(mods_dir))
+                        contributed.append(rel)
                         prev_owner = file_owners.get(rel)
                         if prev_owner:
                             conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
@@ -1500,6 +1557,10 @@ class ModManagerService:
                     state.add_mod(mod_info)
                     if config_record is not None:
                         state.mods[mod_info["file_id"]].fomod_config = config_record
+                    # Attribution for `disable`: the extraction tree is
+                    # merged, so without this a disabled mod cannot be
+                    # told apart from its neighbours at deploy time.
+                    state.mods[mod_info["file_id"]].contributed_files = contributed
                     state.save()
                     pct = 0.75 + 0.15 * ((i + 1) / len(results))
                     progress("extract", pct, f"Extracted {mod_info['mod_name']}")
@@ -1824,6 +1885,17 @@ class ModManagerService:
             add_warnings: list[str] = []
             if fomod_picks and not fomod_seen:
                 add_warnings.append(_unused_picks_warning(mod_name, no_extract))
+            # Warn, never block, when this mod's requirements are not
+            # installed. Collections include their dependencies; `add`
+            # takes one mod and has no idea what else it needs. The list
+            # comes from whatever the mod info carries, and silence when
+            # it carries none: we cannot check what we cannot see, and a
+            # false warning is worse than none.
+            reqs = _requirements_from_mod_info(nexus_mod)
+            for req_id in missing_requirements(state, reqs):
+                add_warnings.append(
+                    f"missing dependency: mod {req_id} is not installed"
+                )
             config_record = None
             for _mod, file_path in results:
                 try:
@@ -2254,6 +2326,40 @@ class ModManagerService:
                     mod.file_id: mod.name for mod in state.mods.values()
                 },
             )
+
+            # A disabled mod is "temporarily not installed": its state
+            # entry, its picks, and its files on disk all stay, but its
+            # files must not land. The extraction tree is merged, so this
+            # works through the attribution recorded at extract time.
+            # A mod with no attribution (extracted before that existed)
+            # cannot be isolated, and says so rather than guessing.
+            disabled_paths: set[str] = set()
+            unattributed: list[str] = []
+            for mod in state.mods.values():
+                if mod.enabled:
+                    continue
+                if mod.contributed_files:
+                    disabled_paths.update(mod.contributed_files)
+                else:
+                    unattributed.append(mod.name)
+            if disabled_paths:
+                plan.data_files = [
+                    (src, dest)
+                    for src, dest in plan.data_files
+                    if str(src.relative_to(mods_dir)) not in disabled_paths
+                ]
+                plan.game_root_files = [
+                    (src, dest)
+                    for src, dest in plan.game_root_files
+                    if str(src.relative_to(mods_dir)) not in disabled_paths
+                ]
+            for name in unattributed:
+                deploy_warnings.append(
+                    f"{name} is disabled but its files cannot be isolated "
+                    "(it was extracted before per-mod attribution existed); "
+                    "re-sync the collection to record it"
+                )
+
             deploy_warnings.extend(plan.warnings)
 
             if plan.total_files == 0:

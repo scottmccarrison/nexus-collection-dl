@@ -1162,6 +1162,88 @@ def remove(
         console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
 
 
+def _set_mod_enabled(
+    ctx: click.Context,
+    mods_dir: Path,
+    file_id: int | None,
+    mod_id: int | None,
+    enabled: bool,
+) -> None:
+    """Shared body of `enable` and `disable`. State-only; nothing deploys."""
+    from .state import CollectionState, StateError
+
+    if (file_id is None) == (mod_id is None):
+        _fail(
+            ctx,
+            ValueError("exactly one of --file-id or --mod-id is required"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+    try:
+        state = CollectionState(mods_dir)
+        state.load()
+        hits = [
+            ms
+            for ms in state.mods.values()
+            if (file_id is not None and ms.file_id == file_id)
+            or (mod_id is not None and ms.mod_id == mod_id)
+        ]
+        if not hits:
+            _fail(
+                ctx,
+                ValueError("no matching mod found"),
+                hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+            )
+        for ms in hits:
+            ms.enabled = enabled
+        state.save()
+    except StateError as e:
+        _fail(ctx, e)
+
+    verb = "Enabled" if enabled else "Disabled"
+    if _emit_result(
+        ctx, {"enabled": enabled, "mods": [{"file_id": h.file_id, "name": h.name} for h in hits]}
+    ):
+        return
+    console.print(f"[green]{verb} {len(hits)} mod(s).[/green]")
+    if not enabled:
+        console.print(
+            "[dim]Off means temporarily not installed: the state entry and "
+            "the files on disk stay. Run 'deploy' to apply.[/dim]"
+        )
+
+
+@main.command(name="disable")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--file-id", type=int, default=None, help="Disable by Nexus file id")
+@click.option("--mod-id", type=int, default=None, help="Disable by Nexus mod id")
+@click.pass_context
+def disable_mod(
+    ctx: click.Context, mods_dir: Path, file_id: int | None, mod_id: int | None
+) -> None:
+    """Turn a mod off without removing it.
+
+    The mod keeps its state entry, its FOMOD picks, and its files on
+    disk; its files just stop landing at deploy. Run 'deploy' to apply.
+    Exactly one of --file-id or --mod-id is required.
+    """
+    _set_mod_enabled(ctx, mods_dir, file_id, mod_id, enabled=False)
+
+
+@main.command(name="enable")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--file-id", type=int, default=None, help="Enable by Nexus file id")
+@click.option("--mod-id", type=int, default=None, help="Enable by Nexus mod id")
+@click.pass_context
+def enable_mod(
+    ctx: click.Context, mods_dir: Path, file_id: int | None, mod_id: int | None
+) -> None:
+    """Turn a mod back on. Run 'deploy' to apply.
+
+    Exactly one of --file-id or --mod-id is required.
+    """
+    _set_mod_enabled(ctx, mods_dir, file_id, mod_id, enabled=True)
+
+
 @main.command()
 @click.argument(
     "root_dir",
