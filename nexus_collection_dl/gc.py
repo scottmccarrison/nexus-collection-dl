@@ -13,9 +13,13 @@ until `--apply`. Two hard rules:
   for "only copy" is attribution: a mod that has extracted payload on
   disk has its content, and the archive is redundant. A mod with no
   attribution (extracted before that existed) or with nothing on disk
-  still needs its archive, and it stays.
+  still needs its archive, and it stays. The archive itself never counts
+  as its own payload.
 
-An archive the state does not claim is not ours to delete and is kept.
+An archive is recognised by content, not by a suffix list: sync names
+downloads after the manifest's filename, which for community collections
+is often a display name with no extension. An archive the state does not
+claim is not ours to delete and is kept.
 """
 
 from __future__ import annotations
@@ -24,12 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .deploy import BACKUPS_DIRNAME
+from .extractor import is_archive
 from .state import CollectionState, StateError
-
-# Archive extensions the download path produces. Deliberately narrow: a
-# file nobody claims is kept whatever it is, and this only narrows which
-# files are candidates in the first place.
-ARCHIVE_SUFFIXES = frozenset({".zip", ".7z", ".rar"})
 
 
 @dataclass
@@ -64,7 +64,11 @@ def plan_gc(mods_dir: Path) -> GcPlan:
         if rel.parts and rel.parts[0] == BACKUPS_DIRNAME:
             # The backup store. Never ours to delete.
             continue
-        if path.suffix.lower() not in ARCHIVE_SUFFIXES:
+        if not is_archive(path):
+            # Content sniffing, not a suffix list: sync names archives
+            # after the manifest's filename, which for community
+            # collections is a display name with no extension. A loose
+            # file download is its own payload and is never a candidate.
             continue
 
         mod = by_filename.get(path.name)
@@ -78,8 +82,11 @@ def plan_gc(mods_dir: Path) -> GcPlan:
             continue
         # The mod has attribution. If any of its files are still on the
         # disk the archive is redundant; if none are, the archive is the
-        # only copy.
-        if not any((mods_dir / f).is_file() for f in mod.contributed_files):
+        # only copy. The archive itself does not count as payload: a
+        # retained archive whose attribution is just its own name is
+        # still the only copy.
+        payload_names = [f for f in mod.contributed_files if f != path.name]
+        if not any((mods_dir / f).is_file() for f in payload_names):
             plan.kept.append((path, "the archive is the only copy of this mod"))
             continue
 
