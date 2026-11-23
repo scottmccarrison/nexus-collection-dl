@@ -160,13 +160,16 @@ def test_extracts_into_directory_with_special_characters(tmp_path):
     assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
 
 
-def test_mid_publication_failure_leaves_earlier_files_and_cleans_staging(
+def test_mid_publication_failure_leaves_a_marker_and_staging(
     tmp_path, monkeypatch
 ):
-    """Pinned limitation: publication moves staged files one by one, so a
-    failure partway leaves the already-moved files published while the
-    staging directory is cleaned up and the error surfaces. Re-running
-    extraction is safe: moves overwrite the earlier subset."""
+    """The pinned limitation is closed: a failure partway is recoverable.
+
+    Publication used to move staged files one by one and clean up
+    staging either way, so a failure left a partial set with nothing to
+    repair from. Now the marker and staging both survive, and
+    recover_pending_publish finishes the job.
+    """
     archive = make_zip(
         tmp_path / "Mod-1.0.zip",
         {
@@ -196,16 +199,24 @@ def test_mid_publication_failure_leaves_earlier_files_and_cleans_staging(
     assert "Mod-1.0.zip" in str(excinfo.value)
 
     # The first file was already published; the rest never moved
-    published = sorted(p for p in target.rglob("*") if p.is_file())
+    published = sorted(
+        p
+        for p in target.rglob("*")
+        if p.is_file()
+        and not any(part.startswith(".nexus-") for part in p.relative_to(target).parts)
+    )
     assert len(published) == 1
     assert published[0].read_bytes() in (b"one", b"two", b"three")
-    # Staging is fully cleaned up even on this failure path
-    assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
+    # The marker and staging both survive so the publish can be finished.
+    assert (target / extractor.PENDING_PUBLISH_MARKER).exists()
+    assert [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]
 
-    # Re-running the same extraction completes and overwrites the subset
-    result = extract_archive(archive, target)
-    assert len(result) == 3
+    # Recovering finishes the job from what was left behind.
+    monkeypatch.setattr(extractor.shutil, "move", real_move)
+    recovered = extractor.recover_pending_publish(target)
+    assert recovered
     assert (target / "Data" / "one.txt").read_bytes() == b"one"
     assert (target / "Data" / "two.txt").read_bytes() == b"two"
     assert (target / "Data" / "three.txt").read_bytes() == b"three"
+    assert not (target / extractor.PENDING_PUBLISH_MARKER).exists()
     assert not [p for p in target.iterdir() if p.name.startswith(".nexus-extract-")]

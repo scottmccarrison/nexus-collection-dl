@@ -1951,6 +1951,7 @@ def deploy(
     journal: DeployJournal | None = None,
     ownership: dict[str, dict] | None = None,
     on_progress: "Callable[[int, int, str], None] | None" = None,
+    expected_plugins: "list[str] | None" = None,
 ) -> DeployResult:
     """Execute a deployment plan.
 
@@ -1966,6 +1967,14 @@ def deploy(
     (hundreds of files in copy mode), so without this the caller can only
     say "deploying N files" and then go quiet. ``total`` is
     ``plan.total_files`` and ``detail`` is the destination being written.
+
+    ``expected_plugins`` are the plugin names the load order knows. On a
+    case-sensitive filesystem a mod shipping ``Foo.esp`` where the load
+    order says ``foo.esp`` is two different files. When the expectation
+    is known the deployed name is fixed up to it (and the rename is
+    reported); when it is not, a collision is warned and nothing is
+    renamed. Never silently rename: a rename the game does not expect is
+    its own bug.
     """
     if not dry_run and (backups is None or journal is None or ownership is None):
         raise ValueError(
@@ -1976,6 +1985,42 @@ def deploy(
     result = DeployResult(warnings=list(plan.warnings))
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
+
+    # Case mismatches, surfaced here rather than in game. Linux
+    # filesystems are case-sensitive and mods are authored on
+    # case-insensitive ones; we shipped this bug class ourselves with
+    # plugins.txt vs Plugins.txt. Never silently rename: a rename the
+    # game does not expect is its own bug.
+    if expected_plugins:
+        by_lower = {p.lower(): p for p in expected_plugins}
+
+        def _fix_case(dest_rel: Path) -> Path:
+            want = by_lower.get(dest_rel.name.lower())
+            if want and want != dest_rel.name:
+                result.warnings.append(
+                    f"{dest_rel}: renamed to {want} to match the load order "
+                    f"(the mod shipped {dest_rel.name})"
+                )
+                return dest_rel.with_name(want)
+            return dest_rel
+
+        plan.game_root_files = [(s, _fix_case(d)) for s, d in plan.game_root_files]
+        plan.data_files = [(s, _fix_case(d)) for s, d in plan.data_files]
+
+    # Two destinations whose names differ only in case: on ext4 only one
+    # of them is real and nothing says which.
+    seen_lower: dict[str, Path] = {}
+    for _src, dest_rel in list(plan.game_root_files) + list(plan.data_files):
+        low = dest_rel.as_posix().lower()
+        prior = seen_lower.get(low)
+        if prior is not None and prior != dest_rel:
+            result.warnings.append(
+                f"{dest_rel}: case-collides with {prior}; on a "
+                "case-sensitive filesystem only one of these is real"
+            )
+        else:
+            seen_lower[low] = dest_rel
+
     entries_total = len(plan.game_root_files) + len(plan.data_files)
     entries_done = 0
 

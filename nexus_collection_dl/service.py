@@ -2298,9 +2298,17 @@ class ModManagerService:
             # never tears down a working deployment.
             progress("classify", 0.15, "Classifying files...")
             manifest_choices = {}
+            expected_plugins: list[str] = []
             if state.manifest_data:
                 manifest = CollectionManifest.from_dict(state.manifest_data)
                 manifest_choices = manifest.mod_choices
+                # Plugin names the load order knows. Used at publish to
+                # fix up a case mismatch before the game sees it.
+                expected_plugins = [
+                    str(p.get("filename") or p.get("name") or "")
+                    for p in (manifest.plugins or [])
+                    if (p.get("filename") or p.get("name"))
+                ]
             # FOMOD option picks recorded by standalone adds and imports.
             fomod_picks = {
                 mod.file_id: mod.fomod_picks
@@ -2415,6 +2423,7 @@ class ModManagerService:
                 plan, game_dir, method=method, dry_run=False,
                 backups=backups, journal=journal, ownership=ownership,
                 on_progress=_file_progress,
+                expected_plugins=expected_plugins,
             )
 
             # Write plugins.txt and the game INI through the same tracking,
