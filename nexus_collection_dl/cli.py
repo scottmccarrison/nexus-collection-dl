@@ -14,6 +14,7 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
+from .errmsg import exception_reason
 from .extractor import ExtractionError
 from .fomod_select import PickError
 from .handler import (
@@ -211,7 +212,13 @@ def _handle_bare_invocation(ctx: click.Context, json_mode: bool) -> None:
     if not cfg.is_configured():
         # First run. The wizard is the front door: detect what it can,
         # ask for the rest, write the config that makes the shell useful.
-        ctx.invoke(setup, non_interactive=False, collections_root=None, game=())
+        ctx.invoke(
+            setup,
+            non_interactive=False,
+            collections_root=None,
+            game=(),
+            install_handler=False,
+        )
         return
 
     from .shell import run_shell
@@ -1297,12 +1304,21 @@ def _format_picks(picks: list, limit: int = 3) -> str:
     multiple=True,
     help="A known game as domain=path (repeatable).",
 )
+@click.option(
+    "--install-handler",
+    is_flag=True,
+    help=(
+        "Also install the user desktop entry so nxm:// links open nexus-dl. "
+        "Opt-in: it writes a .desktop file and registers a MIME default."
+    ),
+)
 @click.pass_context
 def setup(
     ctx: click.Context,
     non_interactive: bool,
     collections_root: Path | None,
     game: tuple[str, ...],
+    install_handler: bool,
 ) -> None:
     """Configure nexus-dl: where collections live and what games you have.
 
@@ -1311,12 +1327,37 @@ def setup(
     --non-interactive it takes flags only and never prompts, which is
     what a script or a harness needs.
 
+    It can also install the nxm:// desktop handler, which is the 0.4.0
+    headline feature and used to live in the docs as a checklist item
+    nobody reached. Interactive setup offers it; --install-handler asks
+    for it explicitly. Both are opt-in, because installing a desktop
+    entry and flipping a MIME default is a change to the system.
+
     This writes ~/.config/nexus-dl/config.json. Bare `nexus-dl` reads it
     to open the shell, so getting it set up is what turns the first run
     into the workbench.
     """
     from .config import UserConfig
     from .steam import list_installed_games
+
+    def _install_handler() -> bool:
+        """Offer and perform the desktop-handler install. True if done."""
+        from .handler import DesktopInstaller
+
+        try:
+            entry = DesktopInstaller().install()
+        except Exception as e:
+            # A failed install must not undo a successful setup.
+            console.print(
+                f"[yellow]Handler not installed:[/yellow] {escape(exception_reason(e))}"
+            )
+            return False
+        console.print(f"[green]NXM handler installed:[/green] {escape(str(entry))}")
+        console.print(
+            "[dim]'Mod manager download' links now open nexus-dl. Map each "
+            "game with 'nexus-dl handler map GAME COLLECTION_DIR'.[/dim]"
+        )
+        return True
 
     if non_interactive:
         if collections_root is None:
@@ -1338,7 +1379,15 @@ def setup(
             games.append({"domain": domain.strip(), "game_dir": game_dir.strip()})
         cfg = UserConfig(collections_root=str(collections_root), games=games)
         cfg.save()
-        if _emit_result(ctx, {"collections_root": cfg.collections_root, "games": cfg.games}):
+        handler_installed = _install_handler() if install_handler else False
+        if _emit_result(
+            ctx,
+            {
+                "collections_root": cfg.collections_root,
+                "games": cfg.games,
+                "handler_installed": handler_installed,
+            },
+        ):
             return
         console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
         return
@@ -1377,6 +1426,21 @@ def setup(
     console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
     if cfg.games:
         console.print(f"Games: {', '.join(g['domain'] for g in cfg.games)}")
+
+    if install_handler:
+        _install_handler()
+    else:
+        console.print(
+            "\n[bold]nxm:// link handler[/bold] (optional, the 0.4.0 "
+            "headline feature): lets a 'Mod manager download' click on "
+            "the Nexus website land in nexus-dl."
+        )
+        if click.confirm("Install it now?", default=True):
+            _install_handler()
+        else:
+            console.print(
+                "[dim]Skipped. Install later with 'nexus-dl handler install'.[/dim]"
+            )
 
 
 @main.command()

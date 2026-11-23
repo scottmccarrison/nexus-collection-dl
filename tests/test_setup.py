@@ -184,14 +184,18 @@ def test_setup_interactive_asks_and_writes(tmp_path, monkeypatch):
     """Answers in, config out.
 
     The prompt flow is what a person sees. CliRunner feeds the answers.
+    Steam detection is pointed at nothing so the machine's real library
+    cannot add prompts this test does not expect.
     """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
     monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    _fake_installer(monkeypatch)
 
     r = CliRunner().invoke(
         cli_module.main,
         ["setup"],
-        input=f"{tmp_path / 'mods'}\n\n",
+        input=f"{tmp_path / 'mods'}\nn\n",
     )
     assert r.exit_code == 0, r.output
     cfg = UserConfig.load()
@@ -202,14 +206,140 @@ def test_setup_interactive_offers_detected_games(tmp_path, monkeypatch):
     """Detection has to reach the user: what is installed gets offered."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    _fake_installer(monkeypatch)
     steam = _fake_steam(tmp_path, {"489830": "Skyrim Special Edition"})
     monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(steam))
 
     r = CliRunner().invoke(
         cli_module.main,
         ["setup"],
-        input=f"{tmp_path / 'mods'}\ny\n\n",
+        input=f"{tmp_path / 'mods'}\ny\nn\n",
     )
     assert r.exit_code == 0, r.output
     cfg = UserConfig.load()
     assert cfg.games and cfg.games[0]["domain"] == "skyrimspecialedition"
+
+
+# ---------------------------------------------------------------------------
+# handler install as part of setup
+# ---------------------------------------------------------------------------
+
+
+def _fake_installer(monkeypatch):
+    """A DesktopInstaller whose install() records rather than writes."""
+    calls: list[str] = []
+    import nexus_collection_dl.handler as handler_module
+
+    class FakeInstaller:
+        def install(self):
+            calls.append("install")
+            return "/tmp/fake/nexus-dl-nxm.desktop"
+
+    monkeypatch.setattr(handler_module, "DesktopInstaller", FakeInstaller)
+    return calls
+
+
+def test_setup_non_interactive_does_not_install_the_handler_by_default(
+    tmp_path, monkeypatch
+):
+    """Side-effecting, so it is opt-in. A harness gets what it asked for.
+
+    Writing a desktop entry and flipping a MIME default is not a thing
+    to do because a flag was absent. The default is to leave the system
+    alone.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    calls = _fake_installer(monkeypatch)
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        [
+            "setup",
+            "--non-interactive",
+            "--collections-root",
+            str(tmp_path / "mods"),
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert not calls, "the handler was installed without being asked for"
+
+
+def test_setup_non_interactive_installs_the_handler_when_asked(
+    tmp_path, monkeypatch
+):
+    """The opt-in flag is how a harness asks."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    calls = _fake_installer(monkeypatch)
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        [
+            "setup",
+            "--non-interactive",
+            "--collections-root",
+            str(tmp_path / "mods"),
+            "--install-handler",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert calls == ["install"]
+
+
+def test_setup_interactive_offers_the_handler(tmp_path, monkeypatch):
+    """It has to reach a person: the handler is the 0.4.0 headline feature
+    and it was opt-in-by-documentation, which is exactly the gap the
+    front door exists to close.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    calls = _fake_installer(monkeypatch)
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup"],
+        input=f"{tmp_path / 'mods'}\ny\n",
+    )
+    assert r.exit_code == 0, r.output
+    assert "handler" in r.output.lower() or "nxm" in r.output.lower()
+    assert calls == ["install"]
+
+
+def test_setup_interactive_can_decline_the_handler(tmp_path, monkeypatch):
+    """Declining is a real answer. Nothing gets written."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    calls = _fake_installer(monkeypatch)
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup"],
+        input=f"{tmp_path / 'mods'}\nn\n",
+    )
+    assert r.exit_code == 0, r.output
+    assert not calls
+
+
+def test_handler_install_is_idempotent_across_setup_runs(tmp_path, monkeypatch):
+    """Re-running setup must not fight the user or fail.
+
+    DesktopInstaller().install() rewrites the entry and is documented as
+    idempotent. Setup leaning on that means re-running is safe.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    calls = _fake_installer(monkeypatch)
+
+    for _ in range(2):
+        r = CliRunner().invoke(
+            cli_module.main,
+            [
+                "setup",
+                "--non-interactive",
+                "--collections-root",
+                str(tmp_path / "mods"),
+                "--install-handler",
+            ],
+        )
+        assert r.exit_code == 0, r.output
+    assert calls == ["install", "install"]
