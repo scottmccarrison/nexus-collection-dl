@@ -224,9 +224,9 @@ def test_free_signed_link_downloads_pending_entry(svc, tmp_path, monkeypatch):
     assert result.extracted is True
     # The credential pair is redeemed exactly as issued; user_id is never sent
     assert fake.download_link_kwargs == [{"key": KEY, "expires": FUTURE}]
-    # Extraction happened and the archive was cleaned up
+    # Extraction happened and the archive is kept for gc to reclaim
     assert (cdir / "Data" / "test.txt").exists()
-    assert not (cdir / "TestMod-1.0.zip").exists()
+    assert (cdir / "TestMod-1.0.zip").exists()
     # State flipped to downloaded with the browser URL cleared
     state = CollectionState(cdir)
     state.load()
@@ -624,14 +624,14 @@ def test_extraction_failure_regresses_downloaded_entry_to_pending(
     assert state.mods[FILE_ID].download_status == "pending_download"
 
     # The advised import now finishes the job: extraction succeeds on
-    # the second attempt, the entry is downloaded, the archive is gone.
+    # the second attempt, the entry is downloaded, the archive is kept.
     import_result = svc.import_downloads(cdir)
     assert import_result.matched == 1
     assert import_result.extracted == 1
     assert import_result.still_pending == 0
     assert import_result.errors == []
     assert (cdir / "Data" / "test.txt").exists()
-    assert not (cdir / "TestMod-1.0.zip").exists()
+    assert (cdir / "TestMod-1.0.zip").exists()
     state = CollectionState(cdir)
     state.load()
     assert state.mods[FILE_ID].download_status == "downloaded"
@@ -1311,15 +1311,18 @@ def test_service_side_empty_domain_check_fails_closed(svc, tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Re-click behavior, end to end: the default flow deletes the extracted
-# archive, so a re-click re-downloads (verified); the zero-network
-# already_downloaded dedupe applies only to retained archives.
+# Re-click behavior, end to end: extraction keeps the verified archive,
+# so the same link clicked again dedupes to already_downloaded with zero
+# network calls. Nothing re-downloads what is already on disk.
 # ---------------------------------------------------------------------------
 
-def test_reclick_after_extraction_redownloads_verified(svc, tmp_path, monkeypatch):
-    """Default flow: download + extract deletes the archive, so the same
-    link clicked again performs a fresh verified download instead of
-    deduping. State stays consistent across both runs."""
+def test_reclick_after_extraction_dedupes_zero_network(svc, tmp_path, monkeypatch):
+    """Keeping the archive makes a re-click free: no second download.
+
+    Before, extraction deleted the archive so the same link re-downloaded
+    and re-verified on every click. State stays consistent across both
+    runs either way; what changes is the network cost.
+    """
     zip_bytes = make_zip()
     cdir = make_collection(tmp_path, mods=[pending_entry()])
     fake = FakeNexusAPI(files=files_meta(zip_bytes))
@@ -1329,7 +1332,8 @@ def test_reclick_after_extraction_redownloads_verified(svc, tmp_path, monkeypatc
     first = svc.add_nxm(uri(), mods_dir=cdir)
     assert first.success and first.status == "downloaded"
     assert first.extracted is True
-    assert not (cdir / "TestMod-1.0.zip").exists()      # archive deleted
+    # Download-manager behaviour: the verified archive is kept.
+    assert (cdir / "TestMod-1.0.zip").exists()
     assert (cdir / "Data" / "test.txt").exists()
     downloads_after_first = fake.calls.count("get_download_url")
     sessions_after_first = len(session.calls)
@@ -1337,12 +1341,12 @@ def test_reclick_after_extraction_redownloads_verified(svc, tmp_path, monkeypatc
 
     second = svc.add_nxm(uri(), mods_dir=cdir)
     assert second.success, second.error
-    # NOT a dedupe: a real second download happened and was verified
-    assert second.status == "downloaded"
-    assert fake.calls.count("get_download_url") == downloads_after_first + 1
-    assert len(session.calls) == sessions_after_first + 1
+    # Dedupe: zero download traffic, and the state is untouched.
+    assert second.status == "already_downloaded"
+    assert fake.calls.count("get_download_url") == downloads_after_first
+    assert len(session.calls) == sessions_after_first
     assert (cdir / "Data" / "test.txt").read_bytes() == b"hello mods"
-    assert not (cdir / "TestMod-1.0.zip").exists()      # cleaned up again
+    assert (cdir / "TestMod-1.0.zip").exists()
     state = CollectionState(cdir)
     state.load()
     assert state.mods[FILE_ID].download_status == "downloaded"

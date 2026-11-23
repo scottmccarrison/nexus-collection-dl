@@ -1545,7 +1545,6 @@ class ModManagerService:
                                 conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                             file_owners[rel] = mod_info["mod_name"]
                         config_record = _fomod_config_record(file_path)
-                        file_path.unlink()
                         extracted += 1
                     else:
                         rel = str(file_path.relative_to(mods_dir))
@@ -1677,7 +1676,6 @@ class ModManagerService:
                                     for ef in final_files
                                 ]
                                 config_record = _fomod_config_record(file_path)
-                                file_path.unlink()
                             else:
                                 # A retained archive or a loose file is
                                 # this mod's footprint; disable needs it.
@@ -1918,7 +1916,6 @@ class ModManagerService:
                             str(ef.relative_to(mods_dir)) for ef in final_files
                         )
                         config_record = _fomod_config_record(file_path)
-                        file_path.unlink()
                     else:
                         # A retained archive or a loose file is this
                         # mod's footprint; disable needs to know it.
@@ -2701,10 +2698,6 @@ class ModManagerService:
             # removal tombstone for the page goes with the same commit.
             state.clear_removed(mod.mod_id)
             state.save()
-            try:
-                archive.unlink()
-            except OSError:
-                pass
 
         return (
             f"{mod.name or mod.filename} installed with "
@@ -2934,17 +2927,7 @@ class ModManagerService:
                 # Importing this mod's file is an explicit re-add of the mod
                 # page, so any tombstone for it is cleared with the commit.
                 state.clear_removed(mod_state.mod_id)
-                # Persist before any destructive cleanup so a mid-run failure
-                # cannot lose progress for already-imported items.
                 state.save()
-
-                if not no_extract and is_arch:
-                    try:
-                        match.unlink()
-                    except OSError as e:
-                        # The import itself succeeded and is persisted; a leftover
-                        # archive is reported but does not roll back the success.
-                        errors.append(f"Could not remove {match.name} after import: {exception_reason(e)}")
 
                 pct = 0.1 + 0.8 * ((i + 1) / len(pending))
                 progress("import", pct, f"Imported {mod_state.name}")
@@ -3107,11 +3090,10 @@ class ModManagerService:
                         warnings=dup_warnings,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
-                # flag; fall through and re-download. Note this is the
-                # normal path for a re-click after a successful download:
-                # the default flow deletes the archive once extraction is
-                # persisted, so a downloaded+extracted entry re-downloads
-                # (with full verification). Zero-network handling of a
+                # flag; fall through and re-download. With archives kept
+                # after extraction, a healthy downloaded entry hits the
+                # already_downloaded no-op above, so this is only the
+                # lost-or-damaged case. Zero-network handling of a
                 # retained sane archive lives above (downloaded entries:
                 # already_downloaded no-op) and below (pending entries:
                 # extraction is completed from the archive).
@@ -3633,14 +3615,6 @@ class ModManagerService:
                     mod_name=mod_name,
                     filename=filename,
                 )
-
-            # The archive is removed only now that the completion is
-            # persisted, and only when this run downloaded and extracted
-            # it: a caller-owned, newly downloaded file, never a pre-existing
-            # one.
-            if extracted:
-                with contextlib.suppress(OSError):
-                    path.unlink()
 
             # Same post-download steps as add/import: tracked-mod sync and
             # load order regeneration. Both run AFTER the successful save,

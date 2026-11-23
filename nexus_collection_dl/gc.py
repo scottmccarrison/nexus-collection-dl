@@ -107,3 +107,36 @@ def apply_gc(plan: GcPlan) -> int:
         except OSError:
             continue
     return freed
+
+
+def human_bytes(n: int) -> str:
+    """Sizes the way a person reads them: 512 B, 4.2 KB, 10.2 GB."""
+    step = 1024.0
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < step or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= step
+    return f"{value:.1f} TB"
+
+
+# Below this much reclaimable archive disk, saying something is noise.
+NUDGE_THRESHOLD_BYTES = 100 * 1024 * 1024
+
+
+def nudge_message(mods_dir: Path, threshold_bytes: int = NUDGE_THRESHOLD_BYTES) -> str | None:
+    """A one-line visibility notice, or None when there is nothing to say.
+
+    The user owns whether to run gc; this is the tool making sure the
+    reclaimable disk is visible while they are working. Silent below the
+    threshold and when there is nothing to reclaim.
+    """
+    plan = plan_gc(mods_dir)
+    if plan.bytes_reclaimable < threshold_bytes:
+        return None
+    return (
+        f"{human_bytes(plan.bytes_reclaimable)} of downloaded archives "
+        f"can be reclaimed. Run 'nexus-dl gc {mods_dir} --apply'."
+    )
