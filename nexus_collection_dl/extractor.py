@@ -13,6 +13,11 @@ import rarfile
 
 from .errmsg import exception_reason
 
+# Marks an in-flight publish: written before the first file lands,
+# removed when every file has. A marker that is still there means the
+# publish did not finish, and recover_pending_publish can pick it up.
+PENDING_PUBLISH_MARKER = ".nexus-publish-pending"
+
 
 class ExtractionError(Exception):
     """Raised when archive extraction fails."""
@@ -295,8 +300,18 @@ def _reject_writes_outside_staging(
 
 
 def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
-    """Move all files from staging directory to target, preserving structure."""
-    moved_files = []
+    """Publish staging into the target as one unit, or leave a marker.
+
+    A failure halfway used to leave a partial set in the target with no
+    record that the publish was incomplete, and the caller's ``finally``
+    deleted staging either way so there was nothing to repair from. Now
+    a marker names the in-flight publish before the first move and is
+    removed only when every file has landed. On failure the marker and
+    the staging dir both survive, so :func:`recover_pending_publish` can
+    finish the job instead of the next run guessing.
+    """
+    moves: list[tuple[Path, Path]] = []
+    rels: list[str] = []
     for src in staging_dir.rglob("*"):
         if not src.is_file():
             continue
@@ -309,10 +324,61 @@ def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
                 f"staging file {rel} collides with an existing directory "
                 f"in the target; refusing to merge it"
             )
+        moves.append((src, dest))
+        rels.append(rel.as_posix())
+
+    # The marker is what says "this publish is not done". It is removed
+    # only when every file has landed; on failure it stays, and so does
+    # staging (see extract_archive's finally), so the next run can
+    # finish the job instead of guessing.
+    marker = target_dir / PENDING_PUBLISH_MARKER
+    marker.write_text("\n".join(rels))
+    moved_files = []
+    for src, dest in moves:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         moved_files.append(dest)
+    marker.unlink()
     return moved_files
+
+
+def recover_pending_publish(target_dir: Path) -> list[Path]:
+    """Finish a publish a previous run left half-done. Returns what landed.
+
+    The marker names the files that were in flight; the staging dir that
+    was left behind holds the ones that had not moved yet. Nothing is
+    guessed: if the staging dir is gone there is nothing to repair from
+    and the marker is cleared with nothing done.
+    """
+    marker = target_dir / PENDING_PUBLISH_MARKER
+    if not marker.exists():
+        return []
+    try:
+        wanted = [line for line in marker.read_text().splitlines() if line]
+    except OSError:
+        return []
+
+    staging_dirs = [
+        p for p in target_dir.iterdir()
+        if p.is_dir() and p.name.startswith(".nexus-extract-")
+    ]
+    moved: list[Path] = []
+    for staging in staging_dirs:
+        for src in staging.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(staging)
+            if rel.as_posix() not in wanted:
+                continue
+            dest = target_dir / rel
+            if dest.exists() and dest.is_file():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved.append(dest)
+        shutil.rmtree(staging, ignore_errors=True)
+    marker.unlink()
+    return moved
 
 
 def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
@@ -379,7 +445,10 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
     except Exception as e:
         raise ExtractionError(f"Failed to extract {archive_path}: {exception_reason(e)}")
     finally:
-        if staging_dir is not None:
+        # Staging is normally cleaned up here. When a publish marker is
+        # still present the publish did not finish: keeping staging is
+        # what lets the next run repair instead of guess.
+        if staging_dir is not None and not (target_dir / PENDING_PUBLISH_MARKER).exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
