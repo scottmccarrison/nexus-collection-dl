@@ -106,6 +106,8 @@ class ModState:
         browser_url: str = "",
         fomod_picks: list[dict[str, str]] | None = None,
         fomod_config: dict[str, str] | None = None,
+        enabled: bool = True,
+        contributed_files: list[str] | None = None,
     ):
         self.file_id = file_id
         self.mod_id = mod_id
@@ -131,6 +133,18 @@ class ModState:
         # fomod/ModuleConfig.xml overwrites the first; without this record
         # deploy can only plan for whichever mod extracted last.
         self.fomod_config = dict(fomod_config) if fomod_config else None
+        # Whether this mod's files land at deploy. Off means "temporarily
+        # not installed", not "removed": the state entry, the picks, and
+        # the files on disk all stay, and turning it back on deploys
+        # again. Defaults to True so state written before this flag
+        # loads as enabled rather than silently turning mods off.
+        self.enabled = enabled
+        # Paths (relative to the collection root) this mod's extraction
+        # contributed. The extraction tree is merged, so without this a
+        # disabled mod cannot be told apart from its neighbours and
+        # "skip it at deploy" would mean guessing. Recorded at extract
+        # time; absent for mods extracted before this existed.
+        self.contributed_files = list(contributed_files or [])
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,6 +162,8 @@ class ModState:
             "browser_url": self.browser_url,
             "fomod_picks": self.fomod_picks,
             "fomod_config": self.fomod_config,
+            "enabled": self.enabled,
+            "contributed_files": self.contributed_files,
         }
 
     @classmethod
@@ -168,6 +184,10 @@ class ModState:
             browser_url=data.get("browser_url", ""),
             fomod_picks=data.get("fomod_picks"),
             fomod_config=data.get("fomod_config"),
+            # Absent in state written before this flag: default to
+            # enabled rather than silently turning mods off.
+            enabled=data.get("enabled", True),
+            contributed_files=data.get("contributed_files"),
         )
 
 
