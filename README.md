@@ -1,6 +1,8 @@
 # nexus-collection-dl
 
-A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it. A CLI, with an interactive shell on top.
+A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
+
+**The interactive shell is the product.** Run `nexus-dl setup` once, then bare `nexus-dl` opens the shell over your collections: browse, sync, pick FOMOD options, deploy, all from one prompt that also notices when you click "Mod manager download" on the site. The commands underneath are still there for scripts and automation, and an AI harness can drive the same surface through `--json`. That is deliberate: Linux tools are often powerful and hostile, and the point of this one is that you can use it without swearing at it.
 
 > [!IMPORTANT]
 > **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
@@ -23,7 +25,7 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 **`main` is stable.** It gets bug fixes and the features that have proven out. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
 
-**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`) and the interactive `nexus-dl shell`. The shell is also where the tool is heading: a harness-driven CLI that AI harnesses can operate directly. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`), the interactive `nexus-dl shell`, and the setup flow that makes bare `nexus-dl` open the shell. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
 
 For AI harnesses, the repo ships an agent skill at [`.agents/skills/nexus-dl/`](.agents/skills/nexus-dl/). It teaches the command surface, the safe defaults (read before write, dry-run before deploy), and the [`--json` machine-readable output](#machine-readable-output), so a harness can drive the same CLI the shell wraps.
 
@@ -95,7 +97,9 @@ export NEXUS_API_KEY="your-api-key-here"
 nexus-dl setup
 ```
 
-That detects your Steam root and the games this tool can manage, asks for the collections root (the directory collection folders live under), and writes `~/.config/nexus-dl/config.json`. Once it exists, bare `nexus-dl` opens the shell over that root. For scripts and harnesses, `nexus-dl setup --non-interactive --collections-root ~/nexus-collections` takes flags only and never prompts.
+That detects your Steam root and the games this tool can manage, asks for the collections root (the directory collection folders live under), and writes `~/.config/nexus-dl/config.json`. It also offers to install the `nxm://` link handler so a "Mod manager download" click on the Nexus website lands in `nexus-dl` - that used to be a docs checklist item nobody reached. For scripts and harnesses, `nexus-dl setup --non-interactive --collections-root ~/nexus-collections --install-handler` takes flags only and never prompts; the handler is opt-in because it writes a `.desktop` file and registers a MIME default.
+
+Once the config exists, bare `nexus-dl` opens the shell over that root.
 
 Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
 
