@@ -4,8 +4,14 @@ A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collectio
 
 **The interactive shell is the product.** Run `nexus-dl setup` once, then bare `nexus-dl` opens the shell over your collections: browse, sync, pick FOMOD options, deploy, all from one prompt that also notices when you click "Mod manager download" on the site. The commands underneath are still there for scripts and automation, and an AI harness can drive the same surface through `--json`. That is deliberate: Linux tools are often powerful and hostile, and the point of this one is that you can use it without swearing at it.
 
+> [!NOTE]
+> **This is an AI-assisted hobby project.** It is built with AI help, tested where it can be tested, and it will have bugs and behave in ways nobody predicted. That is the expectation, not a surprise. If something misbehaves, please say so: the project is young enough that reports genuinely shape it.
+
 > [!IMPORTANT]
 > **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
+
+> [!TIP]
+> **[Discussions](https://github.com/scottmccarrison/nexus-collection-dl/discussions) are where the talking happens.** Questions, "what should this do next", bug reports that need back-and-forth before they become an issue, and beta-testing chatter all live there. [Issues](https://github.com/scottmccarrison/nexus-collection-dl/issues) are for things that are wrong and have a reproducible shape; Discussions are for everything else. There is a [beta testing thread](https://github.com/scottmccarrison/nexus-collection-dl/discussions/68) for each beta point.
 
 ## Why?
 
