@@ -27,7 +27,6 @@ Already probed elsewhere and now false (the gap was closed):
 from __future__ import annotations
 
 import json
-import re
 import zipfile
 from pathlib import Path
 
@@ -254,13 +253,15 @@ def test_known_gap_system_tool_extraction_does_not_pre_list_members(
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_redaction_is_one_way(tmp_path):
-    """Scrubbed text cannot be recovered, and there is no escape hatch.
+def test_known_gap_redaction_is_one_way():
+    """The gap was "no diagnostic escape". Closed: there is one now.
 
-    CHANGELOG: error-text scrubbing has no diagnostic escape for a
-    maintainer reading a bug report.
+    The probe used to assert the redaction was one-way with no way for a
+    maintainer to recover the detail. It flips when the gap closes: the
+    default is still safe, and `diagnostic=True` is the escape hatch.
     """
     import inspect
+
 
     secret = "sk-or-v1-abcdef0123456789abcdef0123456789"
     text = f"failed with key {secret} in the request"
@@ -269,17 +270,11 @@ def test_known_gap_redaction_is_one_way(tmp_path):
     assert secret not in out
     assert "[redacted]" in out
 
-    # No parameter invites an unredacted or diagnostic view.
-    for name in inspect.signature(boundary_redact).parameters:
-        assert not re.search(r"diagnos|escape|unredact|verbose|debug", name, re.IGNORECASE), name
+    sig = inspect.signature(boundary_redact)
+    assert "diagnostic" in sig.parameters, list(sig.parameters)
 
-    # And the module exposes no companion that would hand the original back.
-    import nexus_collection_dl.redaction as redaction_module
-
-    public = [n for n in dir(redaction_module) if not n.startswith("_")]
-    assert not [
-        n for n in public if re.search(r"diagnos|unredact|reveal", n, re.IGNORECASE)
-    ], public
+    diag = boundary_redact(text, (secret,), diagnostic=True)
+    assert secret in diag
 
 
 # ---------------------------------------------------------------------------
@@ -287,11 +282,11 @@ def test_known_gap_redaction_is_one_way(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_removed_serve_reports_command_not_found(tmp_path):
-    """`nexus-dl serve` is a bare "no such command", not a deprecation stub.
+def test_known_gap_removed_serve_reports_a_replacement():
+    """The gap was "reports command not found". Closed: it says what to use.
 
-    CHANGELOG: the removed `serve` command reports "command not found"
-    rather than a deprecation stub.
+    The probe used to assert the bare argparse error. It flips when the
+    gap closes: the stub names the replacement and still exits non-zero.
     """
     from click.testing import CliRunner
 
@@ -300,9 +295,8 @@ def test_known_gap_removed_serve_reports_command_not_found(tmp_path):
     r = CliRunner().invoke(cli_module.main, ["serve"])
     assert r.exit_code != 0
     combined = (r.output + str(r.exception)).lower()
-    assert "no such command" in combined or "usage" in combined
-    # A deprecation stub would name the replacement. This does not.
-    assert "shell" not in combined
+    assert "shell" in combined
+    assert "no such command" not in combined
 
 
 # ---------------------------------------------------------------------------
@@ -310,35 +304,39 @@ def test_known_gap_removed_serve_reports_command_not_found(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_moduleconfig_depth_rules_disagree(tmp_path):
-    """Two code paths, two answers, for the same archive.
+def test_known_gap_moduleconfig_depth_rules_agree(tmp_path):
+    """The two rules were one gap. Closed: they agree now.
 
-    CHANGELOG: the legacy tree scan and the archive marker check disagree
-    on how deep a ModuleConfig.xml may live. The extractor requires a
-    `fomod` path segment; the deploy tree scan takes any basename within
-    three path parts.
+    The CHANGELOG claim was "the legacy tree scan and the archive marker
+    check disagree on how deep a ModuleConfig.xml may live". This is the
+    probe for it, flipped: the gap is closed and the test asserts the
+    agreement rather than the disagreement. See
+    test_fomod_marker_rule.py for the shared rule.
     """
+
     # A config with no `fomod` segment: `SomeMod/ModuleConfig.xml`.
+    # Deliberately not a marker under the shared rule, and both callers
+    # say so.
     staging = tmp_path / "staging"
     (staging / "SomeMod").mkdir(parents=True)
     (staging / "SomeMod" / "ModuleConfig.xml").write_text(SIMPLE_CONFIG)
     (staging / "SomeMod" / "a").mkdir()
     (staging / "SomeMod" / "a" / "thing.esp").write_bytes(b"x")
 
-    # The deploy tree scan finds it and builds a plan.
     plans, _warnings = _fomod_plans(staging, {})
-    assert plans, "the deploy tree scan should pick up SomeMod/ModuleConfig.xml"
+    assert not plans, "the tree scan should not plan a non-marker config"
 
-    # The extractor's marker check, given the same layout in an archive,
-    # does not: there is no `fomod` segment.
     archive = tmp_path / "mod.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("SomeMod/ModuleConfig.xml", SIMPLE_CONFIG)
         zf.writestr("SomeMod/a/thing.esp", b"x")
-    assert find_fomod_installer(archive) is None, (
-        "the marker check requires a `fomod` segment and should not "
-        "recognise SomeMod/ModuleConfig.xml"
-    )
+    assert find_fomod_installer(archive) is None
+
+    # And the layout that IS a marker agrees the other way too.
+    (staging / "fomod").mkdir()
+    (staging / "fomod" / "ModuleConfig.xml").write_text(SIMPLE_CONFIG)
+    plans, _ = _fomod_plans(staging, {})
+    assert plans, "the tree scan should plan fomod/ModuleConfig.xml"
 
 
 # ---------------------------------------------------------------------------

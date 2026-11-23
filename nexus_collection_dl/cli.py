@@ -1444,6 +1444,22 @@ def setup(
 
 
 @main.command()
+def serve() -> None:
+    """The web UI was removed in 0.4.0. Use `nexus-dl shell` instead.
+
+    A stub, not a command: it names the replacement and exits non-zero.
+    A bare "no such command" told an upgrading user nothing about what
+    happened to the thing they used to type.
+    """
+    console.print(
+        "[yellow]The web UI was removed in 0.4.0.[/yellow] "
+        "Use [bold]nexus-dl shell[/bold] instead: it covers the same "
+        "workflows and is where the tool is heading."
+    )
+    raise SystemExit(2)
+
+
+@main.command()
 @click.argument(
     "root_dir",
     required=False,
