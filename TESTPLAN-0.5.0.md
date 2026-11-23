@@ -65,13 +65,30 @@ The places changed most. A mistake here is silent and expensive.
 
 The 0.5.0 product bet. Most likely to be wrong in ways tests cannot see.
 
-- [ ] 2.1 Point `XDG_CONFIG_HOME` at an empty dir. `nexus-dl health`
-      reports "User config: not configured (first run)".
+**Before anything else, isolate the config.** The tool reads its config
+from `$XDG_CONFIG_HOME/nexus-dl/config.json`. Point that at a fresh
+empty directory so the tool sees a first run and your real config is
+never touched. This has to happen before setup has ever run in the
+session.
+
+```bash
+mkdir -p /tmp/nexus-050-fresh
+export XDG_CONFIG_HOME=/tmp/nexus-050-fresh
+nexus-dl health          # must say: User config  WARN  not configured (first run)
+```
+
+If `health` reports `OK` with a collections root, the variable did not
+take. Stop and fix that before continuing. Undo afterwards with
+`unset XDG_CONFIG_HOME`; everything lives under `/tmp/nexus-050-fresh`.
+
+- [ ] 2.1 `nexus-dl health` with `XDG_CONFIG_HOME=/tmp/nexus-050-fresh`
+      reports "User config: not configured (first run)". `STOP`
 - [ ] 2.2 Bare `nexus-dl` in a terminal. The setup wizard runs, detects
       the Steam root and installed games, asks for the collections root
       with a default, offers each game, offers the nxm handler. `STOP`
-- [ ] 2.3 Accept the defaults. `config.json` written with the
-      collections root and games. Handler installed or declined.
+- [ ] 2.3 Accept the defaults. `/tmp/nexus-050-fresh/nexus-dl/config.json`
+      written with the collections root and games. Handler installed or
+      declined.
 - [ ] 2.4 Bare `nexus-dl` again. **The shell opens** over the
       collections root. Not usage. Not the wizard. `STOP`
 - [ ] 2.5 `echo "" | nexus-dl`. Prints usage. **No hang, no REPL.**
