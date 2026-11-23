@@ -190,8 +190,8 @@ def _handle_bare_invocation(ctx: click.Context, json_mode: bool) -> None:
 
     - Interactive and configured: the shell is the default seat now.
     - Not interactive: usage and out. Never a REPL, never a prompt.
-    - Interactive but unconfigured: say so. The setup wizard boots here
-      once it exists; until then a message beats a REPL with no root.
+    - Interactive but unconfigured: the setup wizard, which detects what
+      it can and writes the config the shell needs.
     """
     from .config import UserConfig
 
@@ -209,12 +209,9 @@ def _handle_bare_invocation(ctx: click.Context, json_mode: bool) -> None:
 
     cfg = UserConfig.load()
     if not cfg.is_configured():
-        console.print("[yellow]First run.[/yellow] nexus-dl is not configured yet.")
-        console.print(
-            "It needs a collections root: the directory collection folders "
-            "live under. Until that is set there is nothing for the shell "
-            "to show."
-        )
+        # First run. The wizard is the front door: detect what it can,
+        # ask for the rest, write the config that makes the shell useful.
+        ctx.invoke(setup, non_interactive=False, collections_root=None, game=())
         return
 
     from .shell import run_shell
@@ -1281,6 +1278,105 @@ def _format_picks(picks: list, limit: int = 3) -> str:
         return ", ".join(names)
     shown = ", ".join(names[:limit])
     return f"{shown} (+{len(names) - limit} more)"
+
+
+@main.command()
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    help="No prompts. Requires --collections-root.",
+)
+@click.option(
+    "--collections-root",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory collection folders live under.",
+)
+@click.option(
+    "--game",
+    multiple=True,
+    help="A known game as domain=path (repeatable).",
+)
+@click.pass_context
+def setup(
+    ctx: click.Context,
+    non_interactive: bool,
+    collections_root: Path | None,
+    game: tuple[str, ...],
+) -> None:
+    """Configure nexus-dl: where collections live and what games you have.
+
+    Interactive by default: it detects your Steam root and installed
+    games, asks for what it cannot detect, and writes the config. With
+    --non-interactive it takes flags only and never prompts, which is
+    what a script or a harness needs.
+
+    This writes ~/.config/nexus-dl/config.json. Bare `nexus-dl` reads it
+    to open the shell, so getting it set up is what turns the first run
+    into the workbench.
+    """
+    from .config import UserConfig
+    from .steam import list_installed_games
+
+    if non_interactive:
+        if collections_root is None:
+            _fail(
+                ctx,
+                click.UsageError(
+                    "--non-interactive needs --collections-root: with no "
+                    "prompts there is nothing to guess from"
+                ),
+            )
+        games: list[dict] = []
+        for spec in game:
+            if "=" not in spec:
+                _fail(
+                    ctx,
+                    click.UsageError(f"--game needs domain=path, got {spec!r}"),
+                )
+            domain, _, game_dir = spec.partition("=")
+            games.append({"domain": domain.strip(), "game_dir": game_dir.strip()})
+        cfg = UserConfig(collections_root=str(collections_root), games=games)
+        cfg.save()
+        if _emit_result(ctx, {"collections_root": cfg.collections_root, "games": cfg.games}):
+            return
+        console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
+        return
+
+    if not _is_interactive():
+        _fail(
+            ctx,
+            click.UsageError(
+                "setup prompts, and this is not a terminal. Use "
+                "--non-interactive with --collections-root."
+            ),
+        )
+
+    console.print("[bold]nexus-dl setup[/bold]")
+    detected = list_installed_games()
+    if detected:
+        console.print(f"Found {len(detected)} installed game(s) this tool can manage:")
+        for g in detected:
+            console.print(f"  [cyan]{g['domain']}[/cyan]  {g['game_dir']}")
+    else:
+        console.print("[dim]No managed games detected from Steam.[/dim]")
+
+    root = collections_root
+    if root is None:
+        suggested = Path.home() / "nexus-collections"
+        answer = click.prompt("Collections root", default=str(suggested), show_default=True)
+        root = Path(answer)
+
+    games = []
+    for g in detected:
+        if click.confirm(f"Add {g['name']} ({g['domain']})?", default=True):
+            games.append({"domain": g["domain"], "game_dir": g["game_dir"]})
+
+    cfg = UserConfig(collections_root=str(root), games=games)
+    cfg.save()
+    console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
+    if cfg.games:
+        console.print(f"Games: {', '.join(g['domain'] for g in cfg.games)}")
 
 
 @main.command()

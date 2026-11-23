@@ -89,6 +89,14 @@ pip install -e .
 export NEXUS_API_KEY="your-api-key-here"
 ```
 
+3. Configure the tool:
+
+```bash
+nexus-dl setup
+```
+
+That detects your Steam root and the games this tool can manage, asks for the collections root (the directory collection folders live under), and writes `~/.config/nexus-dl/config.json`. Once it exists, bare `nexus-dl` opens the shell over that root. For scripts and harnesses, `nexus-dl setup --non-interactive --collections-root ~/nexus-collections` takes flags only and never prompts.
+
 Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
 
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
