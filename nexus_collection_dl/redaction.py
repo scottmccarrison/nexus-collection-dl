@@ -137,6 +137,7 @@ def boundary_redact(
     *,
     strip_uris: bool = True,
     min_secret_len: int = 0,
+    diagnostic: bool = False,
 ) -> str:
     """Full redaction scope for text leaving through an output boundary.
 
@@ -148,6 +149,13 @@ def boundary_redact(
     URI query strings. Typed branches also skip URI stripping because
     their messages are redacted at the source and may deliberately
     carry a redacted API URL or the nxm:// scheme name in guidance.
+
+    ``diagnostic`` is the maintainer escape hatch. Scrubbing is the
+    right default, but a bug report with ``[redacted]`` where the error
+    was is one nobody can act on. When set, the output carries the safe
+    text plus a clearly marked section with the original. Maintainer-only:
+    the marked section carries live secrets and must never be pasted
+    into a public report without care.
     """
     long_secrets = tuple(s for s in secrets if len(s) >= min_secret_len)
     short_secrets = tuple(s for s in secrets if len(s) < min_secret_len)
@@ -155,4 +163,11 @@ def boundary_redact(
     if short_secrets:
         out = redact_encoded_secret_forms(out, short_secrets)
         out = redact_secrets_in_uri_queries(out, short_secrets)
-    return sanitize_message(out) if strip_uris else out
+    safe = sanitize_message(out) if strip_uris else out
+    if diagnostic:
+        return (
+            f"{safe}\n"
+            "--- diagnostic, do not share (contains live secrets) ---\n"
+            f"{text}"
+        )
+    return safe

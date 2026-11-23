@@ -47,6 +47,47 @@ def is_bethesda_game(game_domain: str) -> bool:
     return game_domain.lower() in LOOT_GAME_MAP
 
 
+def loot_support(game_domain: str) -> tuple[bool, str]:
+    """Whether LOOT can sort this game, and why not when it cannot.
+
+    The answer, not a guess. Enderal and Enderal SE have a masterlist
+    but no libloot ``GameType``, so they cannot be sorted and fall back
+    to the collection order. That fallback used to be silent: the user
+    had no idea LOOT had not run. Every non-sortable case now carries a
+    reason a caller can print.
+
+    Returns ``(can_sort, reason)``. ``reason`` is empty exactly when
+    ``can_sort`` is True.
+    """
+    if not is_loot_available():
+        return False, "libloot is not installed, so plugins are not LOOT-sorted"
+    domain = game_domain.lower()
+    if domain not in LOOT_GAME_MAP:
+        return False, f"{game_domain} is not a LOOT-supported game"
+    game_type_name = LOOT_GAME_MAP[domain].get("game_type", "")
+    if not game_type_name:
+        return (
+            False,
+            (
+                f"LOOT has no game type for {game_domain}; plugins stay in "
+                "collection order"
+            ),
+        )
+    try:
+        import loot
+    except Exception:
+        return False, "the libloot bindings could not be imported"
+    if getattr(loot.GameType, game_type_name, None) is None:
+        return (
+            False,
+            (
+                f"this libloot build has no {game_type_name} game type; "
+                "plugins stay in collection order"
+            ),
+        )
+    return True, ""
+
+
 def find_plugins(mods_dir: Path) -> list[str]:
     """
     Find all ESP/ESM/ESL plugin files in the mods directory.

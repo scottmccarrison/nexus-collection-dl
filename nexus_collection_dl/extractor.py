@@ -531,7 +531,13 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
 # ship only `fomod/header.png`, which is not an installer and must not be
 # refused. Requiring a known filename means an exotic installer can slip
 # through, and that is the cheaper error of the two.
-_FOMOD_MARKER_NAMES = frozenset({"moduleconfig.xml", "script.lua", "info.xml"})
+_FOMOD_MARKER_NAMES = frozenset(
+    {"moduleconfig.xml", "script.lua", "script.cs", "info.xml"}
+)
+# Script installers live under ``fomod/``. At the archive root a name
+# like ``script.cs`` is too generic to call, so only the header names
+# below are accepted without a ``fomod`` parent vouching for them.
+_FOMOD_ROOT_LEVEL_NAMES = frozenset({"moduleconfig.xml", "info.xml"})
 
 
 def find_fomod_installer(archive_path: Path) -> str | None:
@@ -659,18 +665,34 @@ def _read_7z_member_system(archive_path: Path, member: str) -> bytes | None:
 def _fomod_marker_from_name(name: str) -> str | None:
     """Return ``name`` when it is a FOMOD installer member, else None.
 
-    A member counts when its path has a ``fomod`` segment (any case, any
-    depth) and its basename is one of ``ModuleConfig.xml``, ``script.lua``,
-    or ``info.xml`` (any case). Separators may be ``/`` or ``\\``; real
-    FOMOD configs use backslashes in their own ``source`` paths and
-    archives carry both.
+    The single rule, shared by the archive marker check and the deploy
+    tree scan. Two callers answering the same question differently is
+    how a user gets behavior that depends on which command they ran.
+
+    A member counts when its basename is one of ``ModuleConfig.xml``,
+    ``script.lua``, ``script.cs``, or ``info.xml`` (any case) and either
+
+    - its parent directory is ``fomod`` (any case, any depth), or
+    - it sits at the archive root and is a header name
+      (``ModuleConfig.xml`` or ``info.xml``).
+
+    Separators may be ``/`` or ``\\``: real FOMOD configs use backslashes
+    in their own ``source`` paths and archives carry both.
+
+    A wrapper directory with no ``fomod`` in sight (``SomeMod/ModuleConfig.xml``)
+    is deliberately not a marker. Missing an exotic installer is the
+    cheaper error of the two: a false "this is a FOMOD" refuses a normal
+    mod, while a false "this is not" falls back to the folder heuristic.
     """
     parts = [p for p in name.replace("\\", "/").split("/") if p]
-    if len(parts) < 2:
+    if not parts:
         return None
-    if parts[-2].lower() != "fomod":
+    base = parts[-1].lower()
+    if base not in _FOMOD_MARKER_NAMES:
         return None
-    if parts[-1].lower() in _FOMOD_MARKER_NAMES:
+    if len(parts) >= 2 and parts[-2].lower() == "fomod":
+        return name
+    if len(parts) == 1 and base in _FOMOD_ROOT_LEVEL_NAMES:
         return name
     return None
 

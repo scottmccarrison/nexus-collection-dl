@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from .fomod_plan import InstallPlan, ModuleConfig
 
 from .errmsg import exception_reason
+from .extractor import _fomod_marker_from_name
 
 # Bethesda plugin/archive extensions
 BETHESDA_EXTENSIONS = {".esm", ".esp", ".esl", ".ba2"}
@@ -578,10 +579,13 @@ def _fomod_plans(
         )
 
     for config_path in sorted(mods_dir.rglob("*")):
-        if not config_path.is_file() or config_path.name.lower() != "moduleconfig.xml":
+        if not config_path.is_file():
             continue
         rel = config_path.relative_to(mods_dir)
-        if len(rel.parts) > 3:
+        # The same rule the archive marker check uses. Two callers
+        # answering "is this a FOMOD installer?" differently is how a
+        # user gets behavior that depends on which command they ran.
+        if _fomod_marker_from_name(rel.as_posix()) is None:
             continue
         if rel.as_posix().replace("\\", "/").lower() in recorded:
             continue
