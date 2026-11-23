@@ -113,11 +113,11 @@ def test_bare_interactive_and_configured_boots_the_shell(tmp_path, monkeypatch):
     assert booted[0][0] == str(root)
 
 
-def test_bare_interactive_and_unconfigured_says_first_run(tmp_path, monkeypatch):
-    """A fresh install gets told it is a fresh install.
+def test_bare_interactive_and_unconfigured_boots_the_wizard(tmp_path, monkeypatch):
+    """A fresh install gets the wizard, not a REPL with no root.
 
-    The wizard boots here in the next slice. Until then, a message beats
-    a REPL with no configured root.
+    The front door: config missing means setup, and setup is what writes
+    the config that makes the shell useful.
     """
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
 
@@ -129,8 +129,7 @@ def test_bare_interactive_and_unconfigured_says_first_run(tmp_path, monkeypatch)
     )
     r = _run([], interactive=True, monkeypatch=monkeypatch)
     assert not booted, "the shell booted with no collections root"
-    combined = r.output.lower()
-    assert "first run" in combined or "not configured" in combined or "setup" in combined
+    assert "setup" in r.output.lower(), r.output
 
 
 def test_json_bare_never_boots_the_shell(tmp_path, monkeypatch):
