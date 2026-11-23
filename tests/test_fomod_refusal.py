@@ -360,7 +360,8 @@ def test_add_extracts_a_plain_archive_unchanged(tmp_path, monkeypatch):
     result = svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
     assert result.success, result.error
     assert (tmp_path / "Data" / "thing.esp").exists()
-    assert not (tmp_path / "TestMod-1.0.zip").exists()
+    # Download-manager behaviour: the verified archive is kept for gc.
+    assert (tmp_path / "TestMod-1.0.zip").exists()
 
 
 def test_add_refuses_an_uninspectable_archive(tmp_path, monkeypatch):
@@ -452,9 +453,10 @@ def test_import_records_the_refusal_and_leaves_the_item_pending(
     assert state.mods[11].download_status == "pending_download"
     assert state.mods[22].download_status == "downloaded"
 
-    # The FOMOD archive is kept; the plain one was consumed.
+    # The FOMOD archive is kept (still the only copy); the plain one was
+    # extracted and its archive is kept too, for gc to reclaim later.
     assert (tmp_path / "FomodMod-1.0.zip").exists()
-    assert not (tmp_path / "PlainMod-1.0.zip").exists()
+    assert (tmp_path / "PlainMod-1.0.zip").exists()
 
 
 # --- the CLI surface -------------------------------------------------------

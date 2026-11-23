@@ -74,7 +74,9 @@ def test_import_records_contributed_files(tmp_path):
     result = svc.import_downloads(tmp_path, no_load_order=True)
 
     assert result.extracted == 1, result.errors
-    assert not archive.exists()
+    # Download-manager behaviour: the verified archive is kept, not
+    # deleted. gc reclaims it once its payload is on disk.
+    assert archive.exists()
     mod = _reload(tmp_path).mods[10]
     assert sorted(mod.contributed_files) == ["mod/extra.esp", "mod/plugin.esp"]
 
@@ -146,6 +148,8 @@ def test_add_mod_records_contributed_files(tmp_path, monkeypatch):
     result = svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
 
     assert result.success, result.error
+    # Download-manager behaviour: the verified archive is kept.
+    assert (tmp_path / "TestMod-1.0.zip").exists()
     mod = _reload(tmp_path).mods[555]
     assert sorted(mod.contributed_files) == ["a/one.esp", "a/two.esp"]
 
@@ -235,6 +239,8 @@ def test_add_nxm_records_contributed_files(tmp_path, monkeypatch):
     )
 
     assert result.success, result.error_message
+    # Download-manager behaviour: the verified archive is kept.
+    assert (cdir / "TestMod-1.0.zip").exists()
     mod = _reload(cdir).mods[456]
     assert sorted(mod.contributed_files) == ["Data/other.esp", "Data/thing.esp"]
 
@@ -271,6 +277,8 @@ def test_install_fomod_picks_records_contributed_files(tmp_path):
     svc = ModManagerService(api_key="test-key-unused")
     svc.install_fomod_picks(mods, 11, picks=[Pick("", "G", "OptB")])
 
+    # Download-manager behaviour: the verified archive is kept.
+    assert (mods / "TestMod-1.0.zip").exists()
     mod = _reload(mods).mods[11]
     assert "b/thing.esp" in mod.contributed_files
 
@@ -321,6 +329,8 @@ def test_update_records_contributed_files(tmp_path, monkeypatch):
     result = svc.update(cdir, no_load_order=True)
 
     assert result.to_update or result.to_install, result
+    # Download-manager behaviour: the verified archive is kept.
+    assert (cdir / "TestMod-999.zip").exists()
     mod = reload_state(cdir).mods[999]
     assert mod.contributed_files == ["Data/new.esp"]
 

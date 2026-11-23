@@ -466,6 +466,18 @@ class _ShellSession:
             f"[yellow]Warning:[/yellow] {escape(self._scrub(str(text)))}"
         )
 
+    def _maybe_nudge_gc(self, mods_dir) -> None:
+        """Point at reclaimable archive disk after a work command.
+
+        The user owns whether to run gc; the tool owns making sure the
+        disk is visible while they are working.
+        """
+        from .gc import NUDGE_THRESHOLD_BYTES, nudge_message
+
+        msg = nudge_message(Path(mods_dir), NUDGE_THRESHOLD_BYTES)
+        if msg:
+            self._emit(msg)
+
     # ------------------------------------------------------------------
     # current collection: prompt, startup selection, persistence
     # ------------------------------------------------------------------
@@ -1060,6 +1072,7 @@ class _ShellSession:
                 f"({len(result.conflicts)} conflicts, "
                 f"{len(result.errors)} errors)"
             )
+        self._maybe_nudge_gc(target.path)
 
     def _cmd_deploy(self, rest: str) -> None:
         target = (
@@ -1236,6 +1249,7 @@ class _ShellSession:
             raise ValueError(
                 "/add expects an http(s) mod page URL or an nxm link"
             )
+        self._maybe_nudge_gc(current.path)
 
     def _report_add(self, result: AddResult) -> None:
         # Only reachable after _require_current in _cmd_add, so a
@@ -1425,6 +1439,7 @@ class _ShellSession:
             )
         for f in result.load_order_files:
             self._emit(f"Wrote {_safe_text(f)}")
+        self._maybe_nudge_gc(result.collection_dir or self.root)
 
     def _cmd_remove(self, rest: str) -> None:
         current = self._require_current()

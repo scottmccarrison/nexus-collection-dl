@@ -136,7 +136,8 @@ def test_exact_full_name_match(tmp_path, svc, extract_recorder):
     assert result.extracted == 1
     assert result.errors == []
     assert extract_recorder == [(archive, tmp_path)]
-    assert not archive.exists()  # removed after successful extract
+    # Download-manager behaviour: the verified archive is kept for gc.
+    assert archive.exists()
     state = _reload(tmp_path)
     assert state.mods[10].download_status == "downloaded"
     assert state.mods[10].browser_url == ""
@@ -155,7 +156,8 @@ def test_real_zip_extraction_end_to_end(tmp_path, svc):
     assert result.matched == 1
     assert result.extracted == 1
     assert (tmp_path / "mod" / "plugin.esp").exists()
-    assert not archive.exists()
+    # Download-manager behaviour: the verified archive is kept for gc.
+    assert archive.exists()
 
 
 def test_stale_same_name_rejected_for_verified_alternative(tmp_path, svc, extract_recorder):
@@ -667,32 +669,28 @@ def test_colliding_logical_names_without_identity_not_hashed(
 # -- crash and cleanup resilience --
 
 
-def test_unlink_failure_preserves_imported_state(monkeypatch, tmp_path, svc, extract_recorder):
-    """A cleanup failure after extraction must not lose the persisted import."""
+def test_repeated_import_leaves_the_kept_archive_alone(
+    monkeypatch, tmp_path, svc, extract_recorder
+):
+    """The archive is kept after extraction; a re-run must not re-consume it.
+
+    A finished entry is no longer pending, so import skips it and the
+    kept archive stays for gc to reclaim once the payload is on disk.
+    """
     archive = _make_zip(tmp_path / "Foo-1234-1-0-1699999999.zip")
     _write_state(tmp_path, [{
         "file_id": 10, "mod_id": 1234, "mod_name": "Foo",
         "filename": "Foo", "version": "1.0",
     }])
-    real_unlink = Path.unlink
-
-    def flaky_unlink(self, *args, **kwargs):
-        if self.name == archive.name:
-            raise OSError(28, "No space left on device")
-        return real_unlink(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "unlink", flaky_unlink)
 
     result = svc.import_downloads(tmp_path, no_load_order=True)
 
     assert result.matched == 1
     assert result.extracted == 1
-    assert any("Could not remove" in e for e in result.errors)
-    assert _reload(tmp_path).mods[10].download_status == "downloaded"
+    assert result.errors == []
     assert archive.exists()
+    assert _reload(tmp_path).mods[10].download_status == "downloaded"
 
-    # A repeated import must not re-consume the leftover archive
-    monkeypatch.setattr(Path, "unlink", real_unlink)
     second = svc.import_downloads(tmp_path, no_load_order=True)
     assert second.matched == 0
     assert second.errors == []
@@ -722,7 +720,8 @@ def test_state_persisted_before_midrun_crash(monkeypatch, tmp_path, svc):
     state = _reload(tmp_path)
     assert state.mods[1].download_status == "downloaded"  # progress survived
     assert state.mods[2].download_status == "pending_download"
-    assert not first.exists()
+    # The first extraction kept its archive; the second never happened.
+    assert first.exists()
     assert second.exists()
 
 

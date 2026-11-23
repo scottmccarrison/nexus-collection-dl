@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from .extractor import is_archive
+
 if TYPE_CHECKING:
     from .fomod_plan import GameState, InstallPlan, ModuleConfig
 
@@ -712,6 +714,14 @@ def classify_files(
 
         if not effective_parts:
             plan.skipped.append((rel, "empty after stripping option folders"))
+            continue
+
+        # A download container is never game content. Archives are kept
+        # after extraction so gc can buy the disk back, and they must
+        # not land in the game directory. Content sniffing also catches
+        # the extension-less names sync gives them.
+        if is_archive(file_path):
+            plan.skipped.append((rel, "download archive"))
             continue
 
         effective_rel = Path(*effective_parts)

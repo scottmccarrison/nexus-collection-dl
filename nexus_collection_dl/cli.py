@@ -231,6 +231,22 @@ def _is_json(ctx: click.Context) -> bool:
     return bool(ctx.obj and ctx.obj.get("json_mode"))
 
 
+def _maybe_gc_nudge(ctx: click.Context, mods_dir: Path) -> None:
+    """Point at reclaimable archive disk after a work command.
+
+    The user owns whether to run gc; the tool owns making sure the disk
+    is visible while they are working. Silent in --json mode so stdout
+    stays parseable (machines read 'gc --json' for the number).
+    """
+    if _is_json(ctx):
+        return
+    from .gc import NUDGE_THRESHOLD_BYTES, nudge_message
+
+    msg = nudge_message(mods_dir, NUDGE_THRESHOLD_BYTES)
+    if msg:
+        console.print(f"\n[yellow]{escape(msg)}[/yellow]")
+
+
 def _fail(
     ctx: click.Context,
     exc: BaseException,
@@ -378,6 +394,8 @@ def sync(
         if len(result.conflicts) > 20:
             console.print(f"  [dim]... and {len(result.conflicts) - 20} more[/dim]")
 
+    _maybe_gc_nudge(ctx, result.collection_dir or mods_dir)
+
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
@@ -476,6 +494,8 @@ def update(
             for err in result.errors:
                 console.print(f"[red]Error:[/red] {err}")
         console.print("\n[green]Update complete![/green]")
+
+    _maybe_gc_nudge(ctx, mods_dir)
 
 
 @main.command()
@@ -715,6 +735,8 @@ def deploy(
         console.print("  To launch with mods, set your Steam shortcut TARGET to:")
         console.print(f"  [cyan]{sfse_path}[/cyan]")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
@@ -920,6 +942,8 @@ def add(
     else:
         console.print(f"[green]Added '{result.mod_name}' as manual mod (phase 999).[/green]")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.command(name="add-local")
 @click.argument("name")
@@ -1032,6 +1056,8 @@ def import_cmd(
         if result.load_order_files:
             for f in result.load_order_files:
                 console.print(f"  [green]Wrote[/green] {f}")
+
+    _maybe_gc_nudge(ctx, mods_dir)
 
 
 @main.group(name="track-sync")
@@ -1255,7 +1281,7 @@ def gc(ctx: click.Context, mods_dir: Path, apply: bool) -> None:
     nothing until --apply. Never deletes the backup store, and never
     deletes an archive that is the only copy of its mod.
     """
-    from .gc import apply_gc, plan_gc
+    from .gc import apply_gc, human_bytes, plan_gc
 
     plan = plan_gc(mods_dir)
     if _emit_result(
@@ -1270,22 +1296,32 @@ def gc(ctx: click.Context, mods_dir: Path, apply: bool) -> None:
         return
 
     if not plan.reclaimable and not plan.kept:
-        console.print("[dim]Nothing to report.[/dim]")
+        console.print(
+            "[dim]No archives to reclaim here. Downloads keep their "
+            "archive so this command can buy the disk back once the "
+            "files are extracted.[/dim]"
+        )
         return
     if plan.reclaimable:
         for p in plan.reclaimable:
             console.print(f"  [dim]{escape(str(p))}[/dim]")
         console.print(
             f"[green]{len(plan.reclaimable)} archive(s), "
-            f"{plan.bytes_reclaimable} bytes reclaimable.[/green]"
+            f"{human_bytes(plan.bytes_reclaimable)} reclaimable.[/green]"
         )
     for p, reason in plan.kept:
         console.print(f"  [yellow]kept[/yellow] {escape(str(p.name))}: {reason}")
     if not apply:
-        console.print("[dim]Dry run. Nothing was deleted. Re-run with --apply.[/dim]")
+        if plan.reclaimable:
+            console.print("[dim]Dry run. Nothing was deleted. Re-run with --apply.[/dim]")
+        else:
+            console.print(
+                "[dim]Nothing to reclaim yet: every archive is still "
+                "the only copy of its mod.[/dim]"
+            )
     else:
         freed = apply_gc(plan)
-        console.print(f"[green]Freed {freed} bytes.[/green]")
+        console.print(f"[green]Freed {human_bytes(freed)}.[/green]")
 
 
 @main.command()
