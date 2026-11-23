@@ -147,3 +147,68 @@ def test_gc_reports_the_bytes(tmp_path):
 
     plan = plan_gc(state.mods_dir)
     assert plan.bytes_reclaimable == 4096
+
+
+def test_gc_sees_an_archive_without_a_suffix_extension(tmp_path):
+    """Sync names archives after the manifest's filename, which for
+    community collections is a display name with no extension. The file
+    is a real archive (extraction sniffs it), so gc must see it too.
+    """
+    import io
+    import zipfile
+
+    from nexus_collection_dl.gc import plan_gc
+
+    state = _state_with(
+        tmp_path, filename="Hylios Female Mannequins", name="Hylios"
+    )
+    state.save()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a/one.esp", b"x" * 100)
+    (state.mods_dir / "Hylios Female Mannequins").write_bytes(buf.getvalue())
+
+    plan = plan_gc(state.mods_dir)
+    names = {p.name for p in plan.reclaimable}
+    assert "Hylios Female Mannequins" in names, plan
+    assert plan.bytes_reclaimable == len(buf.getvalue())
+
+
+def test_gc_never_reclaims_a_non_archive_payload_file(tmp_path):
+    """A loose file download is its own payload. Deleting it loses the mod.
+
+    gc reclaims *archives* whose extracted content exists on disk. A
+    non-archive file has no separate payload; it is the payload.
+    """
+    from nexus_collection_dl.gc import plan_gc
+
+    state = _state_with(
+        tmp_path, filename="Solo.esp", name="Solo", file_id=50,
+        contributed_files=["Solo.esp"],
+    )
+    state.save()
+    (state.mods_dir / "Solo.esp").write_bytes(b"esp")
+
+    plan = plan_gc(state.mods_dir)
+    assert plan.reclaimable == []
+    assert (state.mods_dir / "Solo.esp").exists()
+
+
+def test_gc_keeps_an_unextracted_archive_that_is_its_own_footprint(tmp_path):
+    """`--no-extract` records the archive itself as the mod's footprint.
+
+    That is the only copy: nothing was extracted. Treating the archive as
+    its own payload would make gc delete the mod out from under the user.
+    """
+    from nexus_collection_dl.gc import plan_gc
+
+    state = _state_with(
+        tmp_path, filename="body.zip", name="Body",
+        contributed_files=["body.zip"],
+    )
+    state.save()
+    _archive(state.mods_dir, "body.zip")
+
+    plan = plan_gc(state.mods_dir)
+    assert plan.reclaimable == []
+    assert (state.mods_dir / "body.zip").exists()

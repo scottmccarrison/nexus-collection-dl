@@ -1669,13 +1669,25 @@ class ModManagerService:
                     for mod_info, file_path in results:
                         try:
                             config_record = None
+                            contributed: list[str] = []
                             if not no_extract and is_archive(file_path):
-                                extract_archive(file_path, mods_dir)
+                                final_files = extract_archive(file_path, mods_dir)
+                                contributed = [
+                                    str(ef.relative_to(mods_dir))
+                                    for ef in final_files
+                                ]
                                 config_record = _fomod_config_record(file_path)
                                 file_path.unlink()
+                            else:
+                                # A retained archive or a loose file is
+                                # this mod's footprint; disable needs it.
+                                contributed = [
+                                    str(file_path.relative_to(mods_dir))
+                                ]
                             state.add_mod(mod_info)
                             if config_record is not None:
                                 state.mods[mod_info["file_id"]].fomod_config = config_record
+                            state.mods[mod_info["file_id"]].contributed_files = contributed
                             downloaded += 1
                         except ExtractionError as e:
                             errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
@@ -1897,12 +1909,20 @@ class ModManagerService:
                     f"missing dependency: mod {req_id} is not installed"
                 )
             config_record = None
+            contributed: list[str] = []
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
-                        extract_archive(file_path, mods_dir)
+                        final_files = extract_archive(file_path, mods_dir)
+                        contributed.extend(
+                            str(ef.relative_to(mods_dir)) for ef in final_files
+                        )
                         config_record = _fomod_config_record(file_path)
                         file_path.unlink()
+                    else:
+                        # A retained archive or a loose file is this
+                        # mod's footprint; disable needs to know it.
+                        contributed.append(str(file_path.relative_to(mods_dir)))
                 except ExtractionError as e:
                     return AddResult(
                         mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
@@ -1914,6 +1934,7 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            state.mods[selected_file_id].contributed_files = contributed
             if config_record is not None:
                 state.mods[selected_file_id].fomod_config = config_record
             if resolved_picks:
@@ -2348,8 +2369,8 @@ class ModManagerService:
             # entry, its picks, and its files on disk all stay, but its
             # files must not land. The extraction tree is merged, so this
             # works through the attribution recorded at extract time.
-            # A mod with no attribution (extracted before that existed)
-            # cannot be isolated, and says so rather than guessing.
+            # A mod with no attribution cannot be isolated, and says so
+            # rather than guessing.
             disabled_paths: set[str] = set()
             unattributed: list[str] = []
             for mod in state.mods.values():
@@ -2373,8 +2394,8 @@ class ModManagerService:
             for name in unattributed:
                 deploy_warnings.append(
                     f"{name} is disabled but its files cannot be isolated "
-                    "(it was extracted before per-mod attribution existed); "
-                    "re-sync the collection to record it"
+                    "(no per-mod attribution on record for it); re-add or "
+                    "re-sync it to record one"
                 )
 
             deploy_warnings.extend(plan.warnings)
@@ -2659,11 +2680,17 @@ class ModManagerService:
             if not resolved:
                 raise FomodChoicesError(archive.name)
 
-            extract_archive(archive, mods_dir)
+            final_files = extract_archive(archive, mods_dir)
             config_record = _fomod_config_record(archive)
             mod.download_status = "downloaded"
             mod.browser_url = ""
             mod.installed_at = datetime.now(timezone.utc).isoformat()
+            # Attribution for `disable` and `gc`: the extraction tree is
+            # merged, so without this a disabled mod cannot be told
+            # apart from its neighbours at deploy time.
+            mod.contributed_files = [
+                str(ef.relative_to(mods_dir)) for ef in final_files
+            ]
             mod.fomod_picks = [
                 {"step": p.step, "group": p.group, "option": p.option}
                 for p in resolved
@@ -2834,6 +2861,7 @@ class ModManagerService:
                 config_record = None
                 scoped = None
                 fomod_seen = False
+                contributed: list[str] = []
                 try:
                     from .fomod_select import picks_for_file
 
@@ -2853,9 +2881,17 @@ class ModManagerService:
                                 mod_state.fomod_picks,
                                 on_fomod_prompt,
                             )
-                        extract_archive(match, mods_dir)
+                        final_files = extract_archive(match, mods_dir)
+                        contributed = [
+                            str(ef.relative_to(mods_dir)) for ef in final_files
+                        ]
                         config_record = _fomod_config_record(match)
                         extracted += 1
+                    else:
+                        # A retained archive or a loose file: whatever is
+                        # on disk is this mod's footprint, and disable
+                        # needs to know it.
+                        contributed = [str(match.relative_to(mods_dir))]
                 except FomodInstallerError as e:
                     # Same contract as a failed extraction: report it and
                     # leave the item pending rather than abort the batch.
@@ -2891,6 +2927,10 @@ class ModManagerService:
                         {"step": p.step, "group": p.group, "option": p.option}
                         for p in resolved_picks
                     ]
+                # Attribution for `disable` and `gc`: the extraction tree
+                # is merged, so without this a disabled mod cannot be
+                # told apart from its neighbours at deploy time.
+                mod_state.contributed_files = contributed
                 # Importing this mod's file is an explicit re-add of the mod
                 # page, so any tombstone for it is cleared with the commit.
                 state.clear_removed(mod_state.mod_id)
@@ -3138,7 +3178,7 @@ class ModManagerService:
                         f"Extracting retained archive {archive.name}...",
                     )
                     try:
-                        extract_archive(archive, target)
+                        final_files = extract_archive(archive, target)
                     except ExtractionError as e:
                         # Entry stays pending and the archive stays put:
                         # nothing was downloaded, nothing is overwritten.
@@ -3157,6 +3197,12 @@ class ModManagerService:
                     existing.download_status = "downloaded"
                     existing.browser_url = ""
                     existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    # Attribution for `disable` and `gc`. The archive is
+                    # kept on purpose here, so the payload list is what
+                    # tells gc it is now redundant.
+                    existing.contributed_files = [
+                        str(ef.relative_to(target)) for ef in final_files
+                    ]
                     if config_record is not None:
                         existing.fomod_config = config_record
                     # Committing this completion is explicit re-add intent,
@@ -3392,6 +3438,10 @@ class ModManagerService:
 
             extracted = False
             config_record = None
+            # Default footprint is the downloaded file itself: a retained
+            # archive or a loose file is what this mod put on disk. An
+            # extraction below replaces it with the published payload.
+            contributed = [str(path.relative_to(target))]
             if not no_extract and is_archive(path):
                 blocker = _nxm_fomod_blocker(path)
                 if blocker is not None:
@@ -3432,7 +3482,10 @@ class ModManagerService:
                         ),
                     )
                 try:
-                    extract_archive(path, target)
+                    final_files = extract_archive(path, target)
+                    contributed = [
+                        str(ef.relative_to(target)) for ef in final_files
+                    ]
                     extracted = True
                     config_record = _fomod_config_record(path)
                 except ExtractionError as e:
@@ -3534,6 +3587,10 @@ class ModManagerService:
                 version = selected.get("version")
                 if version:
                     existing.version = str(version)
+                # Attribution for `disable` and `gc`: the extraction tree
+                # is merged, so without this a disabled mod cannot be
+                # told apart from its neighbours at deploy time.
+                existing.contributed_files = contributed
                 if config_record is not None:
                     existing.fomod_config = config_record
             else:
@@ -3542,6 +3599,7 @@ class ModManagerService:
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
+                state.mods[info.file_id].contributed_files = contributed
                 if config_record is not None:
                     state.mods[info.file_id].fomod_config = config_record
             # Completing this download is explicit re-add intent, so the
