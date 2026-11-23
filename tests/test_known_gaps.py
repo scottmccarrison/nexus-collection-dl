@@ -135,14 +135,17 @@ def test_known_gap_deploy_has_no_confirmation(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_file_dependency_falls_back_with_a_warning(tmp_path):
-    """An undecidable installer condition falls back to the folder install.
+def test_known_gap_file_dependency_is_decidable_with_a_game_state(tmp_path):
+    """The gap was "deploy cannot see the game's load order". Closed.
 
-    CHANGELOG: fileDependency and gameDependency conditions fall back to
-    the folder-based install with a per-mod warning until deploy can see
-    the game's load order.
+    The probe used to assert the fallback: a fileDependency with no
+    GameState is undecidable. That is still true in isolation, and it is
+    the right behaviour. What is closed is the wiring: deploy now builds
+    a GameState from the game's own plugins.txt, so the condition
+    decides instead of falling back. See test_gamestate.py.
     """
     from nexus_collection_dl.fomod_plan import (
+        GameState,
         load_module_config_text,
         resolve_install_plan,
     )
@@ -150,12 +153,16 @@ def test_known_gap_file_dependency_falls_back_with_a_warning(tmp_path):
     config = load_module_config_text(FILE_DEPENDENCY_CONFIG)
     assert config is not None
 
+    # Without a game state, still undecidable. Refusing to guess is the
+    # contract, not the gap.
     resolved = resolve_install_plan(config, {})
-    assert resolved.indeterminate, (
-        "a fileDependency condition with no GameState should be undecidable, "
-        f"got {resolved}"
+    assert resolved.indeterminate
+
+    # With one, the condition decides.
+    resolved = resolve_install_plan(
+        config, {}, game=GameState(plugin_states={"master.esm": "Active"})
     )
-    assert resolved.notes, "the fallback must say why it could not decide"
+    assert not resolved.indeterminate, resolved.notes
 
 
 # ---------------------------------------------------------------------------

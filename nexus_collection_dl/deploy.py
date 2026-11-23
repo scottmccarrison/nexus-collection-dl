@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from .fomod_plan import InstallPlan, ModuleConfig
+    from .fomod_plan import GameState, InstallPlan, ModuleConfig
 
 from .errmsg import exception_reason
 from .extractor import _fomod_marker_from_name
@@ -379,6 +379,7 @@ def _fomod_plans(
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
     mod_names: dict[int, str] | None = None,
+    game: "GameState | None" = None,
 ) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...], str]], list[str]]:
     """Install plans for every readable ModuleConfig of this tree.
 
@@ -541,7 +542,7 @@ def _fomod_plans(
         where: str,
         label: str,
     ) -> tuple[Path, "InstallPlan | None", tuple[str, ...], str]:
-        resolved = resolve_install_plan(config, selections)
+        resolved = resolve_install_plan(config, selections, game=game)
         owned = tuple(entry.source.lower() for entry in config.all_entries())
         if resolved.indeterminate:
             message = (
@@ -644,6 +645,7 @@ def classify_files(
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
     mod_names: dict[int, str] | None = None,
+    game: "GameState | None" = None,
 ) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment.
 
@@ -661,7 +663,7 @@ def classify_files(
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
     fomod_plans, plan_warnings = _fomod_plans(
-        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names
+        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names, game=game
     )
 
     plan = DeploymentPlan(source_root=mods_dir, warnings=plan_warnings)

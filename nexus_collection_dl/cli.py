@@ -1245,6 +1245,50 @@ def enable_mod(
 
 
 @main.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--apply", is_flag=True, help="Actually delete. Without this it is a dry run.")
+@click.pass_context
+def gc(ctx: click.Context, mods_dir: Path, apply: bool) -> None:
+    """Reclaim disk from archives whose job is done.
+
+    Dry-run by default: it reports what is reclaimable and touches
+    nothing until --apply. Never deletes the backup store, and never
+    deletes an archive that is the only copy of its mod.
+    """
+    from .gc import apply_gc, plan_gc
+
+    plan = plan_gc(mods_dir)
+    if _emit_result(
+        ctx,
+        {
+            "dry_run": not apply,
+            "reclaimable": [str(p) for p in plan.reclaimable],
+            "bytes_reclaimable": plan.bytes_reclaimable,
+            "kept": [{"path": str(p), "reason": r} for p, r in plan.kept],
+        },
+    ):
+        return
+
+    if not plan.reclaimable and not plan.kept:
+        console.print("[dim]Nothing to report.[/dim]")
+        return
+    if plan.reclaimable:
+        for p in plan.reclaimable:
+            console.print(f"  [dim]{escape(str(p))}[/dim]")
+        console.print(
+            f"[green]{len(plan.reclaimable)} archive(s), "
+            f"{plan.bytes_reclaimable} bytes reclaimable.[/green]"
+        )
+    for p, reason in plan.kept:
+        console.print(f"  [yellow]kept[/yellow] {escape(str(p.name))}: {reason}")
+    if not apply:
+        console.print("[dim]Dry run. Nothing was deleted. Re-run with --apply.[/dim]")
+    else:
+        freed = apply_gc(plan)
+        console.print(f"[green]Freed {freed} bytes.[/green]")
+
+
+@main.command()
 @click.argument(
     "root_dir",
     required=False,
