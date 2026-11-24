@@ -171,6 +171,81 @@ def main(
         _handle_bare_invocation(ctx, json_mode)
 
 
+def _settle_root(
+    ctx: click.Context,
+    resolved,
+    kind: str,
+) -> Path | None:
+    """Turn a resolved root into one the service may act on.
+
+    A root that came from the state file alone cannot be verified, so a
+    person at a terminal is asked before it is used. A script or --json
+    run gets a refusal instead: there is nobody to ask, and the state
+    file cannot vouch for itself. Returns None when the caller should
+    stop.
+    """
+    if not resolved.needs_confirmation:
+        return resolved.path
+    if not _is_interactive() or _is_json(ctx):
+        return None
+    if not click.confirm(
+        f"Use {escape(str(resolved.path))} as the {kind}? It came "
+        "from this collection's state file and cannot be verified.",
+        default=False,
+    ):
+        return None
+    return resolved.path
+
+
+def _resolve_root_for_removal(
+    ctx: click.Context,
+    mods_dir: Path,
+    game_dir: Path | None,
+    prefix: Path | None,
+) -> tuple[Path | None, Path | None] | None:
+    """Resolve both roots for an undeploy, confirming what needs it.
+
+    Returns the (game_dir, prefix) pair to pass to the service, or None
+    when the run should stop.
+    """
+    from .service import resolve_game_root, resolve_proton_prefix
+    from .state import CollectionState
+
+    try:
+        state = CollectionState(mods_dir)
+        state.load()
+    except StateError as e:
+        _fail(ctx, e)
+
+    g = resolve_game_root(game_dir, state.game_dir, state.game_domain)
+    for w in g.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    settled = _settle_root(ctx, g, "game directory")
+    if g.needs_confirmation and settled is None:
+        console.print(
+            "[yellow]Aborted:[/yellow] the only game directory on record "
+            f"({escape(str(g.path))}) came from this collection's "
+            "state file and could not be verified. Pass --game-dir to "
+            "name the directory yourself."
+        )
+        return None
+
+    pr = resolve_proton_prefix(prefix, state.proton_prefix, state.game_domain)
+    for w in pr.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    settled_prefix = _settle_root(ctx, pr, "Proton prefix")
+    if pr.needs_confirmation and settled_prefix is None:
+        console.print(
+            "[yellow]Aborted:[/yellow] the only Proton prefix on record "
+            f"({escape(str(pr.path))}) came from this collection's "
+            "state file and could not be verified. Pass --prefix to name "
+            "it yourself."
+        )
+        return None
+
+    return settled, settled_prefix
+
+
 def _is_interactive() -> bool:
     """Can this run a REPL?
 
@@ -604,7 +679,6 @@ def deploy(
         # For dry-run, use deploy module directly
         from .deploy import classify_files
         from .state import CollectionState
-        from .steam import find_game_dir
 
         state = CollectionState(mods_dir)
         try:
@@ -612,10 +686,20 @@ def deploy(
         except StateError as e:
             _fail(ctx, e)
 
-        if game_dir is None and state.game_dir:
-            game_dir = Path(state.game_dir)
-        if game_dir is None:
-            game_dir = find_game_dir(state.game_domain)
+        from .service import resolve_game_root
+
+        root = resolve_game_root(game_dir, state.game_dir, state.game_domain)
+        for w in root.warnings:
+            console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+        game_dir = _settle_root(ctx, root, "game directory")
+        if root.needs_confirmation and game_dir is None:
+            _fail(
+                ctx,
+                FileNotFoundError(
+                    "Could not verify a game directory. Pass --game-dir "
+                    "to name the directory yourself."
+                ),
+            )
         if game_dir is None:
             _fail(ctx, FileNotFoundError("Could not find game directory."))
 
@@ -683,6 +767,44 @@ def deploy(
         line.close()
         _cli_progress(event, pct, msg)
 
+    # Settle the root here rather than in the service: this is the layer
+    # that can ask a person. The service refuses an unverified root.
+    from .service import resolve_game_root, resolve_proton_prefix
+    from .state import CollectionState as _CS
+
+    try:
+        _st = _CS(mods_dir)
+        _st.load()
+    except StateError as e:
+        line.close()
+        _fail(ctx, e)
+    _root = resolve_game_root(game_dir, _st.game_dir, _st.game_domain)
+    for w in _root.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    game_dir = _settle_root(ctx, _root, "game directory")
+    if _root.needs_confirmation and game_dir is None:
+        line.close()
+        _fail(
+            ctx,
+            FileNotFoundError(
+                "Could not verify a game directory. Pass --game-dir to "
+                "name the directory yourself."
+            ),
+        )
+    _pfx = resolve_proton_prefix(prefix, _st.proton_prefix, _st.game_domain)
+    for w in _pfx.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    prefix = _settle_root(ctx, _pfx, "Proton prefix")
+    if _pfx.needs_confirmation and prefix is None:
+        line.close()
+        _fail(
+            ctx,
+            FileNotFoundError(
+                "Could not verify a Proton prefix. Pass --prefix to name "
+                "it yourself."
+            ),
+        )
+
     try:
         result = svc.deploy(
             mods_dir,
@@ -740,16 +862,41 @@ def deploy(
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--game-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Game directory to contain the removal (usually not needed)",
+)
+@click.option(
+    "--prefix",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Proton/Wine prefix path (auto-detected if not specified)",
+)
 @click.pass_context
-def undeploy(ctx: click.Context, mods_dir: Path) -> None:
+def undeploy(
+    ctx: click.Context,
+    mods_dir: Path,
+    game_dir: Path | None,
+    prefix: Path | None,
+) -> None:
     """
     Remove all deployed mod files from game directory.
 
     MODS_DIR: Directory containing previously synced mods
+
+    The removal is contained to a game directory resolved from
+    --game-dir, the user config, or game detection. A directory that is
+    only in the collection's state file is asked about first.
     """
     svc = ctx.obj["service"]
+    resolved = _resolve_root_for_removal(ctx, mods_dir, game_dir, prefix)
+    if resolved is None:
+        return
+    game_dir, prefix = resolved
     try:
-        removed = svc.undeploy(mods_dir)
+        removed = svc.undeploy(mods_dir, game_dir=game_dir, prefix=prefix)
     except UndeployError as e:
         # Partial undeploy: show exactly what was refused/failed. State keeps
         # those entries, so undeploy can be re-run after fixing them.

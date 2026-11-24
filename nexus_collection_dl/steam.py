@@ -28,7 +28,15 @@ STEAM_PATHS = [
 
 
 def find_steam_root() -> Path | None:
-    """Find the Steam installation root directory."""
+    """Find the Steam installation root directory.
+
+    ``NEXUS_DL_STEAM_ROOT`` overrides detection, the same hook
+    detect_installed_games honours. Tests point it at a nonexistent path
+    so a machine with a real Steam library cannot change what they see.
+    """
+    env = os.environ.get("NEXUS_DL_STEAM_ROOT")
+    if env:
+        return Path(env)
     for path in STEAM_PATHS:
         vdf = path / "config" / "libraryfolders.vdf"
         if vdf.exists():
