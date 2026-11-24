@@ -319,8 +319,8 @@ def reload_state(cdir: Path) -> CollectionState:
 
 def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_path):
     """/collections -> /use -> /mods -> /remove (yes): state updated, the
-    removal is tombstoned at the service layer, and payload files on
-    disk are kept exactly as they were."""
+    removal is tombstoned at the service layer, and what the mod added
+    goes with it. Gone means gone."""
     root = make_root(tmp_path, ("Test Collection", [
         mod_entry(file_id=456, mod_id=123, name="Test Mod"),
         mod_entry(file_id=789, mod_id=321, name="Other Mod"),
@@ -331,19 +331,19 @@ def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_pat
     extracted = cdir / "TestMod" / "file.esp"
     extracted.parent.mkdir()
     extracted.write_text("esp content")
+    state = reload_state(cdir)
+    state.mods[456].contributed_files = ["TestMod/file.esp"]
+    state.save()
 
     result = run_cli(root, "/collections\n/use 1\n/mods\n/remove 456\nyes\n/quit\n")
     assert result.exit_code == 0
     out = result.output
 
-    # The confirmation shows name + id and the required statement.
+    # The confirmation shows name + id and says what will happen to disk.
     assert "Test Mod" in out
     assert "file_id 456" in out
     assert "mod_id 123" in out
-    assert (
-        "this removes the mod from the collection and it stays removed "
-        "through sync/update; files on disk are kept; re-add restores it"
-    ) in out
+    assert "from disk" in out
 
     # State updated: the mod is gone, its sibling stays.
     state = reload_state(cdir)
@@ -353,9 +353,9 @@ def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_pat
     assert state.is_removed(123)
     assert not state.is_removed(321)
 
-    # Payload files untouched.
-    assert archive.read_bytes() == b"PK payload bytes"
-    assert extracted.read_text() == "esp content"
+    # Gone means gone: the files the mod added go with it.
+    assert not archive.exists()
+    assert not extracted.exists()
 
 
 # ---------------------------------------------------------------------------

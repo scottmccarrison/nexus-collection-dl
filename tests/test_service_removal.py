@@ -1,14 +1,16 @@
-"""Service-layer tests for collection enumeration and safe mod removal.
+"""Service-layer tests for collection enumeration and mod removal.
 
 list_collections/list_mods/get_collection_url are read-only local scans
-(no network), and remove_mod drops state entries only: payload files on
-disk are never touched, saves are atomic under the collection lock, and
-a load order regeneration failure after the save is reported as a
-warning instead of masking the completed removal. Regeneration failures
-are exercised via real output write failures (load-order.txt pre-created
-as a directory), never by monkeypatching the regeneration helper away.
-Everything runs in tmp_path; all state is built locally and no network
-is ever reached.
+(no network), and remove_mod drops the state entry and deletes the files
+the mod contributed plus its retained archive: gone has to mean gone,
+because nothing reclaims an orphan and it keeps deploying. A mod
+extracted before attribution had no file list, so its files stay and say
+so. Saves are atomic under the collection lock, and a load order
+regeneration failure after the save is reported as a warning instead of
+masking the completed removal. Regeneration failures are exercised via
+real output write failures (load-order.txt pre-created as a directory),
+never by monkeypatching the regeneration helper away. Everything runs in
+tmp_path; all state is built locally and no network is ever reached.
 """
 
 import io
@@ -311,19 +313,37 @@ def snapshot_payloads(cdir: Path):
     return out
 
 
-def test_removal_never_touches_payload_files(svc, tmp_path):
+def test_removal_deletes_what_it_can_and_leaves_what_it_cannot(svc, tmp_path):
+    """The split: attributed files go, unattributed files stay and say so.
+
+    This used to pin the opposite (nothing was ever touched). Nothing
+    reclaimed what was left behind, and the orphan kept deploying.
+    """
     cdir = write_state(tmp_path / "col", mods=[
         mod_entry(555, 100, "Alpha Mod", filename="alpha.zip"),
+        mod_entry(777, 200, "Beta Mod", filename="beta.zip"),
     ])
     (cdir / "Data").mkdir()
     (cdir / "Data" / "test.txt").write_bytes(b"extracted payload")
     (cdir / "alpha.zip").write_bytes(b"archive payload bytes")
-    before = snapshot_payloads(cdir)
+    (cdir / "beta.zip").write_bytes(b"other archive bytes")
+    state = CollectionState(cdir)
+    state.load()
+    # Alpha is pre-attribution: payload on disk, no file list.
+    # Beta knows its files.
+    state.mods[777].contributed_files = ["beta.zip"]
+    state.save()
 
     result = svc.remove_mod(cdir, mod_id=100)
 
     assert result.removed_file_ids == [555]
-    assert snapshot_payloads(cdir) == before
+    # The archive is named by the entry, so it goes.
+    assert not (cdir / "alpha.zip").exists()
+    # The payload cannot be attributed, so it stays and the warning says so.
+    assert (cdir / "Data" / "test.txt").exists()
+    assert any("cannot be attributed" in w for w in result.warnings), result.warnings
+    # The other mod is untouched.
+    assert (cdir / "beta.zip").exists()
 
 
 def test_removal_regenerates_load_order_from_cached_manifest(svc, tmp_path):
@@ -503,3 +523,114 @@ def test_regen_wraps_loot_write_failures(svc, tmp_path, monkeypatch):
 
     with pytest.raises(LoadOrderRegenError):
         svc._regen_load_order_from_state(cdir, state)
+
+
+# ---------------------------------------------------------------------------
+# What "removed" has to mean on disk
+#
+# remove used to be state-only. The payload stayed and nothing reclaimed
+# it: gc only handles archives and drops any it cannot claim, undeploy
+# clears the game dir and not the staging tree. Worse, the orphan kept
+# deploying, because with no state entry nothing attributes it and the
+# folder heuristic ships whatever it finds. Gone has to mean gone.
+# ---------------------------------------------------------------------------
+
+
+def _collection_with_payload(tmp_path: Path, attributed: bool = True) -> Path:
+    cdir = tmp_path / "col"
+    (cdir / "a").mkdir(parents=True)
+    (cdir / "a" / "one.esp").write_bytes(b"1")
+    (cdir / "AlphaMod-555-1-0.zip").write_bytes(b"archive bytes")
+    state = CollectionState(cdir)
+    state.set_collection_info(COLLECTION_URL, "Test Collection", 1, GAME)
+    state.add_mod(mod_entry(555, 100, "Alpha Mod",
+                            filename="AlphaMod-555-1-0.zip"))
+    if attributed:
+        state.mods[555].contributed_files = ["a/one.esp"]
+    state.save()
+    return cdir
+
+
+def test_remove_deletes_the_attributed_payload(svc, tmp_path):
+    """Gone means the content goes too, not just the record."""
+    cdir = _collection_with_payload(tmp_path)
+
+    result = svc.remove_mod(cdir, file_id=555, no_load_order=True)
+
+    assert result.removed_file_ids == [555]
+    assert not (cdir / "a" / "one.esp").exists(), "payload left behind"
+
+
+def test_remove_deletes_the_retained_archive(svc, tmp_path):
+    """The archive is the mod's other copy. Leaving it orphans it for gc.
+
+    gc will not reclaim an archive no mod claims, so a removed mod's
+    archive would sit there forever.
+    """
+    cdir = _collection_with_payload(tmp_path)
+
+    result = svc.remove_mod(cdir, file_id=555, no_load_order=True)
+
+    assert result.removed_file_ids == [555]
+    assert not (cdir / "AlphaMod-555-1-0.zip").exists(), "archive left behind"
+
+
+def test_remove_keeps_files_it_cannot_attribute_and_says_so(svc, tmp_path):
+    """A mod extracted before attribution: we cannot tell its files apart.
+
+    Same rule disable follows: leave them and say so rather than guessing
+    and deleting a neighbour's content. The archive is named by the state
+    entry, so that much is ours to delete.
+    """
+    cdir = _collection_with_payload(tmp_path, attributed=False)
+
+    result = svc.remove_mod(cdir, file_id=555, no_load_order=True)
+
+    assert result.removed_file_ids == [555]
+    assert (cdir / "a" / "one.esp").exists(), "unattributed files must stay"
+    assert not (cdir / "AlphaMod-555-1-0.zip").exists(), "the archive is named, so it goes"
+    assert any("cannot be attributed" in w for w in result.warnings), result.warnings
+
+
+def test_remove_refuses_a_mod_another_mod_requires(svc, tmp_path):
+    """Removing a dependency breaks the mod that needs it. Refuse, and
+    name the dependent so the user knows why."""
+    cdir = tmp_path / "col"
+    (cdir / "a").mkdir(parents=True)
+    (cdir / "a" / "one.esp").write_bytes(b"1")
+    state = CollectionState(cdir)
+    state.set_collection_info(COLLECTION_URL, "Test Collection", 1, GAME)
+    state.add_mod(mod_entry(555, 100, "Alpha Mod", filename="AlphaMod-555.zip"))
+    state.add_mod(mod_entry(777, 200, "Beta Mod", filename="BetaMod-777.zip"))
+    state.mods[555].contributed_files = ["a/one.esp"]
+    # Beta depends on Alpha.
+    state.mods[777].requirements = [100]
+    state.save()
+    before = (cdir / STATE_FILENAME).read_bytes()
+
+    with pytest.raises(StateError) as excinfo:
+        svc.remove_mod(cdir, mod_id=100, no_load_order=True)
+
+    assert "Beta Mod" in str(excinfo.value), str(excinfo.value)
+    assert (cdir / STATE_FILENAME).read_bytes() == before, "state must be untouched"
+    assert (cdir / "a" / "one.esp").exists(), "payload must be untouched"
+
+
+def test_remove_force_deletes_a_required_mod(svc, tmp_path):
+    """--force is for the user who knows better."""
+    cdir = tmp_path / "col"
+    (cdir / "a").mkdir(parents=True)
+    (cdir / "a" / "one.esp").write_bytes(b"1")
+    state = CollectionState(cdir)
+    state.set_collection_info(COLLECTION_URL, "Test Collection", 1, GAME)
+    state.add_mod(mod_entry(555, 100, "Alpha Mod", filename="AlphaMod-555.zip"))
+    state.add_mod(mod_entry(777, 200, "Beta Mod", filename="BetaMod-777.zip"))
+    state.mods[555].contributed_files = ["a/one.esp"]
+    state.mods[777].requirements = [100]
+    state.save()
+
+    result = svc.remove_mod(cdir, mod_id=100, no_load_order=True, force=True)
+
+    assert result.removed_file_ids == [555]
+    assert not (cdir / "a" / "one.esp").exists()
+    assert any("required by" in w for w in result.warnings), result.warnings

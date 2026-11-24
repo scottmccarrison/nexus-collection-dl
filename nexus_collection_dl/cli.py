@@ -1120,6 +1120,7 @@ def push(ctx: click.Context, mods_dir: Path) -> None:
 @click.option("--mod-id", type=int, default=None, help="Remove by Nexus mod id")
 @click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed, change nothing")
+@click.option("--force", is_flag=True, help="Remove even if another mod requires it")
 @click.pass_context
 def remove(
     ctx: click.Context,
@@ -1128,13 +1129,16 @@ def remove(
     mod_id: int | None,
     no_load_order: bool,
     dry_run: bool,
+    force: bool,
 ) -> None:
     """
-    Remove a mod from the collection state.
+    Remove a mod from the collection state and from disk.
 
     Exactly one of --file-id or --mod-id is required. Look ids up with
-    'nexus-dl mods MODS_DIR' rather than guessing. Removal is state-only:
-    it does not delete files from disk, and re-adding the mod restores it.
+    'nexus-dl mods MODS_DIR' rather than guessing. Gone means gone: the
+    state entry, the files the mod contributed, and its retained archive
+    are all deleted. Re-adding the mod downloads it again. A mod another
+    one requires is refused unless --force.
     """
     from .service import list_mods
 
@@ -1171,7 +1175,8 @@ def remove(
 
     try:
         result = svc.remove_mod(
-            mods_dir, file_id=file_id, mod_id=mod_id, no_load_order=no_load_order
+            mods_dir, file_id=file_id, mod_id=mod_id,
+            no_load_order=no_load_order, force=force,
         )
     except (StateError, ValueError) as e:
         _fail(ctx, e)

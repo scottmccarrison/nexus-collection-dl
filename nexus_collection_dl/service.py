@@ -2029,21 +2029,33 @@ class ModManagerService:
         file_id: int | None = None,
         mod_id: int | None = None,
         no_load_order: bool = False,
+        force: bool = False,
     ) -> RemoveModResult:
-        """Remove one mod from collection state (safe removal).
+        """Remove one mod from collection state and from disk.
 
         Exactly one of file_id/mod_id must be given (ValueError
         otherwise); file_id resolves to its mod_id, and ALL state entries
         of that mod are removed. Unknown ids raise StateError before
         anything is mutated.
 
-        This never touches payload files on disk: extracted content and
-        retained archives stay exactly as they are (cleaning up deployed
-        files is undeploy's job). State is updated atomically under the
-        collection lock; a save failure raises StateError with the prior
-        state file left standing. Afterwards the load order is
-        regenerated from the remaining mods unless no_load_order is set;
-        a regeneration failure after the save is reported as a warning
+        Gone means gone. After the state entry is saved out, the files
+        this mod contributed and its retained archive are deleted. They
+        used to be left behind, and nothing ever reclaimed them: gc only
+        handles archives and keeps any it cannot claim, undeploy clears
+        the game directory and not the staging tree. Worse, an orphan
+        keeps deploying, because with no state entry nothing attributes
+        it and the folder heuristic ships whatever it finds.
+
+        A mod extracted before per-mod attribution existed has no file
+        list to delete, so its files stay and say so rather than being
+        guessed at. Removing a mod another one lists as a requirement is
+        refused unless ``force``, which warns instead.
+
+        State is updated atomically under the collection lock; a save
+        failure raises StateError with the prior state file left standing
+        and nothing deleted. Afterwards the load order is regenerated
+        from the remaining mods unless no_load_order is set; a
+        regeneration failure after the save is reported as a warning
         because the removal itself is already persisted.
 
         Removal is recorded as a tombstone so it survives sync/update:
@@ -2088,6 +2100,48 @@ class ModManagerService:
                 if ms.mod_id == target_mod_id
             )
             removed_name = state.mods[removed_file_ids[0]].name if removed_file_ids else ""
+
+            # Removing a mod another one requires breaks that mod. Say
+            # so before anything is touched; --force is for the user who
+            # knows better.
+            dependents = sorted(
+                {
+                    ms.name
+                    for fid, ms in state.mods.items()
+                    if ms.mod_id != target_mod_id
+                    and target_mod_id in (ms.requirements or [])
+                }
+            )
+            if dependents and not force:
+                raise StateError(
+                    f"{removed_name or target_mod_id} is required by "
+                    f"{', '.join(dependents)}; removing it would break "
+                    "them. Re-run with --force to remove it anyway."
+                )
+            if dependents:
+                warnings.append(
+                    f"{removed_name or target_mod_id} is required by "
+                    f"{', '.join(dependents)}; they may no longer work."
+                )
+
+            # What this mod put in the tree. Collected while the entries
+            # are still here; deleted only after the save lands, so a
+            # save failure leaves the content untouched.
+            payload: set[Path] = set()
+            unattributed: list[str] = []
+            archive_present = False
+            for fid in removed_file_ids:
+                ms = state.mods[fid]
+                if ms.contributed_files:
+                    payload.update(mods_dir / rel for rel in ms.contributed_files)
+                else:
+                    unattributed.append(ms.name or ms.filename or str(fid))
+                if ms.filename:
+                    archive = mods_dir / ms.filename
+                    if archive.is_file():
+                        archive_present = True
+                    payload.add(archive)
+
             state.remove_mod(target_mod_id)
             # Tombstone positive Nexus mod pages only (see docstring).
             if target_mod_id > 0:
@@ -2101,6 +2155,27 @@ class ModManagerService:
                     f"Failed to save state after removing mod "
                     f"{target_mod_id}: {exception_reason(e)}"
                 ) from e
+
+            # Gone means gone. gc will not reclaim an archive no mod
+            # claims, so a leftover here would sit on disk forever, and
+            # without an attribution nothing stops it deploying either.
+            for path in sorted(payload):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    warnings.append(
+                        f"Could not remove {path}: {exception_reason(e)}"
+                    )
+            # A real downloaded mod leaves an archive behind. No archive
+            # and no attribution means there is nothing to warn about.
+            if unattributed and archive_present:
+                for name in unattributed:
+                    warnings.append(
+                        f"{name} was extracted before per-mod attribution "
+                        "existed, so its files cannot be attributed and were "
+                        "left on disk. Delete them by hand if you want them "
+                        "gone."
+                    )
 
             if not no_load_order:
                 try:
