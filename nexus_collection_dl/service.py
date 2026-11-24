@@ -92,6 +92,7 @@ from .state import (
     CollectionState,
     LoadOrderRegenError,
     StateError,
+    _is_safe_relative,
 )
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
@@ -2126,21 +2127,44 @@ class ModManagerService:
 
             # What this mod put in the tree. Collected while the entries
             # are still here; deleted only after the save lands, so a
-            # save failure leaves the content untouched.
-            payload: set[Path] = set()
+            # save failure leaves the content untouched. The state file
+            # is untrusted: a contributed_files entry or filename can
+            # name anything, and `base / rel` escapes on `..` and on
+            # absolute paths. Anything outside the collection is refused
+            # rather than deleted.
+            payload: dict[Path, str] = {}
+            refused: list[str] = []
             unattributed: list[str] = []
             archive_present = False
             for fid in removed_file_ids:
                 ms = state.mods[fid]
                 if ms.contributed_files:
-                    payload.update(mods_dir / rel for rel in ms.contributed_files)
+                    for rel in ms.contributed_files:
+                        if not _is_safe_relative(rel):
+                            refused.append(rel)
+                            continue
+                        payload[mods_dir / rel] = rel
                 else:
                     unattributed.append(ms.name or ms.filename or str(fid))
                 if ms.filename:
-                    archive = mods_dir / ms.filename
-                    if archive.is_file():
-                        archive_present = True
-                    payload.add(archive)
+                    if not _is_safe_relative(ms.filename):
+                        refused.append(ms.filename)
+                    else:
+                        archive = mods_dir / ms.filename
+                        if archive.is_file():
+                            archive_present = True
+                        payload[archive] = ms.filename
+
+            # A path a surviving mod also claims is not this mod's to
+            # take: removing one must not break another.
+            survivor_claims: set[str] = set()
+            for fid, ms in state.mods.items():
+                if fid in removed_file_ids:
+                    continue
+                if ms.contributed_files:
+                    survivor_claims.update(ms.contributed_files)
+                if ms.filename:
+                    survivor_claims.add(ms.filename)
 
             state.remove_mod(target_mod_id)
             # Tombstone positive Nexus mod pages only (see docstring).
@@ -2159,7 +2183,18 @@ class ModManagerService:
             # Gone means gone. gc will not reclaim an archive no mod
             # claims, so a leftover here would sit on disk forever, and
             # without an attribution nothing stops it deploying either.
+            for rel in refused:
+                warnings.append(
+                    f"Refused to delete {rel}: it points outside the "
+                    "collection folder."
+                )
             for path in sorted(payload):
+                rel = payload[path]
+                if rel in survivor_claims:
+                    warnings.append(
+                        f"Left {rel} in place: another mod still claims it."
+                    )
+                    continue
                 try:
                     path.unlink(missing_ok=True)
                 except OSError as e:

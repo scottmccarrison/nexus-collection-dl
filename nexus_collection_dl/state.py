@@ -20,6 +20,20 @@ STATE_FILENAME = ".nexus-state.json"
 LOCK_FILENAME = ".nexus-state.lock"
 
 
+def _is_safe_relative(rel: str) -> bool:
+    """Is this a path that stays inside the collection when joined?
+
+    The state file can name any string here. A delete target built as
+    ``mods_dir / rel`` escapes on ``..`` components and on absolute
+    paths (``Path / "/x"`` replaces the base entirely), so both are
+    refused before anything can act on them.
+    """
+    if not rel:
+        return False
+    p = Path(rel)
+    return not p.is_absolute() and ".." not in p.parts
+
+
 class StateError(Exception):
     """Raised when state file operations fail."""
 
@@ -168,12 +182,39 @@ class ModState:
 
     @classmethod
     def from_dict(cls, file_id: int, data: dict[str, Any]) -> "ModState":
+        # The state file is untrusted: it travels with a shared
+        # collection folder and is read back long after we wrote it.
+        # Matching and display fields are coerced, because hand-edited
+        # state with a wrong type here must not lock the user out of the
+        # collection (the suffix matcher already calls _as_int on
+        # mod_id). Fields that become path components or delete targets
+        # are the exception and are refused: `list("ab")` names two
+        # files to delete, and `base / 12345` is a TypeError.
+        if not isinstance(data, dict):
+            raise StateError("mod entry is not an object")
+        raw_mod_id = data.get("mod_id", 0)
+        try:
+            mod_id = int(raw_mod_id)
+        except (TypeError, ValueError):
+            mod_id = 0
+        filename = data.get("filename", "")
+        if not isinstance(filename, str):
+            raise StateError(f"filename must be a string, got {filename!r}")
+        contributed = data.get("contributed_files")
+        if contributed is not None and (
+            not isinstance(contributed, list)
+            or not all(isinstance(x, str) for x in contributed)
+        ):
+            raise StateError(
+                "contributed_files must be a list of strings, got "
+                f"{contributed!r}"
+            )
         return cls(
             file_id=file_id,
-            mod_id=data.get("mod_id", 0),
+            mod_id=mod_id,
             name=data.get("name", ""),
             version=data.get("version", ""),
-            filename=data.get("filename", ""),
+            filename=filename,
             installed_at=data.get("installed_at"),
             optional=data.get("optional", False),
             position=data.get("position", 0),
@@ -187,7 +228,7 @@ class ModState:
             # Absent in state written before this flag: default to
             # enabled rather than silently turning mods off.
             enabled=data.get("enabled", True),
-            contributed_files=data.get("contributed_files"),
+            contributed_files=contributed,
         )
 
 
@@ -243,11 +284,25 @@ class CollectionState:
         self.collection_url = data.get("collection_url", "")
         self.collection_name = data.get("collection_name", "")
         self.collection_revision = data.get("collection_revision", 0)
-        self.game_domain = data.get("game_domain", "")
+        # Coerced, not refused: game_domain is display and URL matching,
+        # never a path, and a bad value must not lock the user out of the
+        # collection (same rule as non-string collection names).
+        self.game_domain = str(data.get("game_domain", ""))
         self.mod_rules = data.get("mod_rules", [])
         self.manifest_data = data.get("manifest_data")
-        self.game_dir = data.get("game_dir", "")
-        self.proton_prefix = data.get("proton_prefix", "")
+        game_dir = data.get("game_dir", "")
+        if not isinstance(game_dir, str):
+            raise StateError(
+                f"Invalid state file: game_dir must be a string, got {game_dir!r}"
+            )
+        self.game_dir = game_dir
+        proton_prefix = data.get("proton_prefix", "")
+        if not isinstance(proton_prefix, str):
+            raise StateError(
+                f"Invalid state file: proton_prefix must be a string, got "
+                f"{proton_prefix!r}"
+            )
+        self.proton_prefix = proton_prefix
         self.deployed_files = data.get("deployed_files", [])
         self.deployed_at = data.get("deployed_at")
         self.track_sync_enabled = data.get("track_sync_enabled", False)
@@ -259,7 +314,13 @@ class CollectionState:
         if not isinstance(raw_mods, dict):
             raise StateError("Invalid state file: mods must be a JSON object")
         for file_id_str, mod_data in raw_mods.items():
-            file_id = int(file_id_str)
+            try:
+                file_id = int(file_id_str)
+            except (TypeError, ValueError):
+                raise StateError(
+                    f"Invalid state file: mod key {file_id_str!r} is not an "
+                    "integer"
+                ) from None
             self.mods[file_id] = ModState.from_dict(file_id, mod_data)
 
         # Tombstones restore with int keys exactly like the mods dict above.
@@ -275,7 +336,13 @@ class CollectionState:
             )
         if isinstance(raw_removed, dict):
             for mod_id_str, removed_data in raw_removed.items():
-                self.removed_mods[int(mod_id_str)] = removed_data
+                try:
+                    self.removed_mods[int(mod_id_str)] = removed_data
+                except (TypeError, ValueError):
+                    raise StateError(
+                        f"Invalid state file: removed_mods key {mod_id_str!r} "
+                        "is not an integer"
+                    ) from None
 
     def save(self) -> None:
         """Save state atomically: unique temp file, fsync, then rename.

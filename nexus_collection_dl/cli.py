@@ -1173,6 +1173,16 @@ def remove(
             console.print(f"  {m.name} (file_id={m.file_id}, mod_id={m.mod_id})")
         return
 
+    # Gone means gone, so a person at a terminal gets asked first. A
+    # script or --json run is already explicit: it named the id.
+    if _is_interactive() and not _is_json(ctx):
+        target = f"mod {mod_id}" if mod_id is not None else f"file {file_id}"
+        if not click.confirm(
+            f"Remove {target} and the files it contributed?", default=False
+        ):
+            console.print("Aborted. Nothing was removed.")
+            return
+
     try:
         result = svc.remove_mod(
             mods_dir, file_id=file_id, mod_id=mod_id,

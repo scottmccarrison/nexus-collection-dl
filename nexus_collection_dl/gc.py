@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .deploy import BACKUPS_DIRNAME
 from .extractor import is_archive
-from .state import CollectionState, StateError
+from .state import CollectionState, ModState, StateError, _is_safe_relative
 
 
 @dataclass
@@ -53,9 +53,14 @@ def plan_gc(mods_dir: Path) -> GcPlan:
         # No state means no claims on any archive: nothing is ours.
         return plan
 
-    # filename -> ModState, so an archive is reclaimable only when the
-    # mod it belongs to is accounted for.
-    by_filename = {ms.filename: ms for ms in state.mods.values()}
+    # A mod's archive lives at one fixed place: mods_dir / filename.
+    # Matching on basename alone let a same-named file in any subfolder
+    # be reclaimed as if it were that archive.
+    claimed: dict[Path, ModState] = {}
+    for ms in state.mods.values():
+        if not ms.filename or not _is_safe_relative(ms.filename):
+            continue
+        claimed[mods_dir / ms.filename] = ms
 
     for path in sorted(mods_dir.rglob("*")):
         if not path.is_file():
@@ -71,7 +76,7 @@ def plan_gc(mods_dir: Path) -> GcPlan:
             # file download is its own payload and is never a candidate.
             continue
 
-        mod = by_filename.get(path.name)
+        mod = claimed.get(path)
         if mod is None:
             plan.kept.append((path, "not claimed by any mod in state"))
             continue
@@ -85,7 +90,10 @@ def plan_gc(mods_dir: Path) -> GcPlan:
         # only copy. The archive itself does not count as payload: a
         # retained archive whose attribution is just its own name is
         # still the only copy.
-        payload_names = [f for f in mod.contributed_files if f != path.name]
+        payload_names = [
+            f for f in mod.contributed_files
+            if f != mod.filename and _is_safe_relative(f)
+        ]
         if not any((mods_dir / f).is_file() for f in payload_names):
             plan.kept.append((path, "the archive is the only copy of this mod"))
             continue
