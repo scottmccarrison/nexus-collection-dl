@@ -972,8 +972,8 @@ class _ShellSession:
         deployed automatically.
         """
         from .deploy import DeployError, classify_files
+        from .service import resolve_game_root
         from .state import CollectionState
-        from .steam import find_game_dir
 
         try:
             state = CollectionState(target.path)
@@ -982,11 +982,25 @@ class _ShellSession:
             self._emit_error(str(e) or type(e).__name__)
             return
 
-        game_dir: Path | None = None
-        if state.game_dir:
-            game_dir = Path(state.game_dir)
-        if game_dir is None:
-            game_dir = find_game_dir(state.game_domain)
+        # Same trust priority as the CLI: flag, config, detection. A root
+        # that is only in the state file cannot be verified, so the user
+        # is asked before it is used.
+        root = resolve_game_root(None, state.game_dir, state.game_domain)
+        for w in root.warnings:
+            self._emit_warning(w)
+        game_dir = root.path
+        if root.needs_confirmation:
+            answer = self._confirm(
+                f"Use {_safe_text(str(game_dir))} as the game directory? "
+                "It came from this collection's state file and cannot be "
+                f"verified. [{_CONFIRM_YES}/no]: "
+            )
+            if answer != _CONFIRM_YES:
+                self._emit_error(
+                    "Could not verify a game directory. Re-run with the "
+                    "directory spelled out."
+                )
+                return
         if game_dir is None:
             self._emit_error("Could not find game directory.")
             return

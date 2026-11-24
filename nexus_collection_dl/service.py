@@ -698,6 +698,116 @@ def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
             mod["expected_md5"] = md5
 
 
+@dataclass
+class ResolvedRoot:
+    """Where a deploy/undeploy may act, and how that was established.
+
+    ``needs_confirmation`` is True when the only candidate is the state
+    file's own value. The state cannot vouch for itself: a crafted
+    ``game_dir`` passes every containment check because containment runs
+    against that base. A caller that cannot ask must refuse rather than
+    act on it.
+    """
+
+    path: Path | None
+    needs_confirmation: bool
+    source: str  # "flag" | "config" | "detected" | "state" | "none"
+    warnings: list[str] = field(default_factory=list)
+
+
+def resolve_game_root(
+    explicit: Path | None,
+    state_game_dir: str,
+    game_domain: str,
+) -> ResolvedRoot:
+    """Resolve the game root by trust priority.
+
+    explicit flag > the user config's entry for this game > Steam
+    detection > the state file's value. The state file is last and never
+    a source of truth on its own: it is the one input a shared collection
+    folder hands over that we did not write this run.
+
+    A resolved root that disagrees with the state is used, and the
+    disagreement is reported: the config and the machine know where the
+    game is, the state only claims where a past deploy put files.
+    """
+    from .config import UserConfig
+
+    state_val = Path(state_game_dir) if state_game_dir else None
+
+    def _note(resolved: Path, source: str) -> ResolvedRoot:
+        warnings: list[str] = []
+        if state_val is not None and resolved != state_val:
+            warnings.append(
+                f"Game directory {resolved} (from {source}) does not match "
+                f"the one recorded in this collection's state "
+                f"({state_val}). Using {resolved}."
+            )
+        return ResolvedRoot(resolved, False, source, warnings)
+
+    if explicit is not None:
+        return _note(explicit, "flag")
+
+    cfg = UserConfig.load()
+    for game in cfg.games:
+        if isinstance(game, dict) and game.get("domain") == game_domain:
+            configured = game.get("game_dir")
+            if configured:
+                return _note(Path(configured), "config")
+
+    detected = find_game_dir(game_domain) if game_domain else None
+    if detected is not None:
+        return _note(detected, "detected")
+
+    if state_val is not None:
+        return ResolvedRoot(state_val, True, "state")
+    return ResolvedRoot(None, False, "none")
+
+
+def resolve_proton_prefix(
+    explicit: Path | None,
+    state_prefix: str,
+    game_domain: str,
+) -> ResolvedRoot:
+    """Resolve the Proton prefix on the same priority as the game root.
+
+    A missing prefix is not an error: plenty of games are not Proton
+    games. The state file's value is again the last resort and needs
+    confirmation.
+    """
+    from .config import UserConfig
+
+    state_val = Path(state_prefix) if state_prefix else None
+
+    def _note(resolved: Path, source: str) -> ResolvedRoot:
+        warnings: list[str] = []
+        if state_val is not None and resolved != state_val:
+            warnings.append(
+                f"Proton prefix {resolved} (from {source}) does not match "
+                f"the one recorded in this collection's state "
+                f"({state_val}). Using {resolved}."
+            )
+        return ResolvedRoot(resolved, False, source, warnings)
+
+    if explicit is not None:
+        return _note(explicit, "flag")
+
+    cfg = UserConfig.load()
+    for game in cfg.games:
+        if isinstance(game, dict) and game.get("domain") == game_domain:
+            configured = game.get("prefix")
+            if configured:
+                return _note(Path(configured), "config")
+
+    detected = find_proton_prefix(game_domain) if game_domain else None
+    if detected is not None:
+        return _note(detected, "detected")
+
+    if state_val is not None:
+        return ResolvedRoot(state_val, True, "state")
+    return ResolvedRoot(None, False, "none")
+
+
 def _validate_no_overlap(mods_dir: Path, game_dir: Path) -> str | None:
     """Reject staging/game directory overlap. Returns an error message or None.
 
@@ -2369,27 +2479,70 @@ class ModManagerService:
             state.load()
             game_domain = state.game_domain
 
-            # Resolve game directory
-            if game_dir is None and state.game_dir:
-                game_dir = Path(state.game_dir)
+            # Resolve the game root and Proton prefix by trust priority:
+            # explicit flag, then the user config, then detection. The
+            # state file is the last resort and never a source of truth
+            # on its own (see resolve_game_root). A caller that cannot
+            # confirm must pass the root explicitly.
+            progress("detect", 0.05, "Resolving game directory...")
+            root = resolve_game_root(game_dir, state.game_dir, game_domain)
+            game_dir = root.path
+            deploy_warnings: list[str] = list(root.warnings)
+            if root.needs_confirmation:
+                return DeployResult(
+                    0, [],
+                    [
+                        (
+                            f"The only game directory on record is "
+                            f"{game_dir}, from this collection's state "
+                            "file. That value cannot be verified. Pass "
+                            "--game-dir to name the directory yourself."
+                        )
+                    ],
+                    str(game_dir or ""),
+                    False,
+                    warnings=deploy_warnings,
+                )
             if game_dir is None:
-                progress("detect", 0.05, "Detecting game directory from Steam...")
-                game_dir = find_game_dir(game_domain)
-                if game_dir is None:
-                    return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False, warnings=[])
+                return DeployResult(
+                    0, [],
+                    ["Could not find game directory. Use game_dir param."],
+                    "",
+                    False,
+                    warnings=deploy_warnings,
+                )
 
             if not game_dir.exists():
-                return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=[])
+                return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=deploy_warnings)
 
             overlap_error = _validate_no_overlap(mods_dir, game_dir)
             if overlap_error:
-                return DeployResult(0, [], [overlap_error], str(game_dir), False, warnings=[])
+                return DeployResult(0, [], [overlap_error], str(game_dir), False, warnings=deploy_warnings)
 
-            # Trusted roots for recovery come from configuration only (never
-            # from journal content): the resolved game dir plus any recorded
-            # game dir/prefix from previous runs.
+            prefix_root = resolve_proton_prefix(prefix, state.proton_prefix, game_domain)
+            prefix = prefix_root.path
+            deploy_warnings.extend(prefix_root.warnings)
+            if prefix_root.needs_confirmation:
+                return DeployResult(
+                    0, [],
+                    [
+                        (
+                            f"The only Proton prefix on record is "
+                            f"{prefix}, from this collection's state "
+                            "file. That value cannot be verified. Pass "
+                            "--prefix to name it yourself."
+                        )
+                    ],
+                    str(game_dir),
+                    False,
+                    warnings=deploy_warnings,
+                )
+
+            # Trusted roots for recovery are the roots we just resolved,
+            # never raw state values: a crafted game_dir in state must not
+            # become a recovery root any more than a write root.
             recovery_roots: list[Path] = []
-            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+            for candidate in (game_dir, prefix):
                 if candidate:
                     p = Path(candidate)
                     if p not in recovery_roots:
@@ -2405,14 +2558,6 @@ class ModManagerService:
                 state.save()
                 journal.clear()
 
-            # Resolve Proton prefix before the checks, so they report on
-            # the value this deploy will actually use. The parameter wins
-            # over state, and auto-detection is the last resort.
-            if prefix is None and state.proton_prefix:
-                prefix = Path(state.proton_prefix)
-            if prefix is None:
-                prefix = find_proton_prefix(game_domain)
-
             # Pre-deploy validation.
             #
             # Proton/Wine cannot read Linux symlinks that cross outside
@@ -2424,7 +2569,7 @@ class ModManagerService:
             if proton_symlink_override:
                 method = "copy"
             check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
-            deploy_warnings = [w.message for w in check_warnings]
+            deploy_warnings = deploy_warnings + [w.message for w in check_warnings]
             deploy_warnings.extend(reports)
             if proton_symlink_override:
                 deploy_warnings.append(
@@ -2537,7 +2682,7 @@ class ModManagerService:
 
             backups = BackupStore(mods_dir)
             roots = []
-            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+            for candidate in (game_dir, prefix):
                 if candidate:
                     p = Path(candidate)
                     if p not in roots:
@@ -2678,7 +2823,13 @@ class ModManagerService:
                 warnings=deploy_warnings,
             )
 
-    def undeploy(self, mods_dir: Path) -> int:
+    def undeploy(
+        self,
+        mods_dir: Path,
+        *,
+        game_dir: Path | None = None,
+        prefix: Path | None = None,
+    ) -> int:
         """Remove all deployed mod files and restore backed-up originals.
 
         Returns the number of cleared deployment entries on full success.
@@ -2686,12 +2837,47 @@ class ModManagerService:
         refused or failed, carrying the removed count plus the refused and
         failed paths, so callers never report a partial undeploy as clean.
         Refused/failed entries stay in state so the operation is retryable.
+
+        The roots these deletions are contained against are resolved by
+        trust priority (explicit flag, user config, detection), never read
+        from the state file as a source of truth. A crafted ``game_dir``
+        would otherwise turn the whole filesystem into a trusted root and
+        anything whose fingerprint still matches would be unlinked. Pass
+        the root explicitly when the collection's state is the only record
+        of where it was deployed.
         """
         with CollectionLock(mods_dir):
             state = CollectionState(mods_dir)
             state.load()
 
-            roots = [Path(p) for p in (state.game_dir, state.proton_prefix) if p]
+            resolved = resolve_game_root(
+                game_dir, state.game_dir, state.game_domain
+            )
+            if resolved.needs_confirmation:
+                raise StateError(
+                    f"The only game directory on record is {resolved.path}, "
+                    "from this collection's state file. That value cannot "
+                    "be verified. Pass --game-dir to name the directory "
+                    "yourself."
+                )
+            prefix_resolved = resolve_proton_prefix(
+                prefix, state.proton_prefix, state.game_domain
+            )
+            if prefix_resolved.needs_confirmation:
+                raise StateError(
+                    f"The only Proton prefix on record is "
+                    f"{prefix_resolved.path}, from this collection's state "
+                    "file. That value cannot be verified. Pass --prefix to "
+                    "name it yourself."
+                )
+            roots = [
+                Path(p) for p in (resolved.path, prefix_resolved.path) if p
+            ]
+            if not roots:
+                raise StateError(
+                    "Could not resolve a game directory to contain the "
+                    "removal. Pass --game-dir to name the directory."
+                )
             ownership, reports = recover_ownership(state.deployed_files, mods_dir, roots)
             journal = DeployJournal(mods_dir)
             if journal.exists() or reports:
