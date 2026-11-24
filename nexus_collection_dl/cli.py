@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 from rich.console import Console
@@ -328,7 +328,7 @@ def _fail(
     hint: str | None = None,
     result: Any = None,
     code: str | None = None,
-) -> None:
+) -> NoReturn:
     """Report a failure and exit 1.
 
     In JSON mode this is the only thing written to stdout: an error envelope
@@ -1634,6 +1634,24 @@ def _format_picks(picks: list, limit: int = 3) -> str:
     return f"{shown} (+{len(names) - limit} more)"
 
 
+def _ensure_collections_root(raw: Path, *, create: bool) -> Path:
+    """Resolve a collections root, refusing anything that is not a directory.
+
+    A path that exists but is not a directory is always refused: writing
+    config for one is how a typo becomes a broken install. A missing
+    directory is only created when the caller says so, which is what the
+    interactive prompt confirms and what an explicit flag means.
+    """
+    if raw.is_dir():
+        return raw
+    if raw.exists():
+        raise ValueError(f"{raw} is not a directory")
+    if not create:
+        raise ValueError(f"{raw} does not exist")
+    raw.mkdir(parents=True, exist_ok=True)
+    return raw
+
+
 @main.command()
 @click.option(
     "--non-interactive",
@@ -1715,6 +1733,13 @@ def setup(
                     "prompts there is nothing to guess from"
                 ),
             )
+        try:
+            # An explicit flag is explicit intent: create what was named.
+            collections_root = _ensure_collections_root(
+                collections_root, create=True
+            )
+        except ValueError as e:
+            _fail(ctx, e)
         games: list[dict] = []
         for spec in game:
             if "=" not in spec:
@@ -1760,8 +1785,35 @@ def setup(
     root = collections_root
     if root is None:
         suggested = Path.home() / "nexus-collections"
-        answer = click.prompt("Collections root", default=str(suggested), show_default=True)
-        root = Path(answer)
+        while True:
+            answer = click.prompt(
+                "Collections root", default=str(suggested), show_default=True
+            )
+            candidate = Path(answer)
+            if candidate.is_dir():
+                root = candidate
+                break
+            if candidate.exists():
+                console.print(
+                    f"[red]Error:[/red] {escape(str(candidate))} is not a "
+                    "directory. Enter a directory."
+                )
+                continue
+            if click.confirm(
+                f"{escape(str(candidate))} does not exist. Create it?",
+                default=True,
+            ):
+                try:
+                    root = _ensure_collections_root(candidate, create=True)
+                    break
+                except OSError as e:
+                    console.print(
+                        f"[red]Error:[/red] could not create "
+                        f"{escape(str(candidate))}: {escape(exception_reason(e))}"
+                    )
+                    continue
+            # Declined: ask again rather than writing a root that is not
+            # there.
 
     games = []
     for g in detected:
