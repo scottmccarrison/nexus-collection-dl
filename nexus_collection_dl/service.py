@@ -199,6 +199,17 @@ def _fomod_config_record(archive_path: Path) -> dict[str, str] | None:
     return {"member": member, "xml": text}
 
 
+def _config_has_choices(config: "ModuleConfig") -> bool:
+    """Does this installer offer anything to choose by hand?
+
+    A config with only ``conditionalFileInstalls`` and ``required`` files
+    has nothing to decide: its install is fully determined by its
+    conditions. An empty selection is the right answer for one, and
+    demanding choices makes the mod uninstallable.
+    """
+    return any(step.groups for step in config.steps)
+
+
 def _nxm_fomod_blocker(archive_path: Path) -> str | None:
     """A message when this archive must not be extracted without choices.
 
@@ -226,6 +237,10 @@ def _nxm_fomod_blocker(archive_path: Path) -> str | None:
         # every uninspectable download would stop plain mods too.
         return None
     if config is None:
+        return None
+    if not _config_has_choices(config):
+        # Nothing to choose, so nothing to block. A conditional-only
+        # installer is decided by its conditions, not by the user.
         return None
     parent = archive_path.parent
     return (
@@ -255,6 +270,10 @@ def _resolve_fomod_picks(
     nothing at all, refuse: guessing is the harm this exists to stop.
     """
     from .fomod_select import Pick, PickError, normalize_picks, picks_to_selections
+
+    if not _config_has_choices(config):
+        # Nothing to choose: an empty selection is the install.
+        return []
 
     if provided:
         return normalize_picks(provided, config)
@@ -2674,7 +2693,7 @@ class ModManagerService:
             resolved = _resolve_fomod_picks(
                 config, archive.name, picks, mod.fomod_picks, on_fomod_prompt
             )
-            if not resolved:
+            if not resolved and _config_has_choices(config):
                 raise FomodChoicesError(archive.name)
 
             final_files = extract_archive(archive, mods_dir)
