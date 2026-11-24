@@ -195,6 +195,9 @@ def shell_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "capability_warnings", list)
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # A machine with a real Steam library must not decide where these
+    # tests deploy; root resolution would silently agree with it.
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
@@ -2307,16 +2310,28 @@ def test_vanished_collection_dir_noted_no_prompt(shell_env, tmp_path):
 
 
 def _setup_deploy_collection(tmp_path, name="Clean Visuals"):
-    """Root with one collection that has a game_dir and a deployable file."""
+    """Root with one collection that has a game_dir and a deployable file.
+
+    The game directory is established through the user config, not
+    through the state file: state alone is no longer a source of truth
+    for where a deploy may write. This is what a configured user looks
+    like, so the deploy flow does not stop to ask.
+    """
     root = make_root(tmp_path, (name, []))
     coll = root / name
     game = tmp_path / "game"
     game.mkdir()
-    # Give the state a game_dir so _deploy_flow skips find_game_dir.
     state = CollectionState(coll)
     state.load()
     state.game_dir = str(game)
     state.save()
+    cfg_dir = tmp_path / "xdg-config" / "nexus-dl"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(json.dumps({
+        "collections_root": str(root),
+        "games": [{"domain": GAME, "game_dir": str(game)}],
+        "defaults": {},
+    }))
     # One deployable file (not hidden).
     (coll / "Data").mkdir()
     (coll / "Data" / "test.esp").write_bytes(b"fake")
