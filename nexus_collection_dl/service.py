@@ -707,12 +707,25 @@ class ResolvedRoot:
     ``game_dir`` passes every containment check because containment runs
     against that base. A caller that cannot ask must refuse rather than
     act on it.
+
+    ``problem`` is set when the caller named a root that cannot be one:
+    a path that is not there, or a path that is not a directory. Naming
+    a root is a statement about where to act, so a bad one is an error
+    and not an invitation to fall back to something else.
     """
 
     path: Path | None
     needs_confirmation: bool
     source: str  # "flag" | "config" | "detected" | "state" | "none"
     warnings: list[str] = field(default_factory=list)
+    problem: str | None = None
+
+
+def _bad_root(root: Path, what: str) -> str:
+    """Why this path cannot be a root, said the way a person reads it."""
+    if not root.exists():
+        return f"{what} {root} does not exist."
+    return f"{what} {root} is not a directory."
 
 
 def resolve_game_root(
@@ -727,6 +740,13 @@ def resolve_game_root(
     a source of truth on its own: it is the one input a shared collection
     folder hands over that we did not write this run.
 
+    A root that is not an existing directory is never used. An explicit
+    flag naming one is an error: the user said where to act and that
+    place is not usable, so falling back would send the command
+    somewhere they did not ask for. A stale config entry is different -
+    nobody named it this run - so it is reported and the next source
+    gets a turn.
+
     A resolved root that disagrees with the state is used, and the
     disagreement is reported: the config and the machine know where the
     game is, the state only claims where a past deploy put files.
@@ -734,34 +754,48 @@ def resolve_game_root(
     from .config import UserConfig
 
     state_val = Path(state_game_dir) if state_game_dir else None
+    warnings: list[str] = []
 
     def _note(resolved: Path, source: str) -> ResolvedRoot:
-        warnings: list[str] = []
         if state_val is not None and resolved != state_val:
             warnings.append(
                 f"Game directory {resolved} (from {source}) does not match "
                 f"the one recorded in this collection's state "
                 f"({state_val}). Using {resolved}."
             )
-        return ResolvedRoot(resolved, False, source, warnings)
+        return ResolvedRoot(resolved, False, source, list(warnings))
 
     if explicit is not None:
+        if not explicit.is_dir():
+            return ResolvedRoot(
+                None, False, "flag",
+                problem=_bad_root(explicit, "Game directory"),
+            )
         return _note(explicit, "flag")
 
     cfg = UserConfig.load()
     for game in cfg.games:
-        if isinstance(game, dict) and game.get("domain") == game_domain:
-            configured = game.get("game_dir")
-            if configured:
-                return _note(Path(configured), "config")
+        if not (isinstance(game, dict) and game.get("domain") == game_domain):
+            continue
+        configured = game.get("game_dir")
+        if not configured:
+            continue
+        candidate = Path(configured)
+        if candidate.is_dir():
+            return _note(candidate, "config")
+        warnings.append(
+            f"Game directory {candidate} (from config) is not an "
+            "existing directory; ignoring it."
+        )
+        break
 
     detected = find_game_dir(game_domain) if game_domain else None
-    if detected is not None:
+    if detected is not None and detected.is_dir():
         return _note(detected, "detected")
 
     if state_val is not None:
-        return ResolvedRoot(state_val, True, "state")
-    return ResolvedRoot(None, False, "none")
+        return ResolvedRoot(state_val, True, "state", list(warnings))
+    return ResolvedRoot(None, False, "none", list(warnings))
 
 
 def resolve_proton_prefix(
@@ -772,40 +806,56 @@ def resolve_proton_prefix(
     """Resolve the Proton prefix on the same priority as the game root.
 
     A missing prefix is not an error: plenty of games are not Proton
-    games. The state file's value is again the last resort and needs
+    games. But one the caller named has to be usable, because a prefix
+    is not only a place to write - it also decides how the deploy runs.
+    The state file's value is again the last resort and needs
     confirmation.
     """
     from .config import UserConfig
 
     state_val = Path(state_prefix) if state_prefix else None
+    warnings: list[str] = []
 
     def _note(resolved: Path, source: str) -> ResolvedRoot:
-        warnings: list[str] = []
         if state_val is not None and resolved != state_val:
             warnings.append(
                 f"Proton prefix {resolved} (from {source}) does not match "
                 f"the one recorded in this collection's state "
                 f"({state_val}). Using {resolved}."
             )
-        return ResolvedRoot(resolved, False, source, warnings)
+        return ResolvedRoot(resolved, False, source, list(warnings))
 
     if explicit is not None:
+        if not explicit.is_dir():
+            return ResolvedRoot(
+                None, False, "flag",
+                problem=_bad_root(explicit, "Proton prefix"),
+            )
         return _note(explicit, "flag")
 
     cfg = UserConfig.load()
     for game in cfg.games:
-        if isinstance(game, dict) and game.get("domain") == game_domain:
-            configured = game.get("prefix")
-            if configured:
-                return _note(Path(configured), "config")
+        if not (isinstance(game, dict) and game.get("domain") == game_domain):
+            continue
+        configured = game.get("prefix")
+        if not configured:
+            continue
+        candidate = Path(configured)
+        if candidate.is_dir():
+            return _note(candidate, "config")
+        warnings.append(
+            f"Proton prefix {candidate} (from config) is not an existing "
+            "directory; ignoring it."
+        )
+        break
 
     detected = find_proton_prefix(game_domain) if game_domain else None
-    if detected is not None:
+    if detected is not None and detected.is_dir():
         return _note(detected, "detected")
 
     if state_val is not None:
-        return ResolvedRoot(state_val, True, "state")
-    return ResolvedRoot(None, False, "none")
+        return ResolvedRoot(state_val, True, "state", list(warnings))
+    return ResolvedRoot(None, False, "none", list(warnings))
 
 
 def _validate_no_overlap(mods_dir: Path, game_dir: Path) -> str | None:
@@ -2183,6 +2233,11 @@ class ModManagerService:
         """
         if (file_id is None) == (mod_id is None):
             raise ValueError("exactly one of file_id or mod_id is required")
+        if mod_id == 0:
+            # 0 is the "unknown" marker from_dict leaves behind, not a
+            # Nexus mod page. Matching it would act on every legacy entry
+            # at once, which is never what a caller asking for id 0 means.
+            raise ValueError("0 is not a real mod id")
 
         warnings: list[str] = []
         with CollectionLock(mods_dir):
@@ -2488,6 +2543,11 @@ class ModManagerService:
             root = resolve_game_root(game_dir, state.game_dir, game_domain)
             game_dir = root.path
             deploy_warnings: list[str] = list(root.warnings)
+            if root.problem:
+                return DeployResult(
+                    0, [], [root.problem], str(game_dir or ""), False,
+                    warnings=deploy_warnings,
+                )
             if root.needs_confirmation:
                 return DeployResult(
                     0, [],
@@ -2522,6 +2582,11 @@ class ModManagerService:
             prefix_root = resolve_proton_prefix(prefix, state.proton_prefix, game_domain)
             prefix = prefix_root.path
             deploy_warnings.extend(prefix_root.warnings)
+            if prefix_root.problem:
+                return DeployResult(
+                    0, [], [prefix_root.problem], str(game_dir or ""), False,
+                    warnings=deploy_warnings,
+                )
             if prefix_root.needs_confirmation:
                 return DeployResult(
                     0, [],
@@ -2565,7 +2630,12 @@ class ModManagerService:
             # files the game sees by name but cannot load. Force copy
             # mode whenever a Proton prefix is in play.
             method = "copy" if use_copy else "symlink"
-            proton_symlink_override = method == "symlink" and prefix
+            # A prefix is not just a place to write: it is what makes
+            # Proton unable to follow symlinks. Only a real directory
+            # gets to change the method; anything else is not a prefix.
+            proton_symlink_override = (
+                method == "symlink" and prefix is not None and prefix.is_dir()
+            )
             if proton_symlink_override:
                 method = "copy"
             check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
