@@ -1468,9 +1468,10 @@ class _ShellSession:
                 "and all its files?"
             )
             self._emit(
-                "this removes the mod from the collection and it stays "
-                "removed through sync/update; files on disk are kept; "
-                "re-add restores it"
+                "this removes the mod from the collection and from disk: "
+                "the state entry, the files it added, and its archive. "
+                "It stays removed through sync/update; re-adding downloads "
+                "it again."
             )
             answer = self._confirm(
                 f"Remove '{_prompt_name(summary.name)}'? [yes/no]: "
