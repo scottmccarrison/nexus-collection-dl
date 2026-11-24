@@ -248,6 +248,7 @@ def test_deploy_dry_run_carries_the_plan_warnings(tmp_path):
     }
     state.save()
 
+    (tmp_path / "game").mkdir()
     r = invoke(
         ["deploy", str(mods), "--game-dir", str(tmp_path / "game"), "--dry-run"],
         json_mode=True,

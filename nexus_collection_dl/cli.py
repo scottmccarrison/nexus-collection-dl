@@ -420,6 +420,14 @@ def sync(
     COLLECTION_URL: URL of the Nexus Mods collection
     MODS_DIR: Directory to download mods to
     """
+    # This path is about to be created. One that is already a file is a
+    # typo, and the mkdir() underneath would throw at the user instead.
+    if mods_dir.exists() and not mods_dir.is_dir():
+        _fail(
+            ctx,
+            ValueError(f"{mods_dir} is not a directory"),
+            hint="Point MODS_DIR at a folder; sync creates it if needed.",
+        )
     svc = ctx.obj["service"]
     try:
         result = svc.sync(
@@ -1297,6 +1305,12 @@ def remove(
             ValueError("exactly one of --file-id or --mod-id is required"),
             hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
         )
+    if mod_id == 0:
+        _fail(
+            ctx,
+            ValueError("0 is not a real mod id"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
 
     if dry_run:
         try:
@@ -1364,6 +1378,15 @@ def _set_mod_enabled(
         _fail(
             ctx,
             ValueError("exactly one of --file-id or --mod-id is required"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+    if mod_id == 0:
+        # 0 is the "unknown" marker from_dict leaves behind, not a Nexus
+        # mod page. Matching it would turn one flag into a bulk change on
+        # exactly the entries that predate mod ids.
+        _fail(
+            ctx,
+            ValueError("0 is not a real mod id"),
             hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
         )
     try:
