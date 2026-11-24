@@ -2471,6 +2471,10 @@ class ModManagerService:
                 on_progress=_file_progress,
                 expected_plugins=expected_plugins,
             )
+            # deploy() reports what it had to change to land the files
+            # (case fixups, case collisions). Those are the user's to
+            # see; dropping them here made the rename silent.
+            deploy_warnings.extend(result.warnings)
 
             # Write plugins.txt and the game INI through the same tracking,
             # but only when the file deployment itself had no failures.

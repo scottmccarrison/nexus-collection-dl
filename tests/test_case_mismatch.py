@@ -153,3 +153,79 @@ def test_matching_case_is_not_renamed(tmp_path):
     deployed = {Path(d.dest).name for d in result.deployed}
     assert deployed == {"foo.esp"}
     assert result.warnings == [], result.warnings
+
+
+# -- the service path ------------------------------------------------------
+#
+# The rename and its warning live in deploy(). The CLI and the shell go
+# through ModManagerService.deploy, which used to return its own warning
+# list and drop deploy()'s. The rename landed, the report did not.
+
+
+def test_service_deploy_reports_the_case_fixup(tmp_path):
+    """The rename must reach the user, not just the filesystem."""
+    from nexus_collection_dl.service import ModManagerService
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    (mods / "Foo.esp").write_bytes(b"PLUGIN")
+
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {"mod_id": 1, "mod_name": "Case Mod", "file_id": 11,
+         "filename": "casemod.zip", "version": "1"}
+    )
+    state.mods[11].contributed_files = ["Foo.esp"]
+    # The load order knows the plugin as foo.esp (lower case).
+    state.manifest_data = {
+        "plugins": [{"filename": "foo.esp", "name": "foo.esp"}],
+        "mod_rules": [],
+        "plugin_rules": [],
+        "mod_phases": {},
+        "logical_name_to_mod_id": {},
+        "mod_choices": {},
+    }
+    state.save()
+
+    game = tmp_path / "game"
+    game.mkdir()
+    svc = ModManagerService(api_key="test-key-unused")
+    result = svc.deploy(mods, game_dir=game, use_copy=True)
+
+    assert result.errors == [], result.errors
+    # The rename happened...
+    assert (game / "Data" / "foo.esp").is_file()
+    assert not (game / "Data" / "Foo.esp").exists()
+    # ...and it was reported.
+    assert any("renamed" in w for w in result.warnings), result.warnings
+
+
+def test_service_deploy_reports_a_case_collision(tmp_path):
+    """Two names that differ only in case: the warning must reach the user."""
+    from nexus_collection_dl.service import ModManagerService
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    (mods / "Foo.esp").write_bytes(b"ONE")
+    (mods / "foo.esp").write_bytes(b"TWO")
+
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {"mod_id": 1, "mod_name": "Case Mod", "file_id": 11,
+         "filename": "casemod.zip", "version": "1"}
+    )
+    state.mods[11].contributed_files = ["Foo.esp", "foo.esp"]
+    state.save()
+
+    game = tmp_path / "game"
+    game.mkdir()
+    svc = ModManagerService(api_key="test-key-unused")
+    result = svc.deploy(mods, game_dir=game, use_copy=True)
+
+    assert any("case-collides" in w or "case" in w.lower() for w in result.warnings), (
+        result.warnings
+    )
