@@ -192,6 +192,7 @@ def test_setup_interactive_asks_and_writes(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
     _fake_installer(monkeypatch)
 
+    (tmp_path / "mods").mkdir()
     r = CliRunner().invoke(
         cli_module.main,
         ["setup"],
@@ -210,6 +211,7 @@ def test_setup_interactive_offers_detected_games(tmp_path, monkeypatch):
     steam = _fake_steam(tmp_path, {"489830": "Skyrim Special Edition"})
     monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(steam))
 
+    (tmp_path / "mods").mkdir()
     r = CliRunner().invoke(
         cli_module.main,
         ["setup"],
@@ -294,6 +296,7 @@ def test_setup_interactive_offers_the_handler(tmp_path, monkeypatch):
     monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
     monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
     calls = _fake_installer(monkeypatch)
+    (tmp_path / "mods").mkdir()
 
     r = CliRunner().invoke(
         cli_module.main,
@@ -311,6 +314,7 @@ def test_setup_interactive_can_decline_the_handler(tmp_path, monkeypatch):
     monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
     monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
     calls = _fake_installer(monkeypatch)
+    (tmp_path / "mods").mkdir()
 
     r = CliRunner().invoke(
         cli_module.main,
@@ -343,3 +347,97 @@ def test_handler_install_is_idempotent_across_setup_runs(tmp_path, monkeypatch):
         )
         assert r.exit_code == 0, r.output
     assert calls == ["install", "install"]
+
+
+# ---------------------------------------------------------------------------
+# The collections root has to be a real directory
+#
+# The prompt took any string. Typing /quit wrote /quit into config and
+# reported "Configured", and the next run opened the shell against a
+# root that is not a directory.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_rejects_a_root_that_is_a_file(tmp_path, monkeypatch):
+    """A file is not a collections root. Say so and ask again."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    _fake_installer(monkeypatch)
+
+    not_a_dir = tmp_path / "notes.txt"
+    not_a_dir.write_text("hello")
+    good = tmp_path / "mods"
+    good.mkdir()
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup"],
+        input=f"{not_a_dir}\n{good}\nn\n",
+    )
+    assert r.exit_code == 0, r.output
+    assert "not a directory" in r.output.lower()
+    cfg = UserConfig.load()
+    assert cfg.collections_root == str(good)
+
+
+def test_setup_confirms_before_creating_a_missing_root(tmp_path, monkeypatch):
+    """A path that does not exist is not silently created.
+
+    This is the /quit case: the answer is shown back and the user gets
+    to say no before anything is written.
+    """
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    _fake_installer(monkeypatch)
+
+    good = tmp_path / "mods"
+    good.mkdir()
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup"],
+        input=f"/quit\nn\n{good}\nn\n",
+    )
+    assert r.exit_code == 0, r.output
+    assert "/quit" in r.output
+    assert "does not exist" in r.output.lower()
+    cfg = UserConfig.load()
+    assert cfg.collections_root == str(good)
+    assert not Path("/quit").exists(), "the typo must not be created"
+
+
+def test_setup_creates_the_root_when_the_user_says_so(tmp_path, monkeypatch):
+    """Creating is allowed, it just has to be asked for."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setattr(cli_module, "_is_interactive", lambda: True)
+    _fake_installer(monkeypatch)
+
+    target = tmp_path / "new" / "mods"
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup"],
+        input=f"{target}\ny\nn\n",
+    )
+    assert r.exit_code == 0, r.output
+    assert target.is_dir()
+    cfg = UserConfig.load()
+    assert cfg.collections_root == str(target)
+
+
+def test_setup_non_interactive_rejects_a_root_that_is_a_file(tmp_path, monkeypatch):
+    """The harness path validates too: no prompts, but no nonsense."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    not_a_dir = tmp_path / "notes.txt"
+    not_a_dir.write_text("hello")
+
+    r = CliRunner().invoke(
+        cli_module.main,
+        ["setup", "--non-interactive", "--collections-root", str(not_a_dir)],
+    )
+    assert r.exit_code != 0
+    assert "not a directory" in r.output.lower()
+    assert not UserConfig.load().is_configured()
