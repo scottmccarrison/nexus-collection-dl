@@ -511,7 +511,10 @@ def _offer_nxm_mapping(ctx: click.Context, collection_dir: Path | None) -> None:
         return
 
     existing = HandlerConfig.load().mappings.get(game_domain, [])
-    if str(collection_dir.resolve()) in existing:
+    if any(
+        (e.get("path") if isinstance(e, dict) else e) == str(collection_dir.resolve())
+        for e in existing
+    ):
         return
 
     command = (
@@ -2455,9 +2458,13 @@ def handler_status(ctx: click.Context) -> None:
         table = Table(title="Game mappings")
         table.add_column("Game", style="cyan")
         table.add_column("Collection directory", style="green")
+        table.add_column("Name", style="dim")
         for game, dirs in sorted(info["mappings"].items()):
-            for directory in dirs:
-                table.add_row(game, directory)
+            for entry in dirs:
+                if isinstance(entry, dict):
+                    table.add_row(game, entry.get("path", ""), entry.get("name", ""))
+                else:
+                    table.add_row(game, entry, "")
         console.print(table)
     else:
         console.print(

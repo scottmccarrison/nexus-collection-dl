@@ -2083,11 +2083,17 @@ class ModManagerService:
             # Warn, never block, when this mod's requirements are not
             # installed. Collections include their dependencies; `add`
             # takes one mod and has no idea what else it needs. The
-            # REST mod endpoint carries no requirements, so this is
-            # silent for standalone adds; it fires when the payload
-            # (GraphQL collection query, stored state) does carry them.
-            reqs = _requirements_from_mod_info(nexus_mod)
-            for req_id in missing_requirements(state, reqs):
+            # REST mod endpoint carries no requirements, so a GraphQL
+            # lookup supplies them; when that fails too, we stay silent
+            # rather than inventing an all-clear.
+            reqs = set(_requirements_from_mod_info(nexus_mod))
+            try:
+                reqs.update(self.api.get_mod_requirements(
+                    mod_info.game_domain, mod_info.mod_id,
+                ))
+            except Exception:  # noqa: S110 - best-effort, the warning is informational only
+                pass
+            for req_id in missing_requirements(state, sorted(reqs)):
                 add_warnings.append(
                     f"missing dependency: mod {req_id} is not installed"
                 )

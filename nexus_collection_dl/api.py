@@ -645,6 +645,40 @@ class NexusAPI:
         response = self._request("get", url)
         return self._handle_response(response)
 
+    def get_mod_requirements(self, game_domain: str, mod_id: int) -> list[int]:
+        """Requirement mod_ids for a standalone mod, via GraphQL.
+
+        The REST mod endpoint carries no requirements; this is the only
+        way to see what a mod needs before installing it. Two calls:
+        the game domain resolves to a numeric gameId, then the mod query
+        returns its requirement list.
+        """
+        game_data = self.graphql_query(
+            "query($d: String!) { game(domainName: $d) { id } }",
+            {"d": game_domain},
+        )
+        game = game_data.get("game") or {}
+        game_id = game.get("id")
+        if game_id is None:
+            return []
+        mod_data = self.graphql_query(
+            "query($g: ID!, $m: ID!) { mod(gameId: $g, modId: $m) "
+            "{ modRequirements { nexusRequirements { nodes { modId } } } } }",
+            {"g": str(game_id), "m": str(mod_id)},
+        )
+        mod = mod_data.get("mod") or {}
+        reqs = mod.get("modRequirements") or {}
+        nexus = reqs.get("nexusRequirements") or {}
+        nodes = nexus.get("nodes") or []
+        out: list[int] = []
+        for node in nodes:
+            if isinstance(node, dict) and "modId" in node:
+                try:
+                    out.append(int(node["modId"]))
+                except (TypeError, ValueError):
+                    continue
+        return out
+
     def validate_key(self) -> dict[str, Any]:
         """Validate API key and return user info."""
         url = f"{REST_BASE_URL}/users/validate.json"

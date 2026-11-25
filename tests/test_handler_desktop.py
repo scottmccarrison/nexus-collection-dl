@@ -489,7 +489,7 @@ def test_mapping_roundtrip_idempotent(tmp_path, cfg_path, monkeypatch):
     add_mapping(GAME, cdir)
     add_mapping(GAME, cdir)                    # idempotent
     cfg = HandlerConfig.load()
-    assert cfg.mappings[GAME] == [str(cdir)]
+    assert [e["path"] for e in cfg.mappings[GAME]] == [str(cdir)]
     assert remove_mapping(GAME) is True
     assert remove_mapping(GAME) is False
     assert HandlerConfig.load().mappings == {}
@@ -684,13 +684,13 @@ def test_relative_mapping_resolves_against_map_time_cwd(tmp_path, cfg_path, monk
     monkeypatch.chdir(cwd_a)
     add_mapping(GAME, os.path.relpath(cdir, cwd_a))
     stored = HandlerConfig.load().mappings[GAME][0]
-    assert os.path.isabs(stored)
-    assert Path(stored) == cdir.resolve()
+    assert os.path.isabs(stored["path"])
+    assert Path(stored["path"]) == cdir.resolve()
     # A desktop launch from an unrelated cwd must hit the same target
     cwd_b = tmp_path / "cwd-b"
     cwd_b.mkdir()
     monkeypatch.chdir(cwd_b)
-    assert resolve_collection_dir(GAME) == Path(stored)
+    assert resolve_collection_dir(GAME) == Path(stored["path"])
 
 
 def test_relative_config_entries_are_dropped(tmp_path, cfg_path, monkeypatch):

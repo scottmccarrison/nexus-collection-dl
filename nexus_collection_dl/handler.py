@@ -286,7 +286,7 @@ class HandlerConfig:
 
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path is not None else config_dir() / CONFIG_FILENAME
-        self.mappings: dict[str, list[str]] = {}
+        self.mappings: dict[str, list[dict[str, str]]] = {}
         self.desktop: dict[str, Any] = {}
 
     @classmethod
@@ -309,15 +309,22 @@ class HandlerConfig:
         if isinstance(mappings, dict):
             for game, dirs in mappings.items():
                 if isinstance(game, str) and isinstance(dirs, list):
-                    cfg.mappings[game.strip().lower()] = [
-                        # Absolute paths only: a relative entry (from a
-                        # hand-edited or pre-canonicalization config) would
-                        # resolve against whatever cwd the desktop-launched
-                        # handler happens to run in, so it is dropped and
-                        # the game reads as unmapped instead.
-                        d for d in dirs
-                        if isinstance(d, str) and Path(d).is_absolute()
-                    ]
+                    entries: list[dict[str, str]] = []
+                    for d in dirs:
+                        # Accept both the old string form and the new
+                        # {"path", "name"} form. A string entry has no
+                        # collection name to search by if it goes stale.
+                        if isinstance(d, str):
+                            if Path(d).is_absolute():
+                                entries.append({"path": d, "name": ""})
+                        elif isinstance(d, dict):
+                            path = d.get("path")
+                            if isinstance(path, str) and Path(path).is_absolute():
+                                entries.append({
+                                    "path": path,
+                                    "name": str(d.get("name") or ""),
+                                })
+                    cfg.mappings[game.strip().lower()] = entries
         desktop = data.get("desktop")
         if isinstance(desktop, dict):
             cfg.desktop = desktop
@@ -378,8 +385,8 @@ def add_mapping(game_domain: str, collection_dir: Path | str) -> HandlerConfig:
         )
     cfg = HandlerConfig.load()
     dirs = cfg.mappings.setdefault(game, [])
-    entry = str(directory)
-    if entry not in dirs:
+    entry = {"path": str(directory), "name": state.collection_name}
+    if not any(e.get("path") == entry["path"] for e in dirs):
         dirs.append(entry)
     cfg.save()
     return cfg
@@ -394,6 +401,30 @@ def remove_mapping(game_domain: str) -> bool:
     del cfg.mappings[game]
     cfg.save()
     return True
+
+
+def _find_moved_collection(parent: Path, name: str, game: str) -> Path | None:
+    """Search *parent* for a synced collection whose name matches.
+
+    Used when a mapping's stored path has gone stale: the user renamed or
+    moved the collection within the same parent directory. Returns the
+    matching directory, or None if there is no unambiguous match.
+    """
+    if not parent.is_dir():
+        return None
+    matches: list[Path] = []
+    for child in sorted(parent.iterdir()):
+        if not child.is_dir():
+            continue
+        if not (child / STATE_FILENAME).exists():
+            continue
+        try:
+            state = _load_collection_state(child)
+        except HandlerError:
+            continue
+        if state.collection_name == name and state.game_domain and state.game_domain.lower() == game:
+            matches.append(child)
+    return matches[0] if len(matches) == 1 else None
 
 
 def resolve_collection_dir(
@@ -440,8 +471,19 @@ def resolve_collection_dir(
     candidates: list[Path] = []
     stale: list[tuple[Path, str]] = []
     for entry in cfg.mappings.get(game, []):
-        directory = Path(entry)
+        # Normalize: old entries are strings, new entries are dicts.
+        if isinstance(entry, str):
+            entry = {"path": entry, "name": ""}
+        directory = Path(entry["path"])
+        entry_name = entry.get("name") or ""
         if not (directory / STATE_FILENAME).exists():
+            # The path is stale. If we know the collection name, search
+            # the parent directory for a collection with that name - the
+            # user may have renamed or moved it within the same root.
+            found = _find_moved_collection(directory.parent, entry_name, game) if entry_name else None
+            if found is not None:
+                candidates.append(found)
+                continue
             stale.append((directory, "is not a synced collection"))
             continue
         try:

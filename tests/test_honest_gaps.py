@@ -123,3 +123,71 @@ def _empty_state():
     st = CollectionState(d)
     st.load()
     return st
+
+
+# ---------------------------------------------------------------------------
+# 3. get_mod_requirements: the GraphQL lookup that makes the warning fire
+# ---------------------------------------------------------------------------
+
+
+def test_get_mod_requirements_returns_the_graphql_list(monkeypatch):
+    """The GraphQL query is the only source of a standalone mod's needs."""
+    from nexus_collection_dl.api import NexusAPI
+
+    api = NexusAPI(api_key="k")
+    calls = []
+
+    def fake_graphql(query, variables=None):
+        calls.append(query)
+        if "game(" in query:
+            return {"game": {"id": 1704}}
+        return {"mod": {"modRequirements": {"nexusRequirements": {
+            "nodes": [{"modId": "72307"}, {"modId": "12345"}],
+        }}}}
+
+    monkeypatch.setattr(api, "graphql_query", fake_graphql)
+    result = api.get_mod_requirements("skyrimspecialedition", 74184)
+    assert result == [72307, 12345]
+    assert len(calls) == 2  # gameId lookup + mod query
+
+
+def test_get_mod_requirements_stays_silent_when_the_game_is_unknown(monkeypatch):
+    from nexus_collection_dl.api import NexusAPI
+
+    api = NexusAPI(api_key="k")
+    monkeypatch.setattr(api, "graphql_query", lambda q, v=None: {"game": None})
+    assert api.get_mod_requirements("nosuchgame", 1) == []
+
+
+def test_add_fires_the_warning_from_graphql(monkeypatch, tmp_path):
+    """End to end: GraphQL supplies the requirement, the warning lands."""
+    from unittest.mock import MagicMock, patch
+
+    from nexus_collection_dl import service as service_module
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    state = _empty_state()
+    state.save()
+
+    svc = service_module.ModManagerService(api_key='k')
+    svc._api = MagicMock()
+    svc._api.get_mod_requirements.return_value = [72307]
+    svc._api.get_mod_info.return_value = {"name": "X", "version": "1"}
+    svc._api.get_mod_files.return_value = [
+        {"file_id": 1, "name": "x.zip", "file_name": "x.zip", "version": "1"}
+    ]
+    svc._api.validate_key.return_value = {"is_premium": True}
+
+    # Mock the download to return a result and the archive check to skip FOMOD
+    with patch.object(service_module, "Downloader") as mock_dl, \
+         patch.object(service_module, "_fomod_config_for_archive", return_value=None), \
+         patch.object(service_module, "is_archive", return_value=True), \
+         patch.object(service_module, "extract_archive", return_value=[state.mods_dir / "x.esp"]):
+        mock_dl.return_value.download_mods.return_value = [
+            ("mod", tmp_path / "x.zip")
+        ]
+        result = svc.add_mod(
+            "https://www.nexusmods.com/skyrimspecialedition/mods/9",
+            state.mods_dir,
+        )
+    assert any("72307" in w for w in result.warnings), result.warnings
