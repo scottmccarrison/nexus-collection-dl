@@ -438,13 +438,16 @@ def resolve_collection_dir(
 
     cfg = config if config is not None else HandlerConfig.load()
     candidates: list[Path] = []
+    stale: list[tuple[Path, str]] = []
     for entry in cfg.mappings.get(game, []):
         directory = Path(entry)
         if not (directory / STATE_FILENAME).exists():
+            stale.append((directory, "is not a synced collection"))
             continue
         try:
             state = _load_collection_state(directory)
         except HandlerError:
+            stale.append((directory, "has a state file that cannot be read"))
             continue
         if not state.game_domain:
             raise NxmRoutingError(
@@ -452,10 +455,24 @@ def resolve_collection_dir(
                 "run 'nexus-dl sync' there to create it properly."
             )
         if state.game_domain.lower() != game:
+            stale.append((directory, f"holds a '{state.game_domain}' collection"))
             continue
         candidates.append(directory)
 
     if not candidates:
+        # A mapping the user made once deserves to hear what became of
+        # it. Silently dropping it makes this read like nothing was ever
+        # mapped, which is how a moved collection looks like a broken
+        # handler rather than a moved folder.
+        if stale:
+            lines = "\n".join(f"  {d} {why}" for d, why in stale)
+            raise NxmRoutingError(
+                f"A mapping exists for '{game}' but nothing usable is left:\n"
+                f"{lines}\n"
+                "Re-map it with:\n"
+                f"  nexus-dl handler map {game} <collection-dir>\n"
+                f"or drop it with 'nexus-dl handler unmap {game}'."
+            )
         raise NxmRoutingError(
             f"No collection directory is mapped for '{game}'. Map one with:\n"
             f"  nexus-dl handler map {game} <collection-dir>\n"
