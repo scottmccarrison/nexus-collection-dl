@@ -1197,9 +1197,11 @@ def _requirements_from_mod_info(info: dict | None) -> list[int]:
 
     The Nexus GraphQL collection query carries these under
     ``modRequirements.nexusRequirements.nodes[].modId``. The REST mod
-    endpoint may or may not carry an equivalent. Both shapes are
-    accepted; anything else is "no list", not "no requirements", so the
-    caller stays silent rather than inventing an all-clear.
+    endpoint (``GET /v1/games/{domain}/mods/{id}.json``) carries no
+    requirements key at all (probed 2026-11-24), so a standalone `add`
+    is always silent here. Both shapes are accepted anyway; anything
+    else is "no list", not "no requirements", so the caller stays
+    silent rather than inventing an all-clear.
     """
     if not isinstance(info, dict):
         return []
@@ -1233,7 +1235,10 @@ def missing_requirements(state: CollectionState, requirements: list[int] | None)
 
     The check behind the `add` dependency warning. Collections handle
     dependencies implicitly (the author includes them); `add` takes one
-    mod and has no idea what else that mod needs.
+    mod and has no idea what else that mod needs. In practice the REST
+    mod endpoint carries no requirements, so `add` alone never warns;
+    the check is meaningful when requirements come from the GraphQL
+    collection query or stored state.
 
     Warn, never block: a missing dependency is a thing the user may know
     about and have decided against. And an empty or absent list means
@@ -2077,10 +2082,10 @@ class ModManagerService:
                 add_warnings.append(_unused_picks_warning(mod_name, no_extract))
             # Warn, never block, when this mod's requirements are not
             # installed. Collections include their dependencies; `add`
-            # takes one mod and has no idea what else it needs. The list
-            # comes from whatever the mod info carries, and silence when
-            # it carries none: we cannot check what we cannot see, and a
-            # false warning is worse than none.
+            # takes one mod and has no idea what else it needs. The
+            # REST mod endpoint carries no requirements, so this is
+            # silent for standalone adds; it fires when the payload
+            # (GraphQL collection query, stored state) does carry them.
             reqs = _requirements_from_mod_info(nexus_mod)
             for req_id in missing_requirements(state, reqs):
                 add_warnings.append(
