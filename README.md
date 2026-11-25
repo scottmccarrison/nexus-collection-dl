@@ -2,10 +2,10 @@
 
 A tool to download and manage [Nexus Mods](https://www.nexusmods.com/) collections on Linux (and macOS). Works with any game - Baldur's Gate 3, Starfield, Cyberpunk 2077, you name it.
 
-**The interactive shell is the product.** Run `nexus-dl setup` once, then bare `nexus-dl` opens the shell over your collections: browse, sync, pick FOMOD options, deploy, all from one prompt that also notices when you click "Mod manager download" on the site. The commands underneath are still there for scripts and automation, and an AI harness can drive the same surface through `--json`. That is deliberate: Linux tools are often powerful and hostile, and the point of this one is that you can use it without swearing at it.
+Run `nexus-dl setup` once, then bare `nexus-dl` opens the shell over your collections: browse, sync, pick FOMOD options, deploy, all from one prompt that also notices when you click "Mod manager download" on the site. The commands underneath are still there for scripts and automation, and an AI harness can drive the same surface through `--json`.
 
 > [!NOTE]
-> **This is an AI-assisted hobby project.** It is built with AI help, tested where it can be tested, and it will have bugs and behave in ways nobody predicted. That is the expectation, not a surprise. If something misbehaves, please say so: the project is young enough that reports genuinely shape it.
+> **This is an AI-assisted hobby project.** If something misbehaves, please open an issue or start a discussion.
 
 > [!IMPORTANT]
 > **Two channels.** `main` is the stable line and where releases are cut. `beta` runs ahead of it with new work and can change or break between beta points. Pick one under [Stable vs beta](#stable-vs-beta).
@@ -29,9 +29,9 @@ Nexus Mods collections are a great way to grab a curated set of mods in one shot
 
 ## Stable vs beta
 
-**`main` is stable.** It gets bug fixes and the features that have proven out. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
+**`main` is stable.** It gets bug fixes and stable features. Stable releases are tagged here and published under [Releases](https://github.com/scottmccarrison/nexus-collection-dl/releases).
 
-**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`), the interactive `nexus-dl shell`, and the setup flow that makes bare `nexus-dl` open the shell. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them, and some things will be buggy.
+**`beta` is ahead of `main`** and is where new work lands first. Right now that means the native `nxm://` click-through handler (a "Mod manager download" click on the site lands straight in `nexus-dl`), the interactive `nexus-dl shell`, and the setup flow that makes bare `nexus-dl` open the shell. The local web UI that earlier releases shipped is **removed** on this line - `nexus-dl shell` covers the same workflows, and the `0.4.0` notes say what to use instead. Beta points are tagged as `v0.4.0-beta.N` pre-releases, behavior can change between them.
 
 For AI harnesses, the repo ships an agent skill at [`.agents/skills/nexus-dl/`](.agents/skills/nexus-dl/). It teaches the command surface, the safe defaults (read before write, dry-run before deploy), and the [`--json` machine-readable output](#machine-readable-output), so a harness can drive the same CLI the shell wraps.
 
@@ -110,6 +110,52 @@ Once the config exists, bare `nexus-dl` opens the shell over that root.
 Planning to use "Mod manager download" click-through? Also store the key with `nexus-dl handler set-api-key` (hidden prompt): browser-launched downloads cannot see your shell's environment variables. See the [nxm:// link handler](#nxm-link-handler) section.
 
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
+
+## Upgrading and downgrading
+
+The tool checks GitHub for newer versions on every command and prints an
+upgrade notice when one exists. In the shell, `/update` shows the current
+version and the upgrade command.
+
+### Upgrading
+
+If you installed with `uv tool`:
+
+```bash
+uv tool install --from git+https://github.com/scottmccarrison/nexus-collection-dl@main nexus-collection-dl --force
+```
+
+If you installed with `pip`:
+
+```bash
+pip install --upgrade nexus-collection-dl
+```
+
+Your config (`~/.config/nexus-dl/config.json`), handler mappings, and
+collection state files are all preserved across upgrades.
+
+### Downgrading
+
+To move back to an older version, install it explicitly:
+
+```bash
+uv tool install --from git+https://github.com/scottmccarrison/nexus-collection-dl@v0.4.0 nexus-collection-dl --force
+```
+
+Or with pip:
+
+```bash
+pip install nexus-collection-dl==0.4.0
+```
+
+**What survives a downgrade:** config, handler mappings, and collection
+state files load in older versions (unknown keys are preserved or
+ignored). What does not: features added in the newer version (new
+commands, new state fields) are unavailable, and a state file written by
+a newer version may carry fields an older version does not understand.
+
+If you are unsure, stay on the version you have until you know you need
+the upgrade.
 
 ## CLI Usage
 
@@ -309,7 +355,7 @@ When in doubt, the log is the reliable channel: `tail -n 5 ~/.local/state/nexus-
 
 #### Common problems
 
-For a click that seems to do nothing, start with the [troubleshooting section](GUIDE.md#troubleshooting): short version, check the log first, because a new line means the click ran and only the feedback is missing. A second click re-downloads and re-verifies a file the default flow already extracted; that is by design (the archive is deleted after extraction), and re-clicks are free only when the verified archive was kept. Peer support and a fuller problem list live in [Discussion #61: Start here: common problems and fixes](https://github.com/scottmccarrison/nexus-collection-dl/discussions/61).
+For a click that seems to do nothing, start with the [troubleshooting section](GUIDE.md#troubleshooting): short version, check the log first, because a new line means the click ran and only the feedback is missing. A second click re-downloads and re-verifies a file the default flow already extracted; the archive is deleted after extraction, so re-clicks are free only when the verified archive was kept. Peer support and a fuller problem list live in [Discussion #61: Start here: common problems and fixes](https://github.com/scottmccarrison/nexus-collection-dl/discussions/61).
 
 ### Register local mods
 

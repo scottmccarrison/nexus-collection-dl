@@ -232,6 +232,9 @@ _COMMAND_HELP = (
             "/config root /path/to/collections",
         ),
     ),
+    _CommandHelp(
+        "/update", "check for a newer version of nexus-dl", ("/update",),
+    ),
     _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
     _CommandHelp(
         "/exit", "leave the shell (alias of /quit)", ("/exit",), in_table=False
@@ -488,15 +491,24 @@ class _ShellSession:
     # current collection: prompt, startup selection, persistence
     # ------------------------------------------------------------------
 
+    _CYAN = "\033[36m"
+    _GREEN = "\033[32m"
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+
     def _prompt(self) -> str:
         """Prompt text: the current collection when one is selected.
 
-        Plain input() text; the name is sanitized so control characters
-        in a hand-edited collection name cannot garble the prompt.
+        ANSI-colored so the tool name, collection, and bracket read as
+        different kinds of thing at a glance. The name is sanitized so
+        control characters in a hand-edited collection name cannot garble
+        the prompt.
         """
+        c, g, d, r = self._CYAN, self._GREEN, self._DIM, self._RESET
         if self.current is None:
-            return "nexus-dl> "
-        return f"nexus-dl [{_prompt_name(self.current.name)}]> "
+            return f"{c}nexus-dl{r}{d}>{r} "
+        name = _prompt_name(self.current.name)
+        return f"{c}nexus-dl{r} {d}[{r}{g}{name}{r}{d}]{r}{d}>{r} "
 
     def _startup_selection(self) -> None:
         """Best-effort initial selection; never fails the session.
@@ -549,10 +561,21 @@ class _ShellSession:
     # main loop
     # ------------------------------------------------------------------
 
+    def _splash(self) -> None:
+        """A short banner that anchors the eye when the shell opens."""
+        self.console.print()
+        self.console.print(
+            "  [bold cyan]nexus-dl[/bold cyan]"
+            "  [dim]mod collections, in your terminal[/dim]"
+        )
+        self.console.print()
+
     def run(self) -> int:
         """Run the REPL until quit or end of input. Always exits 0."""
+        self._splash()
         self._emit(
-            "nexus-dl shell. Type /help for commands, /quit to exit."
+            "[dim]Type[/dim] [cyan]/help[/cyan] [dim]for commands,"
+            " [cyan]/quit[/cyan] [dim]to exit.[/dim]"
         )
         self._startup_selection()
         self._init_event_offsets()
@@ -586,6 +609,7 @@ class _ShellSession:
             input_failures = 0
             try:
                 self._absorb_secrets(line)
+                self.console.print()
                 self._run_line(line)
             except _Quit:
                 self._emit("Goodbye.")
@@ -1746,6 +1770,17 @@ class _ShellSession:
             )
         self.console.print(table)
 
+    def _cmd_update(self, rest: str) -> None:
+        """Check for a newer version of nexus-dl and show how to get it."""
+        from . import __version__
+        from .version_check import check_for_update
+        self.console.print(f"Current version: [cyan]v{__version__}[/cyan]")
+        msg = check_for_update()
+        if msg:
+            self.console.print(f"[yellow]{escape(msg)}[/yellow]")
+        else:
+            self.console.print("[green]You are up to date.[/green]")
+
     def _cmd_config(self, rest: str) -> None:
         """Show or change the collections root.
 
@@ -1787,6 +1822,7 @@ class _ShellSession:
         "/deploy": _cmd_deploy,
         "/status": _cmd_status,
         "/config": _cmd_config,
+        "/update": _cmd_update,
     }
 
 
