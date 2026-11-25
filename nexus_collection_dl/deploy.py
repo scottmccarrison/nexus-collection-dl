@@ -1994,7 +1994,11 @@ def deploy(
             "non-dry-run deployments"
         )
 
-    result = DeployResult(warnings=list(plan.warnings))
+    # plan.warnings is the caller's to merge: it owns them, and this
+    # function's own additions (case fixups and collisions) are the ones
+    # that belong on the result. Seeding with plan.warnings as well is
+    # what reported every plan warning twice.
+    result = DeployResult()
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
 
@@ -2003,6 +2007,23 @@ def deploy(
     # case-insensitive ones; we shipped this bug class ourselves with
     # plugins.txt vs Plugins.txt. Never silently rename: a rename the
     # game does not expect is its own bug.
+    # Two destinations whose names differ only in case: on ext4 only one
+    # of them is real and nothing says which. Checked BEFORE the case
+    # fixup, which would otherwise collapse the pair into one name and
+    # leave the check with nothing to see. The message names what the
+    # mods shipped, which is what the user has to reconcile.
+    seen_lower: dict[str, Path] = {}
+    for _src, dest_rel in list(plan.game_root_files) + list(plan.data_files):
+        low = dest_rel.as_posix().lower()
+        prior = seen_lower.get(low)
+        if prior is not None and prior != dest_rel:
+            result.warnings.append(
+                f"{dest_rel}: case-collides with {prior}; on a "
+                "case-sensitive filesystem only one of these is real"
+            )
+        else:
+            seen_lower[low] = dest_rel
+
     if expected_plugins:
         by_lower = {p.lower(): p for p in expected_plugins}
 
@@ -2018,20 +2039,6 @@ def deploy(
 
         plan.game_root_files = [(s, _fix_case(d)) for s, d in plan.game_root_files]
         plan.data_files = [(s, _fix_case(d)) for s, d in plan.data_files]
-
-    # Two destinations whose names differ only in case: on ext4 only one
-    # of them is real and nothing says which.
-    seen_lower: dict[str, Path] = {}
-    for _src, dest_rel in list(plan.game_root_files) + list(plan.data_files):
-        low = dest_rel.as_posix().lower()
-        prior = seen_lower.get(low)
-        if prior is not None and prior != dest_rel:
-            result.warnings.append(
-                f"{dest_rel}: case-collides with {prior}; on a "
-                "case-sensitive filesystem only one of these is real"
-            )
-        else:
-            seen_lower[low] = dest_rel
 
     entries_total = len(plan.game_root_files) + len(plan.data_files)
     entries_done = 0

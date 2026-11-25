@@ -640,7 +640,10 @@ def test_dry_run_and_json_carry_the_same_warnings_as_deploy(tmp_path):
         mod_names={11: "TestMod"},
     )
     dry = run_deploy(plan, game, dry_run=True)
-    assert dry.warnings == plan.warnings
+    # run_deploy reports what IT changed (case fixups and collisions),
+    # not the planner's warnings: the caller owns those, and merging both
+    # reported every plan warning twice. The service result carries them.
+    assert dry.warnings == []
     assert set(plan.warnings) <= set(result.warnings)
 
     envelope = to_jsonable(result)
