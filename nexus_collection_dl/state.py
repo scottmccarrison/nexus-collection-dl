@@ -17,7 +17,22 @@ except ImportError:  # non-POSIX platforms: locking degrades to a no-op
     fcntl = None  # type: ignore[assignment]
 
 STATE_FILENAME = ".nexus-state.json"
+FOMOD_XML_DIR = ".nexus-fomod"
 LOCK_FILENAME = ".nexus-state.lock"
+
+
+def _is_safe_relative(rel: str) -> bool:
+    """Is this a path that stays inside the collection when joined?
+
+    The state file can name any string here. A delete target built as
+    ``mods_dir / rel`` escapes on ``..`` components and on absolute
+    paths (``Path / "/x"`` replaces the base entirely), so both are
+    refused before anything can act on them.
+    """
+    if not rel:
+        return False
+    p = Path(rel)
+    return not p.is_absolute() and ".." not in p.parts
 
 
 class StateError(Exception):
@@ -106,6 +121,8 @@ class ModState:
         browser_url: str = "",
         fomod_picks: list[dict[str, str]] | None = None,
         fomod_config: dict[str, str] | None = None,
+        enabled: bool = True,
+        contributed_files: list[str] | None = None,
     ):
         self.file_id = file_id
         self.mod_id = mod_id
@@ -131,6 +148,18 @@ class ModState:
         # fomod/ModuleConfig.xml overwrites the first; without this record
         # deploy can only plan for whichever mod extracted last.
         self.fomod_config = dict(fomod_config) if fomod_config else None
+        # Whether this mod's files land at deploy. Off means "temporarily
+        # not installed", not "removed": the state entry, the picks, and
+        # the files on disk all stay, and turning it back on deploys
+        # again. Defaults to True so state written before this flag
+        # loads as enabled rather than silently turning mods off.
+        self.enabled = enabled
+        # Paths (relative to the collection root) this mod's extraction
+        # contributed. The extraction tree is merged, so without this a
+        # disabled mod cannot be told apart from its neighbours and
+        # "skip it at deploy" would mean guessing. Recorded at extract
+        # time; absent for mods extracted before this existed.
+        self.contributed_files = list(contributed_files or [])
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -148,16 +177,45 @@ class ModState:
             "browser_url": self.browser_url,
             "fomod_picks": self.fomod_picks,
             "fomod_config": self.fomod_config,
+            "enabled": self.enabled,
+            "contributed_files": self.contributed_files,
         }
 
     @classmethod
     def from_dict(cls, file_id: int, data: dict[str, Any]) -> "ModState":
+        # The state file is untrusted: it travels with a shared
+        # collection folder and is read back long after we wrote it.
+        # Matching and display fields are coerced, because hand-edited
+        # state with a wrong type here must not lock the user out of the
+        # collection (the suffix matcher already calls _as_int on
+        # mod_id). Fields that become path components or delete targets
+        # are the exception and are refused: `list("ab")` names two
+        # files to delete, and `base / 12345` is a TypeError.
+        if not isinstance(data, dict):
+            raise StateError("mod entry is not an object")
+        raw_mod_id = data.get("mod_id", 0)
+        try:
+            mod_id = int(raw_mod_id)
+        except (TypeError, ValueError):
+            mod_id = 0
+        filename = data.get("filename", "")
+        if not isinstance(filename, str):
+            raise StateError(f"filename must be a string, got {filename!r}")
+        contributed = data.get("contributed_files")
+        if contributed is not None and (
+            not isinstance(contributed, list)
+            or not all(isinstance(x, str) for x in contributed)
+        ):
+            raise StateError(
+                "contributed_files must be a list of strings, got "
+                f"{contributed!r}"
+            )
         return cls(
             file_id=file_id,
-            mod_id=data.get("mod_id", 0),
+            mod_id=mod_id,
             name=data.get("name", ""),
             version=data.get("version", ""),
-            filename=data.get("filename", ""),
+            filename=filename,
             installed_at=data.get("installed_at"),
             optional=data.get("optional", False),
             position=data.get("position", 0),
@@ -168,6 +226,10 @@ class ModState:
             browser_url=data.get("browser_url", ""),
             fomod_picks=data.get("fomod_picks"),
             fomod_config=data.get("fomod_config"),
+            # Absent in state written before this flag: default to
+            # enabled rather than silently turning mods off.
+            enabled=data.get("enabled", True),
+            contributed_files=contributed,
         )
 
 
@@ -223,11 +285,25 @@ class CollectionState:
         self.collection_url = data.get("collection_url", "")
         self.collection_name = data.get("collection_name", "")
         self.collection_revision = data.get("collection_revision", 0)
-        self.game_domain = data.get("game_domain", "")
+        # Coerced, not refused: game_domain is display and URL matching,
+        # never a path, and a bad value must not lock the user out of the
+        # collection (same rule as non-string collection names).
+        self.game_domain = str(data.get("game_domain", ""))
         self.mod_rules = data.get("mod_rules", [])
         self.manifest_data = data.get("manifest_data")
-        self.game_dir = data.get("game_dir", "")
-        self.proton_prefix = data.get("proton_prefix", "")
+        game_dir = data.get("game_dir", "")
+        if not isinstance(game_dir, str):
+            raise StateError(
+                f"Invalid state file: game_dir must be a string, got {game_dir!r}"
+            )
+        self.game_dir = game_dir
+        proton_prefix = data.get("proton_prefix", "")
+        if not isinstance(proton_prefix, str):
+            raise StateError(
+                f"Invalid state file: proton_prefix must be a string, got "
+                f"{proton_prefix!r}"
+            )
+        self.proton_prefix = proton_prefix
         self.deployed_files = data.get("deployed_files", [])
         self.deployed_at = data.get("deployed_at")
         self.track_sync_enabled = data.get("track_sync_enabled", False)
@@ -239,8 +315,21 @@ class CollectionState:
         if not isinstance(raw_mods, dict):
             raise StateError("Invalid state file: mods must be a JSON object")
         for file_id_str, mod_data in raw_mods.items():
-            file_id = int(file_id_str)
+            try:
+                file_id = int(file_id_str)
+            except (TypeError, ValueError):
+                raise StateError(
+                    f"Invalid state file: mod key {file_id_str!r} is not an "
+                    "integer"
+                ) from None
             self.mods[file_id] = ModState.from_dict(file_id, mod_data)
+            # Restore installer XML from its sidecar file if the state
+            # stores only a reference (newer format).
+            cfg = self.mods[file_id].fomod_config
+            if isinstance(cfg, dict) and "xml_file" in cfg and "xml" not in cfg:
+                xml_path = self.mods_dir / cfg["xml_file"]
+                if xml_path.is_file():
+                    cfg["xml"] = xml_path.read_text()
 
         # Tombstones restore with int keys exactly like the mods dict above.
         # The key is missing from older states: they load unchanged with no
@@ -255,7 +344,34 @@ class CollectionState:
             )
         if isinstance(raw_removed, dict):
             for mod_id_str, removed_data in raw_removed.items():
-                self.removed_mods[int(mod_id_str)] = removed_data
+                try:
+                    self.removed_mods[int(mod_id_str)] = removed_data
+                except (TypeError, ValueError):
+                    raise StateError(
+                        f"Invalid state file: removed_mods key {mod_id_str!r} "
+                        "is not an integer"
+                    ) from None
+
+    def _mod_to_dict_with_sidecar(self, file_id: int, mod: "ModState") -> dict[str, Any]:
+        """Serialize a mod, moving installer XML to a sidecar file.
+
+        The full ModuleConfig.xml can be 60KB and is rewritten on every
+        save. The sidecar keeps the state file small while the metadata
+        (member path) stays inline for the deploy planner.
+        """
+        d = mod.to_dict()
+        cfg = d.get("fomod_config")
+        if isinstance(cfg, dict) and "xml" in cfg:
+            # Copy the dict so we do not mutate the in-memory state
+            cfg = dict(cfg)
+            d["fomod_config"] = cfg
+            xml_text = cfg.pop("xml")
+            sidecar_dir = self.mods_dir / FOMOD_XML_DIR
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = sidecar_dir / f"{file_id}.xml"
+            sidecar.write_text(xml_text)
+            cfg["xml_file"] = f"{FOMOD_XML_DIR}/{file_id}.xml"
+        return d
 
     def save(self) -> None:
         """Save state atomically: unique temp file, fsync, then rename.
@@ -274,7 +390,10 @@ class CollectionState:
             "mod_rules": self.mod_rules,
             "manifest_data": self.manifest_data,
             # Key by file_id so each file from a multi-file mod is tracked
-            "mods": {str(file_id): mod.to_dict() for file_id, mod in self.mods.items()},
+            "mods": {
+                str(file_id): self._mod_to_dict_with_sidecar(file_id, mod)
+                for file_id, mod in self.mods.items()
+            },
             # Tombstones persist as "removed_mods" keyed by mod_id (see
             # __init__). JSON object keys are strings; load() converts
             # them back to int the same way the mods dict is restored.
@@ -287,6 +406,23 @@ class CollectionState:
             "deployed_at": self.deployed_at,
             "track_sync_enabled": self.track_sync_enabled,
         }
+
+        # Forward compatibility, not retroactive repair: an older build that
+        # already drops a key cannot be fixed from here. What this does is
+        # keep the next new key from disappearing when someone runs a
+        # slightly older build against the same state file. Known keys
+        # always come from the in-memory object; only keys this version
+        # does not model are carried over from the file on disk.
+        if self.state_file.exists():
+            try:
+                with open(self.state_file) as f:
+                    existing = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict):
+                for key, value in existing.items():
+                    if key not in data:
+                        data[key] = value
 
         # Temp file lives in the same directory as the target so the final
         # os.replace() is guaranteed to stay on one filesystem.

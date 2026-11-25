@@ -226,6 +226,15 @@ _COMMAND_HELP = (
             "(needs network)"),
         ),
     ),
+    _CommandHelp(
+        "/config", "show or change the collections root", (
+            "/config",
+            "/config root /path/to/collections",
+        ),
+    ),
+    _CommandHelp(
+        "/update", "check for a newer version of nexus-dl", ("/update",),
+    ),
     _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
     _CommandHelp(
         "/exit", "leave the shell (alias of /quit)", ("/exit",), in_table=False
@@ -466,19 +475,45 @@ class _ShellSession:
             f"[yellow]Warning:[/yellow] {escape(self._scrub(str(text)))}"
         )
 
+    def _maybe_nudge_gc(self, mods_dir) -> None:
+        """Point at reclaimable archive disk after a work command.
+
+        The user owns whether to run gc; the tool owns making sure the
+        disk is visible while they are working.
+        """
+        from .gc import NUDGE_THRESHOLD_BYTES, nudge_message
+
+        msg = nudge_message(Path(mods_dir), NUDGE_THRESHOLD_BYTES)
+        if msg:
+            self._emit(msg)
+
     # ------------------------------------------------------------------
     # current collection: prompt, startup selection, persistence
     # ------------------------------------------------------------------
 
+    _CYAN = "\033[36m"
+    _GREEN = "\033[32m"
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+
     def _prompt(self) -> str:
         """Prompt text: the current collection when one is selected.
 
-        Plain input() text; the name is sanitized so control characters
-        in a hand-edited collection name cannot garble the prompt.
+        ANSI-colored so the tool name, collection, and bracket read as
+        different kinds of thing at a glance. Honors NO_COLOR. The name
+        is sanitized so control characters in a hand-edited collection
+        name cannot garble the prompt.
         """
+        import os
+        if os.environ.get("NO_COLOR"):
+            if self.current is None:
+                return "nexus-dl> "
+            return f"nexus-dl [{_prompt_name(self.current.name)}]> "
+        c, g, d, r = self._CYAN, self._GREEN, self._DIM, self._RESET
         if self.current is None:
-            return "nexus-dl> "
-        return f"nexus-dl [{_prompt_name(self.current.name)}]> "
+            return f"{c}nexus-dl{r}{d}>{r} "
+        name = _prompt_name(self.current.name)
+        return f"{c}nexus-dl{r} {d}[{r}{g}{name}{r}{d}]{r}{d}>{r} "
 
     def _startup_selection(self) -> None:
         """Best-effort initial selection; never fails the session.
@@ -531,10 +566,21 @@ class _ShellSession:
     # main loop
     # ------------------------------------------------------------------
 
+    def _splash(self) -> None:
+        """A short banner that anchors the eye when the shell opens."""
+        self.console.print()
+        self.console.print(
+            "  [bold cyan]nexus-dl[/bold cyan]"
+            "  [dim]mod collections, in your terminal[/dim]"
+        )
+        self.console.print()
+
     def run(self) -> int:
         """Run the REPL until quit or end of input. Always exits 0."""
+        self._splash()
         self._emit(
-            "nexus-dl shell. Type /help for commands, /quit to exit."
+            "[dim]Type[/dim] [cyan]/help[/cyan] [dim]for commands,"
+            " [cyan]/quit[/cyan] [dim]to exit.[/dim]"
         )
         self._startup_selection()
         self._init_event_offsets()
@@ -568,6 +614,7 @@ class _ShellSession:
             input_failures = 0
             try:
                 self._absorb_secrets(line)
+                self.console.print()
                 self._run_line(line)
             except _Quit:
                 self._emit("Goodbye.")
@@ -960,8 +1007,8 @@ class _ShellSession:
         deployed automatically.
         """
         from .deploy import DeployError, classify_files
+        from .service import resolve_game_root
         from .state import CollectionState
-        from .steam import find_game_dir
 
         try:
             state = CollectionState(target.path)
@@ -970,11 +1017,25 @@ class _ShellSession:
             self._emit_error(str(e) or type(e).__name__)
             return
 
-        game_dir: Path | None = None
-        if state.game_dir:
-            game_dir = Path(state.game_dir)
-        if game_dir is None:
-            game_dir = find_game_dir(state.game_domain)
+        # Same trust priority as the CLI: flag, config, detection. A root
+        # that is only in the state file cannot be verified, so the user
+        # is asked before it is used.
+        root = resolve_game_root(None, state.game_dir, state.game_domain)
+        for w in root.warnings:
+            self._emit_warning(w)
+        game_dir = root.path
+        if root.needs_confirmation:
+            answer = self._confirm(
+                f"Use {_safe_text(str(game_dir))} as the game directory? "
+                "It came from this collection's state file and cannot be "
+                f"verified. [{_CONFIRM_YES}/no]: "
+            )
+            if answer != _CONFIRM_YES:
+                self._emit_error(
+                    "Could not verify a game directory. Re-run with the "
+                    "directory spelled out."
+                )
+                return
         if game_dir is None:
             self._emit_error("Could not find game directory.")
             return
@@ -1060,6 +1121,7 @@ class _ShellSession:
                 f"({len(result.conflicts)} conflicts, "
                 f"{len(result.errors)} errors)"
             )
+        self._maybe_nudge_gc(target.path)
 
     def _cmd_deploy(self, rest: str) -> None:
         target = (
@@ -1236,6 +1298,7 @@ class _ShellSession:
             raise ValueError(
                 "/add expects an http(s) mod page URL or an nxm link"
             )
+        self._maybe_nudge_gc(current.path)
 
     def _report_add(self, result: AddResult) -> None:
         # Only reachable after _require_current in _cmd_add, so a
@@ -1425,6 +1488,63 @@ class _ShellSession:
             )
         for f in result.load_order_files:
             self._emit(f"Wrote {_safe_text(f)}")
+        self._offer_nxm_mapping(result.collection_dir)
+        self._maybe_nudge_gc(result.collection_dir or self.root)
+
+    def _offer_nxm_mapping(self, collection_dir: Path | None) -> None:
+        """Offer to route this game's nxm:// clicks to the collection just synced.
+
+        Same rule as the CLI sync: the collection directory and its state
+        exist now, which is the one moment the mapping can be made without
+        the user going looking for a command. Already-mapped games are left
+        alone - syncing again is not a reason to ask again.
+        """
+        from .handler import HandlerConfig, add_mapping
+        from .state import CollectionState
+
+        if collection_dir is None:
+            return
+        collection_dir = Path(collection_dir)
+        if not (collection_dir / ".nexus-state.json").exists():
+            return
+        try:
+            state = CollectionState(collection_dir)
+            state.load()
+        except StateError:
+            return
+        game_domain = (state.game_domain or "").strip().lower()
+        if not game_domain:
+            return
+        existing = HandlerConfig.load().mappings.get(game_domain, [])
+        if any(
+            (e.get("path") if isinstance(e, dict) else e) == str(collection_dir.resolve())
+            for e in existing
+        ):
+            return
+
+        command = (
+            f"nexus-dl handler map {game_domain} "
+            f"'{collection_dir.resolve()}'"
+        )
+        answer = self._confirm(
+            f"Map {_safe_text(game_domain)} to this collection so nxm:// "
+            f"clicks land here? [{_CONFIRM_YES}/no]: "
+        )
+        if answer != _CONFIRM_YES:
+            self._emit(f"Skipped. Do it later with: {_safe_text(command)}")
+            return
+        try:
+            add_mapping(game_domain, collection_dir)
+        except Exception as e:
+            self._emit_error(
+                f"Could not map {_safe_text(game_domain)}: {_safe_text(str(e))}"
+            )
+            self._emit(f"Try it by hand: {_safe_text(command)}")
+            return
+        self._emit(
+            f"nxm:// clicks for {_safe_text(game_domain)} now land in "
+            f"{_safe_text(str(collection_dir.resolve()))}."
+        )
 
     def _cmd_remove(self, rest: str) -> None:
         current = self._require_current()
@@ -1453,9 +1573,10 @@ class _ShellSession:
                 "and all its files?"
             )
             self._emit(
-                "this removes the mod from the collection and it stays "
-                "removed through sync/update; files on disk are kept; "
-                "re-add restores it"
+                "this removes the mod from the collection and from disk: "
+                "the state entry, the files it added, and its archive. "
+                "It stays removed through sync/update; re-adding downloads "
+                "it again."
             )
             answer = self._confirm(
                 f"Remove '{_prompt_name(summary.name)}'? [yes/no]: "
@@ -1654,6 +1775,44 @@ class _ShellSession:
             )
         self.console.print(table)
 
+    def _cmd_update(self, rest: str) -> None:
+        """Check for a newer version of nexus-dl and show how to get it."""
+        from . import __version__
+        from .version_check import check_for_update
+        self.console.print(f"Current version: [cyan]v{__version__}[/cyan]")
+        msg = check_for_update()
+        if msg:
+            self.console.print(f"[yellow]{escape(msg)}[/yellow]")
+        else:
+            self.console.print("[green]You are up to date.[/green]")
+
+    def _cmd_config(self, rest: str) -> None:
+        """Show or change the collections root.
+
+        /config          show the current collections root
+        /config root <path>  change the collections root
+        """
+        from .config import UserConfig
+        parts = rest.split(None, 1)
+        if not parts:
+            cfg = UserConfig.load()
+            self.console.print(f"Collections root: {cfg.collections_root or '(not set)'}")
+            return
+        if parts[0].lower() == "root" and len(parts) == 2:
+            new_root = Path(parts[1]).expanduser()
+            if not new_root.is_dir():
+                self.console.print(
+                    f"[red]Error:[/red] {new_root} is not an existing directory."
+                )
+                return
+            cfg = UserConfig.load()
+            cfg.collections_root = str(new_root.resolve())
+            cfg.save()
+            self.root = new_root.resolve()
+            self.console.print(f"Collections root set to {self.root}")
+            return
+        self.console.print("Usage: /config  or  /config root <path>")
+
     _COMMANDS: ClassVar[dict[str, Any]] = {
         "/help": _cmd_help,
         "/quit": _cmd_quit,
@@ -1667,6 +1826,8 @@ class _ShellSession:
         "/remove": _cmd_remove,
         "/deploy": _cmd_deploy,
         "/status": _cmd_status,
+        "/config": _cmd_config,
+        "/update": _cmd_update,
     }
 
 

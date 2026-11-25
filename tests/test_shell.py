@@ -11,6 +11,13 @@ is fake and asserted absent from all output.
 import io
 import json
 import re
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI color codes so tests can match on text content."""
+    return _ANSI_RE.sub("", text)
 from pathlib import Path
 from typing import ClassVar
 
@@ -195,6 +202,9 @@ def shell_env(monkeypatch, tmp_path):
     monkeypatch.setattr(cli_module, "capability_warnings", list)
     monkeypatch.setattr(cli_module.console, "width", 400)  # no line wrapping
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # A machine with a real Steam library must not decide where these
+    # tests deploy; root resolution would silently agree with it.
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
@@ -319,8 +329,8 @@ def reload_state(cdir: Path) -> CollectionState:
 
 def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_path):
     """/collections -> /use -> /mods -> /remove (yes): state updated, the
-    removal is tombstoned at the service layer, and payload files on
-    disk are kept exactly as they were."""
+    removal is tombstoned at the service layer, and what the mod added
+    goes with it. Gone means gone."""
     root = make_root(tmp_path, ("Test Collection", [
         mod_entry(file_id=456, mod_id=123, name="Test Mod"),
         mod_entry(file_id=789, mod_id=321, name="Other Mod"),
@@ -331,19 +341,19 @@ def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_pat
     extracted = cdir / "TestMod" / "file.esp"
     extracted.parent.mkdir()
     extracted.write_text("esp content")
+    state = reload_state(cdir)
+    state.mods[456].contributed_files = ["TestMod/file.esp"]
+    state.save()
 
     result = run_cli(root, "/collections\n/use 1\n/mods\n/remove 456\nyes\n/quit\n")
     assert result.exit_code == 0
     out = result.output
 
-    # The confirmation shows name + id and the required statement.
+    # The confirmation shows name + id and says what will happen to disk.
     assert "Test Mod" in out
     assert "file_id 456" in out
     assert "mod_id 123" in out
-    assert (
-        "this removes the mod from the collection and it stays removed "
-        "through sync/update; files on disk are kept; re-add restores it"
-    ) in out
+    assert "from disk" in out
 
     # State updated: the mod is gone, its sibling stays.
     state = reload_state(cdir)
@@ -353,9 +363,9 @@ def test_full_session_collections_use_mods_remove_confirm_yes(shell_env, tmp_pat
     assert state.is_removed(123)
     assert not state.is_removed(321)
 
-    # Payload files untouched.
-    assert archive.read_bytes() == b"PK payload bytes"
-    assert extracted.read_text() == "esp content"
+    # Gone means gone: the files the mod added go with it.
+    assert not archive.exists()
+    assert not extracted.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +808,42 @@ def test_sync_lists_per_mod_errors_before_success_text(
         {"method": "sync", "collection_url": url, "mods_dir": root,
          "target_dir": None}
     ]
+
+
+def test_sync_offers_to_map_the_game_for_nxm_clicks(shell_env, tmp_path, monkeypatch):
+    """The shell is the product; a shell sync must offer the routing too.
+
+    `sync` is what creates the collection directory and state that a
+    handler mapping validates against, so it is the moment the mapping
+    can be made without the user going looking for a command.
+    """
+    from nexus_collection_dl.handler import HandlerConfig
+
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    coll = root / "Synced Collection"
+    coll.mkdir()
+    (coll / ".nexus-state.json").write_text(json.dumps({
+        "collection_url": "u", "collection_name": "Synced Collection",
+        "collection_revision": 1,
+        "game_domain": GAME,
+        "mods": {"11": {"mod_id": 1, "name": "M", "file_id": 11,
+                        "filename": "a.zip", "version": "1",
+                        "download_status": "downloaded"}},
+    }))
+    FakeShellService.sync_result = SyncResult(
+        mods_downloaded=1, mods_extracted=1, errors=[],
+        load_order_files=["load-order.txt"], collection_dir=coll,
+    )
+
+    url = "https://next.nexusmods.com/skyrimspecialedition/collections/abc"
+    result = run_cli(
+        root, f"/sync {url}\nyes\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert "nxm://" in result.output, result.output
+    assert [e["path"] for e in HandlerConfig.load().mappings.get(GAME, [])] == [str(coll.resolve())], \
+        HandlerConfig.load().mappings
 
 
 # ---------------------------------------------------------------------------
@@ -1621,7 +1667,7 @@ def test_prompt_shows_the_current_collection_and_auto_selects_one(
     assert code == 0
     # Exactly one collection: selected at startup with a note.
     assert "Using 'Solo Pack' (only collection here)." in out
-    assert prompts[0] == "nexus-dl [Solo Pack]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Solo Pack]> "
 
 
 def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
@@ -1631,8 +1677,8 @@ def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
     )
     assert code == 0
     # Two collections: no auto-select, plain prompt until /use.
-    assert prompts[0] == "nexus-dl> "
-    assert prompts[1] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
+    assert _strip_ansi(prompts[1]) == "nexus-dl [Beta]> "
 
 
 def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
@@ -1644,7 +1690,7 @@ def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
     assert code == 0
     # Control characters collapse to spaces; brackets are plain text.
     assert "\n" not in prompts[0]
-    assert prompts[0] == "nexus-dl [Weird Name] [x]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Weird Name] [x]> "
 
 
 def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
@@ -1667,8 +1713,8 @@ def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
     assert "Collections under" in out
     assert "Alpha" in out and "Beta" in out
     # Bare /use changed nothing: prompts before and after match.
-    assert prompts[0] == "nexus-dl> "
-    assert prompts[1] == prompts[2] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
+    assert _strip_ansi(prompts[1]) == _strip_ansi(prompts[2]) == "nexus-dl [Beta]> "
 
 
 def test_explicit_use_remembers_the_selection(shell_env, tmp_path):
@@ -1696,7 +1742,7 @@ def test_startup_restores_the_remembered_selection(shell_env, tmp_path):
     before = memory.read_bytes()
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Beta]> "
     assert "Using 'Beta'" in out
     # Restore never rewrites the memory file: bytes are identical.
     assert memory.read_bytes() == before
@@ -1709,7 +1755,7 @@ def test_startup_restores_a_root_level_collection(shell_env, tmp_path):
     memory.write_text(json.dumps({"current": "root"}))
     code, _out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl [Root Collection]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Root Collection]> "
 
 
 def test_stale_remembered_selection_is_ignored_silently(shell_env, tmp_path):
@@ -1717,7 +1763,7 @@ def test_stale_remembered_selection_is_ignored_silently(shell_env, tmp_path):
     (root / ".nexus-shell.json").write_text(json.dumps({"current": "gone"}))
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -1726,7 +1772,7 @@ def test_corrupt_remembered_selection_is_ignored_silently(shell_env, tmp_path):
     (root / ".nexus-shell.json").write_text("{ not json")
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -1931,13 +1977,14 @@ def test_control_characters_never_reach_the_terminal(shell_env, tmp_path):
     )
     assert code == 0
     # Raw control bytes never reach the terminal: not in output, not in
-    # any prompt (including the /remove confirm prompt).
-    assert "\x1b" not in out
+    # any prompt (including the /remove confirm prompt). Our own ANSI
+    # styling is intentional, so strip it before checking for leaks.
     assert "\x07" not in out
+    assert "\x1b" not in _strip_ansi(out)
     for p in prompts:
-        assert "\x1b" not in p
-        assert "\x07" not in p
-        assert "\n" not in p
+        assert "\x1b" not in _strip_ansi(p)
+        assert "\x07" not in _strip_ansi(p)
+        assert "\n" not in _strip_ansi(p)
     # The name renders collapsed to one plain line everywhere.
     assert "Evil [2JName X Y" in out
     # Hostile typed input is collapsed in the unknown-command echoes
@@ -2121,7 +2168,7 @@ def test_traversal_shaped_memory_values_are_ignored(
     (root / ".nexus-shell.json").write_text(json.dumps({"current": value}))
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -2307,16 +2354,28 @@ def test_vanished_collection_dir_noted_no_prompt(shell_env, tmp_path):
 
 
 def _setup_deploy_collection(tmp_path, name="Clean Visuals"):
-    """Root with one collection that has a game_dir and a deployable file."""
+    """Root with one collection that has a game_dir and a deployable file.
+
+    The game directory is established through the user config, not
+    through the state file: state alone is no longer a source of truth
+    for where a deploy may write. This is what a configured user looks
+    like, so the deploy flow does not stop to ask.
+    """
     root = make_root(tmp_path, (name, []))
     coll = root / name
     game = tmp_path / "game"
     game.mkdir()
-    # Give the state a game_dir so _deploy_flow skips find_game_dir.
     state = CollectionState(coll)
     state.load()
     state.game_dir = str(game)
     state.save()
+    cfg_dir = tmp_path / "xdg-config" / "nexus-dl"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.json").write_text(json.dumps({
+        "collections_root": str(root),
+        "games": [{"domain": GAME, "game_dir": str(game)}],
+        "defaults": {},
+    }))
     # One deployable file (not hidden).
     (coll / "Data").mkdir()
     (coll / "Data" / "test.esp").write_bytes(b"fake")
@@ -2551,7 +2610,7 @@ def test_live_drain_redraws_the_prompt_after_an_idle_report(shell_env, tmp_path)
     )
     assert code == 0
     # Drawn once up front and once again after the tick's report.
-    assert out.count("nexus-dl [Clean Visuals]>") >= 2
+    assert _strip_ansi(out).count("nexus-dl [Clean Visuals]>") >= 2
 
 
 def test_ctrl_c_at_fomod_picker_aborts_the_walk(shell_env, tmp_path):

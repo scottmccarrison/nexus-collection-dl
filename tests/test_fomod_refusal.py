@@ -277,7 +277,7 @@ def test_add_needs_choices_for_a_fomod_archive(tmp_path, monkeypatch):
         service_module.Downloader, "download_mods",
         _fake_download_writing({
             "TestMod-1.0.zip": {
-                "fomod/ModuleConfig.xml": b"<config/>",
+                "fomod/ModuleConfig.xml": CONFIG_WITH_ONE_GROUP,
                 "Data/thing.esp": b"x",
             },
         }),
@@ -308,7 +308,7 @@ def test_add_refuses_without_ever_calling_extract(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service_module.Downloader, "download_mods",
         _fake_download_writing({
-            "TestMod-1.0.zip": {"fomod/ModuleConfig.xml": b"<config/>"},
+            "TestMod-1.0.zip": {"fomod/ModuleConfig.xml": CONFIG_WITH_ONE_GROUP},
         }),
     )
     calls: list = []
@@ -360,7 +360,8 @@ def test_add_extracts_a_plain_archive_unchanged(tmp_path, monkeypatch):
     result = svc.add_mod(MOD_URL, tmp_path, no_load_order=True)
     assert result.success, result.error
     assert (tmp_path / "Data" / "thing.esp").exists()
-    assert not (tmp_path / "TestMod-1.0.zip").exists()
+    # Download-manager behaviour: the verified archive is kept for gc.
+    assert (tmp_path / "TestMod-1.0.zip").exists()
 
 
 def test_add_refuses_an_uninspectable_archive(tmp_path, monkeypatch):
@@ -436,7 +437,7 @@ def test_import_records_the_refusal_and_leaves_the_item_pending(
     state.save()
 
     make_zip(tmp_path / "FomodMod-1.0.zip", {
-        "fomod/ModuleConfig.xml": b"<config/>",
+        "fomod/ModuleConfig.xml": CONFIG_WITH_ONE_GROUP,
     })
     make_zip(tmp_path / "PlainMod-1.0.zip", {"Data/plain.esp": b"x"})
 
@@ -452,9 +453,10 @@ def test_import_records_the_refusal_and_leaves_the_item_pending(
     assert state.mods[11].download_status == "pending_download"
     assert state.mods[22].download_status == "downloaded"
 
-    # The FOMOD archive is kept; the plain one was consumed.
+    # The FOMOD archive is kept (still the only copy); the plain one was
+    # extracted and its archive is kept too, for gc to reclaim later.
     assert (tmp_path / "FomodMod-1.0.zip").exists()
-    assert not (tmp_path / "PlainMod-1.0.zip").exists()
+    assert (tmp_path / "PlainMod-1.0.zip").exists()
 
 
 # --- the CLI surface -------------------------------------------------------
@@ -472,7 +474,7 @@ def test_cli_add_reports_fomod_choices_code(tmp_path, monkeypatch):
     monkeypatch.setattr(
         service_module.Downloader, "download_mods",
         _fake_download_writing({
-            "TestMod-1.0.zip": {"fomod/ModuleConfig.xml": b"<config/>"},
+            "TestMod-1.0.zip": {"fomod/ModuleConfig.xml": CONFIG_WITH_ONE_GROUP},
         }),
     )
 
@@ -496,3 +498,198 @@ def test_cli_add_reports_fomod_choices_code(tmp_path, monkeypatch):
     assert envelope["ok"] is False
     assert envelope["error"]["code"] == "fomod_choices"
     assert "--fomod-option" in envelope["error"]["message"]
+
+
+# --- a FOMOD with nothing to choose ---------------------------------------
+#
+# "Refuse rather than guess" is right when there is something to guess.
+# A config with only conditionalFileInstalls has nothing to decide by
+# hand: the install is fully determined by its conditions. Demanding
+# choices for it makes the mod uninstallable by every path.
+
+CONFIG_WITH_ONE_GROUP = b"""
+<config>
+  <moduleName>Test</moduleName>
+  <installSteps>
+    <installStep name="S">
+      <optionalFileGroups>
+        <group name="G" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="OptA">
+              <files><file source="a/thing.esp" destination="thing.esp"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups>
+    </installStep>
+  </installSteps>
+</config>
+"""
+
+
+CONDITIONAL_ONLY_CONFIG = b"""
+<config>
+  <moduleName>T</moduleName>
+  <conditionalFileInstalls>
+    <patterns>
+      <pattern>
+        <dependencies>
+          <fileDependency file="Master.esm" state="Active"/>
+        </dependencies>
+        <files><file source="a/thing.esp" destination="thing.esp"/></files>
+      </pattern>
+    </patterns>
+  </conditionalFileInstalls>
+</config>
+"""
+
+
+def _conditional_only_zip(path: Path) -> Path:
+    return make_zip(
+        path,
+        {
+            "fomod/ModuleConfig.xml": CONDITIONAL_ONLY_CONFIG,
+            "a/thing.esp": b"PAYLOAD",
+            "loose/other.esp": b"LOOSE",
+        },
+    )
+
+
+def test_a_fomod_with_no_selectable_groups_is_not_blocked():
+    """Nothing to choose, so nothing to block."""
+    import tempfile
+
+    from nexus_collection_dl.service import _nxm_fomod_blocker
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = _conditional_only_zip(Path(tmp) / "CondMod-1-1-0.zip")
+        assert _nxm_fomod_blocker(archive) is None
+
+
+def test_install_fomod_picks_accepts_an_empty_answer_when_there_is_nothing_to_choose(
+    tmp_path,
+):
+    """An empty pick list is correct when the installer offers no groups.
+
+    The picker walks the groups and answers; with no groups the answer
+    is empty, and that must not be read as "no answer at all".
+    """
+    from nexus_collection_dl.service import ModManagerService
+    from nexus_collection_dl.state import CollectionState
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    _conditional_only_zip(mods / "CondMod-1-1-0.zip")
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "Cond Mod",
+            "file_id": 11,
+            "filename": "CondMod-1-1-0.zip",
+            "version": "1",
+            "manual": True,
+            "download_status": "pending_choices",
+        }
+    )
+    state.save()
+
+    def asker(config, archive_name, kept):
+        return []
+
+    svc = ModManagerService(api_key="test-key-unused")
+    report = svc.install_fomod_picks(mods, 11, on_fomod_prompt=asker)
+
+    assert "installed" in report
+    reloaded = CollectionState(mods)
+    reloaded.load()
+    assert reloaded.mods[11].download_status == "downloaded"
+    assert (mods / "a" / "thing.esp").exists()
+
+
+def test_add_installs_a_conditional_only_fomod_with_no_choices(tmp_path, monkeypatch):
+    """The non-interactive path must not demand choices that do not exist."""
+    from nexus_collection_dl import service as service_module
+    from nexus_collection_dl.service import ModManagerService
+    from tests.test_service_regressions import FakeNexusAPI, _state
+
+    _state(tmp_path)
+    svc = ModManagerService(api_key="test-key-unused")
+    svc._api = FakeNexusAPI(is_premium=True)
+
+    def fake_download_mods(self, game_domain, mods, target_dir,
+                           on_complete=None, on_progress=None,
+                           show_progress=True):
+        out = []
+        for m in mods:
+            p = Path(target_dir) / m["filename"]
+            _conditional_only_zip(p)
+            out.append((m, p))
+        return out
+
+    monkeypatch.setattr(
+        service_module.Downloader, "download_mods", fake_download_mods
+    )
+
+    result = svc.add_mod(
+        "https://www.nexusmods.com/skyrimspecialedition/mods/100",
+        tmp_path,
+        no_load_order=True,
+    )
+
+    assert result.success, result.error
+    assert (tmp_path / "a" / "thing.esp").exists()
+
+
+def test_conditional_only_fomod_deploys_with_the_folder_fallback(tmp_path, monkeypatch):
+    """With no game state the condition is unknown and the fallback warns.
+
+    Unknown is not empty: the deploy must say the condition could not be
+    evaluated rather than silently picking a branch.
+    """
+    from nexus_collection_dl import service as service_module
+    from nexus_collection_dl.service import ModManagerService
+    from nexus_collection_dl.state import CollectionState
+
+    # Pin the game-state lookup to a fixture. Left alone,
+    # find_proton_prefix reaches this machine's real Steam library and
+    # answers the condition from a real plugins.txt.
+    monkeypatch.setattr(service_module, "find_proton_prefix", lambda domain: None)
+
+    mods = tmp_path / "mods"
+    mods.mkdir()
+    _conditional_only_zip(mods / "CondMod-1-1-0.zip")
+    state = CollectionState(mods)
+    state.set_collection_info("u", "n", 1, "skyrimspecialedition")
+    state.add_mod(
+        {
+            "mod_id": 1,
+            "mod_name": "Cond Mod",
+            "file_id": 11,
+            "filename": "CondMod-1-1-0.zip",
+            "version": "1",
+            "manual": True,
+            "download_status": "pending_choices",
+        }
+    )
+    state.save()
+
+    def asker(config, archive_name, kept):
+        return []
+
+    svc = ModManagerService(api_key="test-key-unused")
+    svc.install_fomod_picks(mods, 11, on_fomod_prompt=asker)
+
+    game = tmp_path / "game"
+    game.mkdir()
+    result = svc.deploy(mods, game_dir=game, use_copy=True)
+
+    assert result.errors == [], result
+    # Unknown is not empty: the fallback is reported, not silent.
+    assert any("could not be evaluated" in w for w in result.warnings), result.warnings
+    # The folder fallback ships the tree as-is rather than guessing the
+    # conditional branch.
+    assert (game / "Data" / "a" / "thing.esp").exists()
+    assert (game / "Data" / "loose" / "other.esp").exists()

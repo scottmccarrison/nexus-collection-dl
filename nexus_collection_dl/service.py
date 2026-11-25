@@ -92,6 +92,7 @@ from .state import (
     CollectionState,
     LoadOrderRegenError,
     StateError,
+    _is_safe_relative,
 )
 from .steam import STEAM_APP_IDS, find_game_dir, find_proton_prefix
 
@@ -199,6 +200,17 @@ def _fomod_config_record(archive_path: Path) -> dict[str, str] | None:
     return {"member": member, "xml": text}
 
 
+def _config_has_choices(config: "ModuleConfig") -> bool:
+    """Does this installer offer anything to choose by hand?
+
+    A config with only ``conditionalFileInstalls`` and ``required`` files
+    has nothing to decide: its install is fully determined by its
+    conditions. An empty selection is the right answer for one, and
+    demanding choices makes the mod uninstallable.
+    """
+    return any(step.groups for step in config.steps)
+
+
 def _nxm_fomod_blocker(archive_path: Path) -> str | None:
     """A message when this archive must not be extracted without choices.
 
@@ -226,6 +238,10 @@ def _nxm_fomod_blocker(archive_path: Path) -> str | None:
         # every uninspectable download would stop plain mods too.
         return None
     if config is None:
+        return None
+    if not _config_has_choices(config):
+        # Nothing to choose, so nothing to block. A conditional-only
+        # installer is decided by its conditions, not by the user.
         return None
     parent = archive_path.parent
     return (
@@ -255,6 +271,10 @@ def _resolve_fomod_picks(
     nothing at all, refuse: guessing is the harm this exists to stop.
     """
     from .fomod_select import Pick, PickError, normalize_picks, picks_to_selections
+
+    if not _config_has_choices(config):
+        # Nothing to choose: an empty selection is the install.
+        return []
 
     if provided:
         return normalize_picks(provided, config)
@@ -678,6 +698,166 @@ def _attach_expected_md5(state: CollectionState, mods: list[dict]) -> None:
             mod["expected_md5"] = md5
 
 
+@dataclass
+class ResolvedRoot:
+    """Where a deploy/undeploy may act, and how that was established.
+
+    ``needs_confirmation`` is True when the only candidate is the state
+    file's own value. The state cannot vouch for itself: a crafted
+    ``game_dir`` passes every containment check because containment runs
+    against that base. A caller that cannot ask must refuse rather than
+    act on it.
+
+    ``problem`` is set when the caller named a root that cannot be one:
+    a path that is not there, or a path that is not a directory. Naming
+    a root is a statement about where to act, so a bad one is an error
+    and not an invitation to fall back to something else.
+    """
+
+    path: Path | None
+    needs_confirmation: bool
+    source: str  # "flag" | "config" | "detected" | "state" | "none"
+    warnings: list[str] = field(default_factory=list)
+    problem: str | None = None
+
+
+def _bad_root(root: Path, what: str) -> str:
+    """Why this path cannot be a root, said the way a person reads it."""
+    if not root.exists():
+        return f"{what} {root} does not exist."
+    return f"{what} {root} is not a directory."
+
+
+def resolve_game_root(
+    explicit: Path | None,
+    state_game_dir: str,
+    game_domain: str,
+) -> ResolvedRoot:
+    """Resolve the game root by trust priority.
+
+    explicit flag > the user config's entry for this game > Steam
+    detection > the state file's value. The state file is last and never
+    a source of truth on its own: it is the one input a shared collection
+    folder hands over that we did not write this run.
+
+    A root that is not an existing directory is never used. An explicit
+    flag naming one is an error: the user said where to act and that
+    place is not usable, so falling back would send the command
+    somewhere they did not ask for. A stale config entry is different -
+    nobody named it this run - so it is reported and the next source
+    gets a turn.
+
+    A resolved root that disagrees with the state is used, and the
+    disagreement is reported: the config and the machine know where the
+    game is, the state only claims where a past deploy put files.
+    """
+    from .config import UserConfig
+
+    state_val = Path(state_game_dir) if state_game_dir else None
+    warnings: list[str] = []
+
+    def _note(resolved: Path, source: str) -> ResolvedRoot:
+        if state_val is not None and resolved != state_val:
+            warnings.append(
+                f"Game directory {resolved} (from {source}) does not match "
+                f"the one recorded in this collection's state "
+                f"({state_val}). Using {resolved}."
+            )
+        return ResolvedRoot(resolved, False, source, list(warnings))
+
+    if explicit is not None:
+        if not explicit.is_dir():
+            return ResolvedRoot(
+                None, False, "flag",
+                problem=_bad_root(explicit, "Game directory"),
+            )
+        return _note(explicit, "flag")
+
+    cfg = UserConfig.load()
+    for game in cfg.games:
+        if not (isinstance(game, dict) and game.get("domain") == game_domain):
+            continue
+        configured = game.get("game_dir")
+        if not configured:
+            continue
+        candidate = Path(configured)
+        if candidate.is_dir():
+            return _note(candidate, "config")
+        warnings.append(
+            f"Game directory {candidate} (from config) is not an "
+            "existing directory; ignoring it."
+        )
+        break
+
+    detected = find_game_dir(game_domain) if game_domain else None
+    if detected is not None and detected.is_dir():
+        return _note(detected, "detected")
+
+    if state_val is not None:
+        return ResolvedRoot(state_val, True, "state", list(warnings))
+    return ResolvedRoot(None, False, "none", list(warnings))
+
+
+def resolve_proton_prefix(
+    explicit: Path | None,
+    state_prefix: str,
+    game_domain: str,
+) -> ResolvedRoot:
+    """Resolve the Proton prefix on the same priority as the game root.
+
+    A missing prefix is not an error: plenty of games are not Proton
+    games. But one the caller named has to be usable, because a prefix
+    is not only a place to write - it also decides how the deploy runs.
+    The state file's value is again the last resort and needs
+    confirmation.
+    """
+    from .config import UserConfig
+
+    state_val = Path(state_prefix) if state_prefix else None
+    warnings: list[str] = []
+
+    def _note(resolved: Path, source: str) -> ResolvedRoot:
+        if state_val is not None and resolved != state_val:
+            warnings.append(
+                f"Proton prefix {resolved} (from {source}) does not match "
+                f"the one recorded in this collection's state "
+                f"({state_val}). Using {resolved}."
+            )
+        return ResolvedRoot(resolved, False, source, list(warnings))
+
+    if explicit is not None:
+        if not explicit.is_dir():
+            return ResolvedRoot(
+                None, False, "flag",
+                problem=_bad_root(explicit, "Proton prefix"),
+            )
+        return _note(explicit, "flag")
+
+    cfg = UserConfig.load()
+    for game in cfg.games:
+        if not (isinstance(game, dict) and game.get("domain") == game_domain):
+            continue
+        configured = game.get("prefix")
+        if not configured:
+            continue
+        candidate = Path(configured)
+        if candidate.is_dir():
+            return _note(candidate, "config")
+        warnings.append(
+            f"Proton prefix {candidate} (from config) is not an existing "
+            "directory; ignoring it."
+        )
+        break
+
+    detected = find_proton_prefix(game_domain) if game_domain else None
+    if detected is not None and detected.is_dir():
+        return _note(detected, "detected")
+
+    if state_val is not None:
+        return ResolvedRoot(state_val, True, "state", list(warnings))
+    return ResolvedRoot(None, False, "none", list(warnings))
+
+
 def _validate_no_overlap(mods_dir: Path, game_dir: Path) -> str | None:
     """Reject staging/game directory overlap. Returns an error message or None.
 
@@ -876,6 +1056,10 @@ class ModSummary:
     version: str
     filename: str
     download_status: str
+    # The stored FOMOD option picks as {"step", "group", "option"}
+    # triples. They drive the deploy plan, so the listing has to carry
+    # them: otherwise "what did I pick" is unanswerable from the CLI.
+    fomod_picks: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1008,6 +1192,65 @@ def list_games(root: Path) -> list[GameSummary]:
     ]
 
 
+def _requirements_from_mod_info(info: dict | None) -> list[int]:
+    """Requirement mod_ids from a mod-info payload, or [].
+
+    The Nexus GraphQL collection query carries these under
+    ``modRequirements.nexusRequirements.nodes[].modId``. The REST mod
+    endpoint (``GET /v1/games/{domain}/mods/{id}.json``) carries no
+    requirements key at all (probed 2026-11-24), so a standalone `add`
+    is always silent here. Both shapes are accepted anyway; anything
+    else is "no list", not "no requirements", so the caller stays
+    silent rather than inventing an all-clear.
+    """
+    if not isinstance(info, dict):
+        return []
+    direct = info.get("requirements") or info.get("dependencies")
+    if isinstance(direct, list):
+        out: list[int] = []
+        for item in direct:
+            if isinstance(item, int):
+                out.append(item)
+            elif isinstance(item, dict) and "modId" in item:
+                try:
+                    out.append(int(item["modId"]))
+                except (TypeError, ValueError):
+                    continue
+        return out
+    nested = info.get("modRequirements") or {}
+    nexus = nested.get("nexusRequirements") or {}
+    nodes = nexus.get("nodes") or []
+    out = []
+    for node in nodes:
+        if isinstance(node, dict) and "modId" in node:
+            try:
+                out.append(int(node["modId"]))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def missing_requirements(state: CollectionState, requirements: list[int] | None) -> list[int]:
+    """Required mod_ids this collection does not have.
+
+    The check behind the `add` dependency warning. Collections handle
+    dependencies implicitly (the author includes them); `add` takes one
+    mod and has no idea what else that mod needs. In practice the REST
+    mod endpoint carries no requirements, so `add` alone never warns;
+    the check is meaningful when requirements come from the GraphQL
+    collection query or stored state.
+
+    Warn, never block: a missing dependency is a thing the user may know
+    about and have decided against. And an empty or absent list means
+    "nothing known", not "nothing needed": we cannot check what we
+    cannot see, and a false warning is worse than none.
+    """
+    if not requirements:
+        return []
+    installed = {ms.mod_id for ms in state.mods.values()}
+    return [r for r in requirements if r not in installed]
+
+
 def list_mods(mods_dir: Path) -> list[ModSummary]:
     """List tracked mods from local state only (read-only, no network).
 
@@ -1028,6 +1271,7 @@ def list_mods(mods_dir: Path) -> list[ModSummary]:
             version=ms.version,
             filename=ms.filename,
             download_status=ms.download_status,
+            fomod_picks=list(ms.fomod_picks),
         )
         for ms in state.mods.values()
     ]
@@ -1475,19 +1719,21 @@ class ModManagerService:
             for i, (mod_info, file_path) in enumerate(results):
                 try:
                     config_record = None
+                    contributed: list[str] = []
                     if not no_extract and is_archive(file_path):
                         final_files = extract_archive(file_path, mods_dir)
                         for ef in final_files:
                             rel = str(ef.relative_to(mods_dir))
+                            contributed.append(rel)
                             prev_owner = file_owners.get(rel)
                             if prev_owner:
                                 conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
                             file_owners[rel] = mod_info["mod_name"]
                         config_record = _fomod_config_record(file_path)
-                        file_path.unlink()
                         extracted += 1
                     else:
                         rel = str(file_path.relative_to(mods_dir))
+                        contributed.append(rel)
                         prev_owner = file_owners.get(rel)
                         if prev_owner:
                             conflicts.append(FileConflict(rel, mod_info["mod_name"], prev_owner))
@@ -1495,6 +1741,10 @@ class ModManagerService:
                     state.add_mod(mod_info)
                     if config_record is not None:
                         state.mods[mod_info["file_id"]].fomod_config = config_record
+                    # Attribution for `disable`: the extraction tree is
+                    # merged, so without this a disabled mod cannot be
+                    # told apart from its neighbours at deploy time.
+                    state.mods[mod_info["file_id"]].contributed_files = contributed
                     state.save()
                     pct = 0.75 + 0.15 * ((i + 1) / len(results))
                     progress("extract", pct, f"Extracted {mod_info['mod_name']}")
@@ -1603,13 +1853,24 @@ class ModManagerService:
                     for mod_info, file_path in results:
                         try:
                             config_record = None
+                            contributed: list[str] = []
                             if not no_extract and is_archive(file_path):
-                                extract_archive(file_path, mods_dir)
+                                final_files = extract_archive(file_path, mods_dir)
+                                contributed = [
+                                    str(ef.relative_to(mods_dir))
+                                    for ef in final_files
+                                ]
                                 config_record = _fomod_config_record(file_path)
-                                file_path.unlink()
+                            else:
+                                # A retained archive or a loose file is
+                                # this mod's footprint; disable needs it.
+                                contributed = [
+                                    str(file_path.relative_to(mods_dir))
+                                ]
                             state.add_mod(mod_info)
                             if config_record is not None:
                                 state.mods[mod_info["file_id"]].fomod_config = config_record
+                            state.mods[mod_info["file_id"]].contributed_files = contributed
                             downloaded += 1
                         except ExtractionError as e:
                             errors.append(f"Extraction error for {mod_info['mod_name']}: {exception_reason(e)}")
@@ -1788,7 +2049,8 @@ class ModManagerService:
                     success=False, error="Download failed"
                 )
 
-            progress("extract", 0.85, "Extracting...")
+            if not no_extract:
+                progress("extract", 0.85, "Extracting...")
             # Read the FOMOD installer (if any) and settle the option
             # choices BEFORE extracting anything, so a multi-file add
             # extracts nothing when one file's choices cannot be
@@ -1819,13 +2081,37 @@ class ModManagerService:
             add_warnings: list[str] = []
             if fomod_picks and not fomod_seen:
                 add_warnings.append(_unused_picks_warning(mod_name, no_extract))
+            # Warn, never block, when this mod's requirements are not
+            # installed. Collections include their dependencies; `add`
+            # takes one mod and has no idea what else it needs. The
+            # REST mod endpoint carries no requirements, so a GraphQL
+            # lookup supplies them; when that fails too, we stay silent
+            # rather than inventing an all-clear.
+            reqs = set(_requirements_from_mod_info(nexus_mod))
+            try:
+                reqs.update(self.api.get_mod_requirements(
+                    mod_info.game_domain, mod_info.mod_id,
+                ))
+            except Exception:  # noqa: S110 - best-effort, the warning is informational only
+                pass
+            for req_id in missing_requirements(state, sorted(reqs)):
+                add_warnings.append(
+                    f"missing dependency: mod {req_id} is not installed"
+                )
             config_record = None
+            contributed: list[str] = []
             for _mod, file_path in results:
                 try:
                     if not no_extract and is_archive(file_path):
-                        extract_archive(file_path, mods_dir)
+                        final_files = extract_archive(file_path, mods_dir)
+                        contributed.extend(
+                            str(ef.relative_to(mods_dir)) for ef in final_files
+                        )
                         config_record = _fomod_config_record(file_path)
-                        file_path.unlink()
+                    else:
+                        # A retained archive or a loose file is this
+                        # mod's footprint; disable needs to know it.
+                        contributed.append(str(file_path.relative_to(mods_dir)))
                 except ExtractionError as e:
                     return AddResult(
                         mod_name=mod_name, mod_id=mod_info.mod_id, file_name=selected_name,
@@ -1837,6 +2123,7 @@ class ModManagerService:
             state.add_mod(download_info)
             # State is keyed by file_id, not mod_id
             state.mods[selected_file_id].phase = 999
+            state.mods[selected_file_id].contributed_files = contributed
             if config_record is not None:
                 state.mods[selected_file_id].fomod_config = config_record
             if resolved_picks:
@@ -1915,21 +2202,33 @@ class ModManagerService:
         file_id: int | None = None,
         mod_id: int | None = None,
         no_load_order: bool = False,
+        force: bool = False,
     ) -> RemoveModResult:
-        """Remove one mod from collection state (safe removal).
+        """Remove one mod from collection state and from disk.
 
         Exactly one of file_id/mod_id must be given (ValueError
         otherwise); file_id resolves to its mod_id, and ALL state entries
         of that mod are removed. Unknown ids raise StateError before
         anything is mutated.
 
-        This never touches payload files on disk: extracted content and
-        retained archives stay exactly as they are (cleaning up deployed
-        files is undeploy's job). State is updated atomically under the
-        collection lock; a save failure raises StateError with the prior
-        state file left standing. Afterwards the load order is
-        regenerated from the remaining mods unless no_load_order is set;
-        a regeneration failure after the save is reported as a warning
+        Gone means gone. After the state entry is saved out, the files
+        this mod contributed and its retained archive are deleted. They
+        used to be left behind, and nothing ever reclaimed them: gc only
+        handles archives and keeps any it cannot claim, undeploy clears
+        the game directory and not the staging tree. Worse, an orphan
+        keeps deploying, because with no state entry nothing attributes
+        it and the folder heuristic ships whatever it finds.
+
+        A mod extracted before per-mod attribution existed has no file
+        list to delete, so its files stay and say so rather than being
+        guessed at. Removing a mod another one lists as a requirement is
+        refused unless ``force``, which warns instead.
+
+        State is updated atomically under the collection lock; a save
+        failure raises StateError with the prior state file left standing
+        and nothing deleted. Afterwards the load order is regenerated
+        from the remaining mods unless no_load_order is set; a
+        regeneration failure after the save is reported as a warning
         because the removal itself is already persisted.
 
         Removal is recorded as a tombstone so it survives sync/update:
@@ -1946,6 +2245,11 @@ class ModManagerService:
         """
         if (file_id is None) == (mod_id is None):
             raise ValueError("exactly one of file_id or mod_id is required")
+        if mod_id == 0:
+            # 0 is the "unknown" marker from_dict leaves behind, not a
+            # Nexus mod page. Matching it would act on every legacy entry
+            # at once, which is never what a caller asking for id 0 means.
+            raise ValueError("0 is not a real mod id")
 
         warnings: list[str] = []
         with CollectionLock(mods_dir):
@@ -1974,6 +2278,71 @@ class ModManagerService:
                 if ms.mod_id == target_mod_id
             )
             removed_name = state.mods[removed_file_ids[0]].name if removed_file_ids else ""
+
+            # Removing a mod another one requires breaks that mod. Say
+            # so before anything is touched; --force is for the user who
+            # knows better.
+            dependents = sorted(
+                {
+                    ms.name
+                    for fid, ms in state.mods.items()
+                    if ms.mod_id != target_mod_id
+                    and target_mod_id in (ms.requirements or [])
+                }
+            )
+            if dependents and not force:
+                raise StateError(
+                    f"{removed_name or target_mod_id} is required by "
+                    f"{', '.join(dependents)}; removing it would break "
+                    "them. Re-run with --force to remove it anyway."
+                )
+            if dependents:
+                warnings.append(
+                    f"{removed_name or target_mod_id} is required by "
+                    f"{', '.join(dependents)}; they may no longer work."
+                )
+
+            # What this mod put in the tree. Collected while the entries
+            # are still here; deleted only after the save lands, so a
+            # save failure leaves the content untouched. The state file
+            # is untrusted: a contributed_files entry or filename can
+            # name anything, and `base / rel` escapes on `..` and on
+            # absolute paths. Anything outside the collection is refused
+            # rather than deleted.
+            payload: dict[Path, str] = {}
+            refused: list[str] = []
+            unattributed: list[str] = []
+            archive_present = False
+            for fid in removed_file_ids:
+                ms = state.mods[fid]
+                if ms.contributed_files:
+                    for rel in ms.contributed_files:
+                        if not _is_safe_relative(rel):
+                            refused.append(rel)
+                            continue
+                        payload[mods_dir / rel] = rel
+                else:
+                    unattributed.append(ms.name or ms.filename or str(fid))
+                if ms.filename:
+                    if not _is_safe_relative(ms.filename):
+                        refused.append(ms.filename)
+                    else:
+                        archive = mods_dir / ms.filename
+                        if archive.is_file():
+                            archive_present = True
+                        payload[archive] = ms.filename
+
+            # A path a surviving mod also claims is not this mod's to
+            # take: removing one must not break another.
+            survivor_claims: set[str] = set()
+            for fid, ms in state.mods.items():
+                if fid in removed_file_ids:
+                    continue
+                if ms.contributed_files:
+                    survivor_claims.update(ms.contributed_files)
+                if ms.filename:
+                    survivor_claims.add(ms.filename)
+
             state.remove_mod(target_mod_id)
             # Tombstone positive Nexus mod pages only (see docstring).
             if target_mod_id > 0:
@@ -1987,6 +2356,38 @@ class ModManagerService:
                     f"Failed to save state after removing mod "
                     f"{target_mod_id}: {exception_reason(e)}"
                 ) from e
+
+            # Gone means gone. gc will not reclaim an archive no mod
+            # claims, so a leftover here would sit on disk forever, and
+            # without an attribution nothing stops it deploying either.
+            for rel in refused:
+                warnings.append(
+                    f"Refused to delete {rel}: it points outside the "
+                    "collection folder."
+                )
+            for path in sorted(payload):
+                rel = payload[path]
+                if rel in survivor_claims:
+                    warnings.append(
+                        f"Left {rel} in place: another mod still claims it."
+                    )
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as e:
+                    warnings.append(
+                        f"Could not remove {path}: {exception_reason(e)}"
+                    )
+            # A real downloaded mod leaves an archive behind. No archive
+            # and no attribution means there is nothing to warn about.
+            if unattributed and archive_present:
+                for name in unattributed:
+                    warnings.append(
+                        f"{name} was extracted before per-mod attribution "
+                        "existed, so its files cannot be attributed and were "
+                        "left on disk. Delete them by hand if you want them "
+                        "gone."
+                    )
 
             if not no_load_order:
                 try:
@@ -2122,6 +2523,7 @@ class ModManagerService:
         prefix: Path | None = None,
         use_copy: bool = False,
         on_progress: ProgressCallback | None = None,
+        on_file_progress: "Callable[[int, int, str], None] | None" = None,
     ) -> DeployResult:
         """Deploy mods from staging to game directory.
 
@@ -2131,6 +2533,11 @@ class ModManagerService:
         overwritten. The previous deployment is removed safely first; if any
         old entry cannot be safely removed, the redeploy stops and the
         remaining entries stay in state for retry.
+
+        ``on_file_progress(done, total, detail)`` fires once per file in
+        the write loop. It is separate from ``on_progress`` because the
+        loop is the long silent phase and a caller rendering a progress
+        line needs the raw counts, not a pre-baked message.
         """
         progress = on_progress or _noop_progress
 
@@ -2139,27 +2546,80 @@ class ModManagerService:
             state.load()
             game_domain = state.game_domain
 
-            # Resolve game directory
-            if game_dir is None and state.game_dir:
-                game_dir = Path(state.game_dir)
+            # Resolve the game root and Proton prefix by trust priority:
+            # explicit flag, then the user config, then detection. The
+            # state file is the last resort and never a source of truth
+            # on its own (see resolve_game_root). A caller that cannot
+            # confirm must pass the root explicitly.
+            progress("detect", 0.05, "Resolving game directory...")
+            root = resolve_game_root(game_dir, state.game_dir, game_domain)
+            game_dir = root.path
+            deploy_warnings: list[str] = list(root.warnings)
+            if root.problem:
+                return DeployResult(
+                    0, [], [root.problem], str(game_dir or ""), False,
+                    warnings=deploy_warnings,
+                )
+            if root.needs_confirmation:
+                return DeployResult(
+                    0, [],
+                    [
+                        (
+                            f"The only game directory on record is "
+                            f"{game_dir}, from this collection's state "
+                            "file. That value cannot be verified. Pass "
+                            "--game-dir to name the directory yourself."
+                        )
+                    ],
+                    str(game_dir or ""),
+                    False,
+                    warnings=deploy_warnings,
+                )
             if game_dir is None:
-                progress("detect", 0.05, "Detecting game directory from Steam...")
-                game_dir = find_game_dir(game_domain)
-                if game_dir is None:
-                    return DeployResult(0, [], ["Could not find game directory. Use game_dir param."], "", False, warnings=[])
+                return DeployResult(
+                    0, [],
+                    ["Could not find game directory. Use game_dir param."],
+                    "",
+                    False,
+                    warnings=deploy_warnings,
+                )
 
             if not game_dir.exists():
-                return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=[])
+                return DeployResult(0, [], [f"Game directory does not exist: {game_dir}"], str(game_dir), False, warnings=deploy_warnings)
 
             overlap_error = _validate_no_overlap(mods_dir, game_dir)
             if overlap_error:
-                return DeployResult(0, [], [overlap_error], str(game_dir), False, warnings=[])
+                return DeployResult(0, [], [overlap_error], str(game_dir), False, warnings=deploy_warnings)
 
-            # Trusted roots for recovery come from configuration only (never
-            # from journal content): the resolved game dir plus any recorded
-            # game dir/prefix from previous runs.
+            prefix_root = resolve_proton_prefix(prefix, state.proton_prefix, game_domain)
+            prefix = prefix_root.path
+            deploy_warnings.extend(prefix_root.warnings)
+            if prefix_root.problem:
+                return DeployResult(
+                    0, [], [prefix_root.problem], str(game_dir or ""), False,
+                    warnings=deploy_warnings,
+                )
+            if prefix_root.needs_confirmation:
+                return DeployResult(
+                    0, [],
+                    [
+                        (
+                            f"The only Proton prefix on record is "
+                            f"{prefix}, from this collection's state "
+                            "file. That value cannot be verified. Pass "
+                            "--prefix to name it yourself."
+                        )
+                    ],
+                    str(game_dir),
+                    False,
+                    warnings=deploy_warnings,
+                )
+
+            # Trusted roots for recovery are the roots we just resolved,
+            # never raw state values: a crafted game_dir in state must not
+            # become a recovery root any more than a write root.
             recovery_roots: list[Path] = []
-            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+            for candidate in (game_dir, prefix):
                 if candidate:
                     p = Path(candidate)
                     if p not in recovery_roots:
@@ -2175,14 +2635,6 @@ class ModManagerService:
                 state.save()
                 journal.clear()
 
-            # Resolve Proton prefix before the checks, so they report on
-            # the value this deploy will actually use. The parameter wins
-            # over state, and auto-detection is the last resort.
-            if prefix is None and state.proton_prefix:
-                prefix = Path(state.proton_prefix)
-            if prefix is None:
-                prefix = find_proton_prefix(game_domain)
-
             # Pre-deploy validation.
             #
             # Proton/Wine cannot read Linux symlinks that cross outside
@@ -2190,11 +2642,16 @@ class ModManagerService:
             # files the game sees by name but cannot load. Force copy
             # mode whenever a Proton prefix is in play.
             method = "copy" if use_copy else "symlink"
-            proton_symlink_override = method == "symlink" and prefix
+            # A prefix is not just a place to write: it is what makes
+            # Proton unable to follow symlinks. Only a real directory
+            # gets to change the method; anything else is not a prefix.
+            proton_symlink_override = (
+                method == "symlink" and prefix is not None and prefix.is_dir()
+            )
             if proton_symlink_override:
                 method = "copy"
             check_warnings = self.pre_deploy_checks(state, game_dir, mods_dir, method, prefix)
-            deploy_warnings = [w.message for w in check_warnings]
+            deploy_warnings = deploy_warnings + [w.message for w in check_warnings]
             deploy_warnings.extend(reports)
             if proton_symlink_override:
                 deploy_warnings.append(
@@ -2215,9 +2672,17 @@ class ModManagerService:
             # never tears down a working deployment.
             progress("classify", 0.15, "Classifying files...")
             manifest_choices = {}
+            expected_plugins: list[str] = []
             if state.manifest_data:
                 manifest = CollectionManifest.from_dict(state.manifest_data)
                 manifest_choices = manifest.mod_choices
+                # Plugin names the load order knows. Used at publish to
+                # fix up a case mismatch before the game sees it.
+                expected_plugins = [
+                    str(p.get("filename") or p.get("name") or "")
+                    for p in (manifest.plugins or [])
+                    if (p.get("filename") or p.get("name"))
+                ]
             # FOMOD option picks recorded by standalone adds and imports.
             fomod_picks = {
                 mod.file_id: mod.fomod_picks
@@ -2233,6 +2698,14 @@ class ModManagerService:
                 for mod in state.mods.values()
                 if mod.fomod_config
             }
+            # What the game looks like from here: the load order the
+            # installer's fileDependency/gameDependency conditions are
+            # answered against. Without it those conditions are
+            # undecidable and multi-game installers fall back to the
+            # folder heuristic.
+            from .game_state import read_game_state
+
+            game_state = read_game_state(prefix, game_domain)
             plan = classify_files(
                 mods_dir,
                 game_domain,
@@ -2242,7 +2715,45 @@ class ModManagerService:
                 mod_names={
                     mod.file_id: mod.name for mod in state.mods.values()
                 },
+                game=game_state,
             )
+
+            # A disabled mod is "temporarily not installed": its state
+            # entry, its picks, and its files on disk all stay, but its
+            # files must not land. The extraction tree is merged, so this
+            # works through the attribution recorded at extract time.
+            # A mod with no attribution cannot be isolated, and says so
+            # rather than guessing.
+            disabled_paths: set[str] = set()
+            unattributed: list[str] = []
+            for mod in state.mods.values():
+                if mod.enabled:
+                    continue
+                if mod.contributed_files:
+                    disabled_paths.update(mod.contributed_files)
+                else:
+                    unattributed.append(mod.name)
+            if disabled_paths:
+                plan.data_files = [
+                    (src, dest)
+                    for src, dest in plan.data_files
+                    if str(src.relative_to(mods_dir)) not in disabled_paths
+                ]
+                plan.game_root_files = [
+                    (src, dest)
+                    for src, dest in plan.game_root_files
+                    if str(src.relative_to(mods_dir)) not in disabled_paths
+                ]
+            for name in unattributed:
+                deploy_warnings.append(
+                    f"{name} is disabled but its files cannot be isolated "
+                    "(no per-mod attribution on record for it); re-add or "
+                    "re-sync it to record one"
+                )
+
+            # The service owns plan.warnings. run_deploy does not seed
+            # its result with them: merging both lists reported every
+            # plan warning twice.
             deploy_warnings.extend(plan.warnings)
 
             if plan.total_files == 0:
@@ -2256,7 +2767,7 @@ class ModManagerService:
 
             backups = BackupStore(mods_dir)
             roots = []
-            for candidate in (game_dir, state.game_dir, prefix, state.proton_prefix):
+            for candidate in (game_dir, prefix):
                 if candidate:
                     p = Path(candidate)
                     if p not in roots:
@@ -2285,10 +2796,25 @@ class ModManagerService:
 
             # Deploy
             progress("deploy", 0.3, f"Deploying {plan.total_files} files via {method}...")
+
+            def _file_progress(done: int, total: int, detail: str) -> None:
+                if on_file_progress is not None:
+                    on_file_progress(done, total, detail)
+                # The write loop is the long silent phase; 0.3 to 1.0 is
+                # the span left after classify/undeploy.
+                frac = (done / total) if total else 1.0
+                progress("deploy", 0.3 + 0.7 * frac, detail)
+
             result = deploy_files(
                 plan, game_dir, method=method, dry_run=False,
                 backups=backups, journal=journal, ownership=ownership,
+                on_progress=_file_progress,
+                expected_plugins=expected_plugins,
             )
+            # deploy() reports what it had to change to land the files
+            # (case fixups, case collisions). Those are the user's to
+            # see; dropping them here made the rename silent.
+            deploy_warnings.extend(result.warnings)
 
             # Write plugins.txt and the game INI through the same tracking,
             # but only when the file deployment itself had no failures.
@@ -2311,21 +2837,46 @@ class ModManagerService:
                             existing_plugins = stripped
                             break
                 if not existing_plugins:
-                    plugin_exts = (".esp", ".esm", ".esl")
-                    seen_plugins: set[str] = set()
+                    # The collection author's plugin order is the intent;
+                    # the deployed files are only a fallback for a manifest
+                    # that carries none. Sorting deployed files by the mod
+                    # order puts a master after its dependents.
                     plugin_lines: list[str] = []
-                    for df in result.deployed:
-                        if df.kind != "mod":
+                    manifest_plugins = []
+                    if state.manifest_data:
+                        try:
+                            manifest_plugins = (
+                                CollectionManifest.from_dict(
+                                    state.manifest_data
+                                ).plugins
+                                or []
+                            )
+                        except Exception:
+                            manifest_plugins = []
+                    for plugin in manifest_plugins:
+                        name = plugin.get("filename") or plugin.get("name") or ""
+                        if not name:
                             continue
-                        name = Path(df.dest).name
-                        if not name.lower().endswith(plugin_exts):
-                            continue
-                        if name not in seen_plugins:
-                            seen_plugins.add(name)
-                            plugin_lines.append(f"*{name}")
+                        prefix_mark = "*" if plugin.get("enabled", True) else ""
+                        plugin_lines.append(f"{prefix_mark}{name}")
+                    if not plugin_lines:
+                        plugin_exts = (".esp", ".esm", ".esl")
+                        seen_plugins: set[str] = set()
+                        for df in result.deployed:
+                            if df.kind != "mod":
+                                continue
+                            name = Path(df.dest).name
+                            if not name.lower().endswith(plugin_exts):
+                                continue
+                            if name not in seen_plugins:
+                                seen_plugins.add(name)
+                                plugin_lines.append(f"*{name}")
+                        origin = "generated from deployed files"
+                    else:
+                        origin = "from collection metadata"
                     if plugin_lines:
                         plugins_src.write_text(
-                            "# Plugin Load Order (generated from deployed files)\n"
+                            f"# Plugin Load Order ({origin})\n"
                             "# Generated by nexus-collection-dl\n"
                             f"# Game: {game_domain}\n"
                             "#\n"
@@ -2382,7 +2933,13 @@ class ModManagerService:
                 warnings=deploy_warnings,
             )
 
-    def undeploy(self, mods_dir: Path) -> int:
+    def undeploy(
+        self,
+        mods_dir: Path,
+        *,
+        game_dir: Path | None = None,
+        prefix: Path | None = None,
+    ) -> int:
         """Remove all deployed mod files and restore backed-up originals.
 
         Returns the number of cleared deployment entries on full success.
@@ -2390,12 +2947,47 @@ class ModManagerService:
         refused or failed, carrying the removed count plus the refused and
         failed paths, so callers never report a partial undeploy as clean.
         Refused/failed entries stay in state so the operation is retryable.
+
+        The roots these deletions are contained against are resolved by
+        trust priority (explicit flag, user config, detection), never read
+        from the state file as a source of truth. A crafted ``game_dir``
+        would otherwise turn the whole filesystem into a trusted root and
+        anything whose fingerprint still matches would be unlinked. Pass
+        the root explicitly when the collection's state is the only record
+        of where it was deployed.
         """
         with CollectionLock(mods_dir):
             state = CollectionState(mods_dir)
             state.load()
 
-            roots = [Path(p) for p in (state.game_dir, state.proton_prefix) if p]
+            resolved = resolve_game_root(
+                game_dir, state.game_dir, state.game_domain
+            )
+            if resolved.needs_confirmation:
+                raise StateError(
+                    f"The only game directory on record is {resolved.path}, "
+                    "from this collection's state file. That value cannot "
+                    "be verified. Pass --game-dir to name the directory "
+                    "yourself."
+                )
+            prefix_resolved = resolve_proton_prefix(
+                prefix, state.proton_prefix, state.game_domain
+            )
+            if prefix_resolved.needs_confirmation:
+                raise StateError(
+                    f"The only Proton prefix on record is "
+                    f"{prefix_resolved.path}, from this collection's state "
+                    "file. That value cannot be verified. Pass --prefix to "
+                    "name it yourself."
+                )
+            roots = [
+                Path(p) for p in (resolved.path, prefix_resolved.path) if p
+            ]
+            if not roots:
+                raise StateError(
+                    "Could not resolve a game directory to contain the "
+                    "removal. Pass --game-dir to name the directory."
+                )
             ownership, reports = recover_ownership(state.deployed_files, mods_dir, roots)
             journal = DeployJournal(mods_dir)
             if journal.exists() or reports:
@@ -2511,14 +3103,20 @@ class ModManagerService:
             resolved = _resolve_fomod_picks(
                 config, archive.name, picks, mod.fomod_picks, on_fomod_prompt
             )
-            if not resolved:
+            if not resolved and _config_has_choices(config):
                 raise FomodChoicesError(archive.name)
 
-            extract_archive(archive, mods_dir)
+            final_files = extract_archive(archive, mods_dir)
             config_record = _fomod_config_record(archive)
             mod.download_status = "downloaded"
             mod.browser_url = ""
             mod.installed_at = datetime.now(timezone.utc).isoformat()
+            # Attribution for `disable` and `gc`: the extraction tree is
+            # merged, so without this a disabled mod cannot be told
+            # apart from its neighbours at deploy time.
+            mod.contributed_files = [
+                str(ef.relative_to(mods_dir)) for ef in final_files
+            ]
             mod.fomod_picks = [
                 {"step": p.step, "group": p.group, "option": p.option}
                 for p in resolved
@@ -2529,10 +3127,6 @@ class ModManagerService:
             # removal tombstone for the page goes with the same commit.
             state.clear_removed(mod.mod_id)
             state.save()
-            try:
-                archive.unlink()
-            except OSError:
-                pass
 
         return (
             f"{mod.name or mod.filename} installed with "
@@ -2689,6 +3283,7 @@ class ModManagerService:
                 config_record = None
                 scoped = None
                 fomod_seen = False
+                contributed: list[str] = []
                 try:
                     from .fomod_select import picks_for_file
 
@@ -2708,9 +3303,17 @@ class ModManagerService:
                                 mod_state.fomod_picks,
                                 on_fomod_prompt,
                             )
-                        extract_archive(match, mods_dir)
+                        final_files = extract_archive(match, mods_dir)
+                        contributed = [
+                            str(ef.relative_to(mods_dir)) for ef in final_files
+                        ]
                         config_record = _fomod_config_record(match)
                         extracted += 1
+                    else:
+                        # A retained archive or a loose file: whatever is
+                        # on disk is this mod's footprint, and disable
+                        # needs to know it.
+                        contributed = [str(match.relative_to(mods_dir))]
                 except FomodInstallerError as e:
                     # Same contract as a failed extraction: report it and
                     # leave the item pending rather than abort the batch.
@@ -2746,20 +3349,14 @@ class ModManagerService:
                         {"step": p.step, "group": p.group, "option": p.option}
                         for p in resolved_picks
                     ]
+                # Attribution for `disable` and `gc`: the extraction tree
+                # is merged, so without this a disabled mod cannot be
+                # told apart from its neighbours at deploy time.
+                mod_state.contributed_files = contributed
                 # Importing this mod's file is an explicit re-add of the mod
                 # page, so any tombstone for it is cleared with the commit.
                 state.clear_removed(mod_state.mod_id)
-                # Persist before any destructive cleanup so a mid-run failure
-                # cannot lose progress for already-imported items.
                 state.save()
-
-                if not no_extract and is_arch:
-                    try:
-                        match.unlink()
-                    except OSError as e:
-                        # The import itself succeeded and is persisted; a leftover
-                        # archive is reported but does not roll back the success.
-                        errors.append(f"Could not remove {match.name} after import: {exception_reason(e)}")
 
                 pct = 0.1 + 0.8 * ((i + 1) / len(pending))
                 progress("import", pct, f"Imported {mod_state.name}")
@@ -2922,11 +3519,10 @@ class ModManagerService:
                         warnings=dup_warnings,
                     )
                 # Artifact gone or corrupt: do not blindly trust the state
-                # flag; fall through and re-download. Note this is the
-                # normal path for a re-click after a successful download:
-                # the default flow deletes the archive once extraction is
-                # persisted, so a downloaded+extracted entry re-downloads
-                # (with full verification). Zero-network handling of a
+                # flag; fall through and re-download. With archives kept
+                # after extraction, a healthy downloaded entry hits the
+                # already_downloaded no-op above, so this is only the
+                # lost-or-damaged case. Zero-network handling of a
                 # retained sane archive lives above (downloaded entries:
                 # already_downloaded no-op) and below (pending entries:
                 # extraction is completed from the archive).
@@ -2993,7 +3589,7 @@ class ModManagerService:
                         f"Extracting retained archive {archive.name}...",
                     )
                     try:
-                        extract_archive(archive, target)
+                        final_files = extract_archive(archive, target)
                     except ExtractionError as e:
                         # Entry stays pending and the archive stays put:
                         # nothing was downloaded, nothing is overwritten.
@@ -3012,6 +3608,12 @@ class ModManagerService:
                     existing.download_status = "downloaded"
                     existing.browser_url = ""
                     existing.installed_at = datetime.now(timezone.utc).isoformat()
+                    # Attribution for `disable` and `gc`. The archive is
+                    # kept on purpose here, so the payload list is what
+                    # tells gc it is now redundant.
+                    existing.contributed_files = [
+                        str(ef.relative_to(target)) for ef in final_files
+                    ]
                     if config_record is not None:
                         existing.fomod_config = config_record
                     # Committing this completion is explicit re-add intent,
@@ -3247,6 +3849,10 @@ class ModManagerService:
 
             extracted = False
             config_record = None
+            # Default footprint is the downloaded file itself: a retained
+            # archive or a loose file is what this mod put on disk. An
+            # extraction below replaces it with the published payload.
+            contributed = [str(path.relative_to(target))]
             if not no_extract and is_archive(path):
                 blocker = _nxm_fomod_blocker(path)
                 if blocker is not None:
@@ -3287,7 +3893,10 @@ class ModManagerService:
                         ),
                     )
                 try:
-                    extract_archive(path, target)
+                    final_files = extract_archive(path, target)
+                    contributed = [
+                        str(ef.relative_to(target)) for ef in final_files
+                    ]
                     extracted = True
                     config_record = _fomod_config_record(path)
                 except ExtractionError as e:
@@ -3389,6 +3998,10 @@ class ModManagerService:
                 version = selected.get("version")
                 if version:
                     existing.version = str(version)
+                # Attribution for `disable` and `gc`: the extraction tree
+                # is merged, so without this a disabled mod cannot be
+                # told apart from its neighbours at deploy time.
+                existing.contributed_files = contributed
                 if config_record is not None:
                     existing.fomod_config = config_record
             else:
@@ -3397,6 +4010,7 @@ class ModManagerService:
                 state.add_mod(download_info)
                 # State is keyed by file_id, not mod_id
                 state.mods[info.file_id].phase = 999
+                state.mods[info.file_id].contributed_files = contributed
                 if config_record is not None:
                     state.mods[info.file_id].fomod_config = config_record
             # Completing this download is explicit re-add intent, so the
@@ -3430,14 +4044,6 @@ class ModManagerService:
                     mod_name=mod_name,
                     filename=filename,
                 )
-
-            # The archive is removed only now that the completion is
-            # persisted, and only when this run downloaded and extracted
-            # it: a caller-owned, newly downloaded file, never a pre-existing
-            # one.
-            if extracted:
-                with contextlib.suppress(OSError):
-                    path.unlink()
 
             # Same post-download steps as add/import: tracked-mod sync and
             # load order regeneration. Both run AFTER the successful save,
@@ -4247,6 +4853,31 @@ def _health_locks(
     return [HealthCheck("State locks", "OK", detail)]
 
 
+def _health_user_config() -> list[HealthCheck]:
+    """Has the tool ever been set up?
+
+    The front door's signal: a missing or unusable user config is a
+    first run, and `health` is the one place that looks at the whole
+    installation, so it is where a fresh install gets noticed.
+    """
+    from .config import UserConfig
+
+    cfg = UserConfig.load()
+    if cfg.is_configured():
+        return [HealthCheck("User config", "OK", f"collections root: {cfg.collections_root}")]
+    return [
+        HealthCheck(
+            "User config",
+            "WARN",
+            "not configured (first run)",
+            remedy=(
+                "Set a collections root: the directory collection folders "
+                "live under. Until then every command asks for its paths."
+            ),
+        )
+    ]
+
+
 def collect_health(
     root: Path,
     *,
@@ -4279,6 +4910,7 @@ def collect_health(
 
     checks: list[HealthCheck] = []
     for label, fn in (
+        ("User config", _health_user_config),
         ("API key", lambda: _health_api_key(probes, api_key_present)),
         ("nxm handler", lambda: _health_handler(probes)),
         ("Notifications", lambda: _health_notifications(probes)),

@@ -50,6 +50,13 @@ class Env:
     pass
 
 
+@pytest.fixture(autouse=True)
+def _no_steam(monkeypatch, tmp_path):
+    """Detection must not reach this machine's real Steam library."""
+    monkeypatch.setenv("NEXUS_DL_STEAM_ROOT", str(tmp_path / "no-steam"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-config"))
+
+
 @pytest.fixture()
 def env(tmp_path: Path) -> Env:
     e = Env()
@@ -574,15 +581,15 @@ def test_undeploy_counts_mod_files_only(env):
 
 
 def test_service_deploy_and_undeploy_report_the_same_count(svc, tmp_path):
-    mods, _game, _prefix = _svc_env(tmp_path, {
+    mods, game, prefix = _svc_env(tmp_path, {
         "ModA/plugin.esp": b"a",
         "ModB/other.esp": b"b",
         "plugins.txt": b"plugin.esp\n",
     })
-    result = svc.deploy(mods)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 2, result.errors
 
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed == 2
 
 
@@ -594,9 +601,11 @@ def test_service_rejects_staging_inside_game(svc, tmp_path):
     (mods / "ModA" / "plugin.esp").write_bytes(b"x")
     state = CollectionState(mods)
     state.set_collection_info("u", "n", 1, DOMAIN)
-    state.proton_prefix = str(tmp_path / "pfx")
+    prefix = tmp_path / "pfx"
+    prefix.mkdir()
+    state.proton_prefix = str(prefix)
     state.save()
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 0
     assert any("inside the game directory" in e for e in result.errors)
 
@@ -646,12 +655,12 @@ def test_pre_deploy_checks_still_report_a_missing_prefix(svc, tmp_path):
 
 
 def test_busy_lock_serializes_deploy_and_undeploy(svc, tmp_path):
-    mods, game, _prefix = _svc_env(tmp_path)
+    mods, game, prefix = _svc_env(tmp_path)
     with CollectionLock(mods):
         with pytest.raises(StateBusyError):
-            svc.deploy(mods, game_dir=game)
+            svc.deploy(mods, game_dir=game, prefix=prefix)
         with pytest.raises(StateBusyError):
-            svc.undeploy(mods)
+            svc.undeploy(mods, game_dir=game, prefix=prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +843,7 @@ def test_no_cross_directory_renames_during_cycle(env: Env, monkeypatch):
 
 def test_service_deploy_undeploy_full_cycle(svc, tmp_path):
     mods, game, prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 1, result.errors
     assert not result.errors
 
@@ -852,7 +861,7 @@ def test_service_deploy_undeploy_full_cycle(svc, tmp_path):
     assert state.deployed_at
     assert not (mods / ".nexus-journal.jsonl").exists()  # cleared after save
 
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert not dest.exists()
     assert not (game / "Data" / "ModA").exists()
@@ -874,14 +883,14 @@ def test_service_preserves_original_plugins_and_ini(svc, tmp_path):
     ini_path.parent.mkdir(parents=True)
     ini_path.write_bytes(b"[Display]\niSize H=1080\n")
 
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert not result.errors
     assert plugins_dest.read_bytes() == b"*ModA.esp\n"
     merged = ini_path.read_text()
     assert "[Display]" in merged and "iSize H=1080" in merged  # user keys kept
     assert "bInvalidateOlderFiles=1" in merged
 
-    svc.undeploy(mods)
+    svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert plugins_dest.read_bytes() == b"USER PLUGINS\n"
     assert stat.S_IMODE(plugins_dest.stat().st_mode) == 0o640
     assert ini_path.read_bytes() == b"[Display]\niSize H=1080\n"
@@ -895,7 +904,7 @@ def test_service_deploy_failure_skips_plugins_and_ini(svc, tmp_path):
     outside.mkdir()
     (game / "Data").symlink_to(outside)  # forces every data-file deploy to refuse
 
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 0
     assert result.errors
     assert not get_game_ini_path(prefix, DOMAIN).exists()
@@ -904,13 +913,13 @@ def test_service_deploy_failure_skips_plugins_and_ini(svc, tmp_path):
 
 
 def test_service_redeploy_stops_on_unsafe_removal(svc, tmp_path):
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game, use_copy=True)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
     dest.write_bytes(b"ESP BYTES")  # same size as b"esp bytes", user edit
 
-    result2 = svc.deploy(mods, game_dir=game, use_copy=True)
+    result2 = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert result2.deployed_count == 0
     assert any("Redeploy stopped" in e for e in result2.errors)
     assert dest.read_bytes() == b"ESP BYTES"  # user edit intact
@@ -921,14 +930,14 @@ def test_service_redeploy_stops_on_unsafe_removal(svc, tmp_path):
 
 
 def test_service_undeploy_partial_raises_and_retry_succeeds(svc, tmp_path):
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game, use_copy=True)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
     dest.write_bytes(b"ESP BYTES")  # external same-size edit
 
     with pytest.raises(UndeployError) as excinfo:
-        svc.undeploy(mods)
+        svc.undeploy(mods, game_dir=game, prefix=prefix)
     err = excinfo.value
     assert len(err.refused) == 1 and str(dest) in err.refused[0]
     assert dest.read_bytes() == b"ESP BYTES"  # untouched
@@ -938,7 +947,7 @@ def test_service_undeploy_partial_raises_and_retry_succeeds(svc, tmp_path):
 
     # Repair the file to the deployed content and retry: clean success
     dest.write_bytes(b"esp bytes")
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed == 1
     assert not dest.exists()
     state = CollectionState(mods)
@@ -947,7 +956,7 @@ def test_service_undeploy_partial_raises_and_retry_succeeds(svc, tmp_path):
 
 
 def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkeypatch):
-    mods, game, _prefix = _svc_env(tmp_path)
+    mods, game, prefix = _svc_env(tmp_path)
     real_save = CollectionState.save
 
     def failing_save(self):
@@ -955,7 +964,7 @@ def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkey
 
     monkeypatch.setattr(CollectionState, "save", failing_save)
     with pytest.raises(StateError):
-        svc.deploy(mods, game_dir=game)
+        svc.deploy(mods, game_dir=game, prefix=prefix)
     monkeypatch.setattr(CollectionState, "save", real_save)
 
     # State on disk has no deployment, but the journal and files exist
@@ -968,26 +977,26 @@ def test_service_state_save_failure_after_install_recovers(svc, tmp_path, monkey
 
     # Next deploy recovers ownership from the journal, removes the old
     # deployment safely, and redeploys.
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 1, result.errors
     assert dest.is_file()
     state = CollectionState(mods)
     state.load()
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
 
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert not dest.exists()
 
 
 def test_service_nothing_to_deploy_keeps_existing_deployment(svc, tmp_path):
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result.deployed_count == 1
 
     # Empty the staging content; redeploy must not tear down the deployment
     (mods / "ModA" / "plugin.esp").unlink()
-    result2 = svc.deploy(mods, game_dir=game)
+    result2 = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert result2.deployed_count == 0
     assert any("left in place" in e for e in result2.errors)
     dest = game / "Data" / "ModA" / "plugin.esp"
@@ -1141,7 +1150,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
 ):
     """Real service.deploy failing mid-publish: journal kept, failed dest never
     enters ownership, retry completes cleanly, undeploy restores original bytes."""
-    mods, game, _prefix = _svc_env(
+    mods, game, prefix = _svc_env(
         tmp_path,
         staging_files={"ModA/plugin.esp": b"esp a", "ModB/other.esp": b"esp b"},
     )
@@ -1157,7 +1166,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
         return real_replace(s, d, **kw)
 
     monkeypatch.setattr(os, "replace", failing_replace)
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     monkeypatch.setattr(os, "replace", real_replace)
 
     # Failed run: error surfaced, destination untouched, journal NOT cleared
@@ -1172,7 +1181,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
 
     # Retry without the fault: recovery folds the dangling intent, deploy
     # completes cleanly, and only then is the journal discarded.
-    result2 = svc.deploy(mods, game_dir=game)
+    result2 = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert not result2.errors, result2.errors
     state = CollectionState(mods)
     state.load()
@@ -1181,7 +1190,7 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
     assert not (mods / ".nexus-journal.jsonl").exists()
 
     # Undeploy restores the user's original bytes exactly.
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 2
     assert orig_b.read_bytes() == b"USER ORIGINAL B"
     assert not (game / "Data" / "ModA" / "plugin.esp").exists()
@@ -1189,14 +1198,14 @@ def test_service_deploy_publish_failure_preserves_journal_and_recovers(
 
 def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeypatch):
     """Ownership lands in saved state even when journal done lines are lost."""
-    mods, game, _prefix = _svc_env(tmp_path)
+    mods, game, prefix = _svc_env(tmp_path)
     real_done = DeployJournal.deploy_done
 
     def failing_done(self, dest_str):
         raise OSError(28, "injected ENOSPC on journal completion line")
 
     monkeypatch.setattr(DeployJournal, "deploy_done", failing_done)
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     monkeypatch.setattr(DeployJournal, "deploy_done", real_done)
 
     assert not result.errors, result.errors
@@ -1207,7 +1216,7 @@ def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeyp
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
 
     # The deployment is fully tracked from state alone: undeploy is clean.
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert not dest.exists()
     state = CollectionState(mods)
@@ -1218,13 +1227,13 @@ def test_service_lost_done_line_keeps_state_and_undeploys(svc, tmp_path, monkeyp
 def test_service_redeploy_stop_preserves_journal(svc, tmp_path):
     """A redeploy that stops on an unsafe removal keeps the dangling undeploy
     intent recoverable; repairing and redeploying finishes cleanly."""
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game, use_copy=True)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
     dest.write_bytes(b"ESP BYTES")  # external same-size edit
 
-    result2 = svc.deploy(mods, game_dir=game, use_copy=True)
+    result2 = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert any("Redeploy stopped" in e for e in result2.errors)
     assert (mods / ".nexus-journal.jsonl").exists()
     assert DeployJournal(mods).read()  # dangling entries retained, not cleared
@@ -1235,12 +1244,12 @@ def test_service_redeploy_stop_preserves_journal(svc, tmp_path):
 
     # Repair to the deployed content and redeploy: clean success
     dest.write_bytes(b"esp bytes")
-    result3 = svc.deploy(mods, game_dir=game, use_copy=True)
+    result3 = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert not result3.errors, result3.errors
     assert not (mods / ".nexus-journal.jsonl").exists()
     assert dest.read_bytes() == b"esp bytes"
 
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert not dest.exists()
 
@@ -1249,8 +1258,8 @@ def test_service_interrupted_undeploy_retains_entries_and_journal(
     svc, tmp_path, monkeypatch
 ):
     """An interrupted removal keeps both the state entry and the journal."""
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
 
@@ -1263,7 +1272,7 @@ def test_service_interrupted_undeploy_retains_entries_and_journal(
 
     monkeypatch.setattr(os, "unlink", failing_unlink)
     with pytest.raises(UndeployError) as excinfo:
-        svc.undeploy(mods)
+        svc.undeploy(mods, game_dir=game, prefix=prefix)
     monkeypatch.setattr(os, "unlink", real_unlink)
 
     err = excinfo.value
@@ -1275,7 +1284,7 @@ def test_service_interrupted_undeploy_retains_entries_and_journal(
     assert any(r["dest"] == str(dest) for r in state.deployed_files)
 
     # Retry with the fault gone: recovery folds the intent, removal completes
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert not dest.exists()
     assert not (mods / ".nexus-journal.jsonl").exists()
@@ -1289,12 +1298,12 @@ def test_service_corrupt_backup_mid_restore_never_replaces_deployed_file(
 ):
     """M: the staged restore copy is re-hashed before publish; a backup that
     turns corrupt after pre-verification leaves the deployed file in place."""
-    mods, game, _prefix = _svc_env(tmp_path)
+    mods, game, prefix = _svc_env(tmp_path)
     dest = game / "Data" / "ModA" / "plugin.esp"
     dest.parent.mkdir(parents=True)
     dest.write_bytes(b"USER ORIGINAL")
 
-    result = svc.deploy(mods, game_dir=game, use_copy=True)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix, use_copy=True)
     assert not result.errors, result.errors
     assert dest.read_bytes() == b"esp bytes"
 
@@ -1307,7 +1316,7 @@ def test_service_corrupt_backup_mid_restore_never_replaces_deployed_file(
     monkeypatch.setattr(BackupStore, "verify", lambda self, name, sha: True)
 
     with pytest.raises(UndeployError) as excinfo:
-        svc.undeploy(mods)
+        svc.undeploy(mods, game_dir=game, prefix=prefix)
     monkeypatch.setattr(BackupStore, "verify", real_verify)
 
     err = excinfo.value
@@ -1322,7 +1331,7 @@ def test_service_corrupt_backup_mid_restore_never_replaces_deployed_file(
 
     # Repair the blob and retry: the original bytes are restored exactly.
     blob.write_bytes(b"USER ORIGINAL")
-    removed = svc.undeploy(mods)
+    removed = svc.undeploy(mods, game_dir=game, prefix=prefix)
     assert removed >= 1
     assert dest.read_bytes() == b"USER ORIGINAL"
     state = CollectionState(mods)
@@ -1448,8 +1457,8 @@ def test_proton_deploy_forces_copy_mode(svc, tmp_path):
     """Symlinks are not readable through the Wine prefix.  When a Proton
     prefix is in play, the deploy must use copy mode even when the caller
     did not ask for it, and say so in the warnings."""
-    mods, game, _prefix = _svc_env(tmp_path)
-    result = svc.deploy(mods, game_dir=game)
+    mods, game, prefix = _svc_env(tmp_path)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert not result.errors
     dest = game / "Data" / "ModA" / "plugin.esp"
     assert dest.is_file()
@@ -1524,9 +1533,208 @@ def test_deploy_generates_plugins_txt_from_deployed_files(svc, tmp_path):
     )
     plugins_dest = get_plugins_txt_dest(prefix, DOMAIN)
 
-    result = svc.deploy(mods, game_dir=game)
+    result = svc.deploy(mods, game_dir=game, prefix=prefix)
     assert not result.errors
     plugins_text = plugins_dest.read_text()
     assert "*HSPlayerHomes - Breezehome.esp" in plugins_text
     assert "*HSResources.esl" in plugins_text
     assert "texture.dds" not in plugins_text
+
+
+def test_overlap_guard_resolves_symlink_staging_to_game(tmp_path):
+    """Staging that resolves to the game dir is the same path.
+
+    The overlap guard must compare resolved paths, or a staging directory
+    reached through a symlink deploys over the tree it extracts from.
+    """
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    alias = tmp_path / "mods-alias"
+    alias.symlink_to(game)
+
+    message = _validate_no_overlap(alias, game)
+    assert message is not None
+    assert "same path" in message
+
+
+def test_overlap_guard_resolves_dotdot_staging_into_game(tmp_path):
+    """A `..`-spelled staging path that names the game dir is the same path."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    inner = game / "sub"
+    inner.mkdir()
+
+    message = _validate_no_overlap(inner / "..", game)
+    assert message is not None
+    assert "same path" in message
+
+
+def test_overlap_guard_resolves_symlinked_parent_containment(tmp_path):
+    """Containment holds through a symlinked parent, not just for equals."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    root = tmp_path / "root"
+    root.mkdir()
+    game = root / "game"
+    game.mkdir()
+    staging = game / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+
+    message = _validate_no_overlap(staging, alias)
+    assert message is not None
+    assert "inside the game directory" in message
+
+
+def test_overlap_guard_allows_genuinely_separate_dirs(tmp_path):
+    """Resolving must not manufacture an overlap that is not there."""
+    from nexus_collection_dl.service import _validate_no_overlap
+
+    game = tmp_path / "game"
+    game.mkdir()
+    staging = tmp_path / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+
+    assert _validate_no_overlap(staging, alias) is None
+
+
+def test_service_allows_deploy_through_symlinked_game_dir(svc, tmp_path):
+    """A symlinked game dir with genuinely separate staging must deploy.
+
+    Resolving paths must not manufacture an overlap that is not there:
+    staging elsewhere, game reached through a link, is a normal deploy.
+    """
+    mods, game, prefix = _svc_env(tmp_path)
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+    result = svc.deploy(mods, game_dir=alias, prefix=prefix)
+    assert result.errors == [], result.errors
+    assert result.deployed_count == 1
+
+
+def test_service_rejects_staging_inside_symlinked_game(svc, tmp_path):
+    """Containment holds through a symlinked parent, not just for equals."""
+    root = tmp_path / "root"
+    root.mkdir()
+    game = root / "game"
+    game.mkdir()
+    staging = game / "mods"
+    staging.mkdir()
+    alias = tmp_path / "game-alias"
+    alias.symlink_to(game)
+    state = CollectionState(staging)
+    state.set_collection_info("https://x/y", "T", 1, DOMAIN)
+    state.game_dir = str(alias)
+    state.save()
+    (staging / "a.esp").write_bytes(b"x")
+    result = svc.deploy(staging, game_dir=alias)
+    assert result.deployed_count == 0
+    assert result.errors, result.errors
+
+
+def test_conflict_messages_name_the_owning_mods(env):
+    """A conflict has to say which mods collide, not just which files.
+
+    A FOMOD install plan writes to the destination the config names, so
+    both sides of the collision carry source paths that say nothing about
+    which Nexus mod they belong to. The display name is the thing a user
+    can act on.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    collide = """
+    <config>
+      <installSteps><installStep name="Options"><optionalFileGroups>
+        <group name="Pack" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Only">
+              <files><file source="content/payload.nif"
+                           destination="meshes/actors/x.nif"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups></installStep></installSteps>
+    </config>
+    """
+    for mod in ("alpha", "beta"):
+        (env.staging / mod / "content").mkdir(parents=True)
+        (env.staging / mod / "content" / "payload.nif").write_bytes(mod.encode())
+
+    plan = classify_files(
+        env.staging,
+        "skyrimspecialedition",
+        fomod_picks={
+            1: [{"step": "Options", "group": "Pack", "option": "Only"}],
+            2: [{"step": "Options", "group": "Pack", "option": "Only"}],
+        },
+        fomod_configs={
+            1: {"member": "alpha/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 1},
+            2: {"member": "beta/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 2},
+        },
+        mod_names={1: "Alpha Armor", 2: "Beta Armor"},
+    )
+    assert len(plan.data_files) == 2, plan.data_files
+
+    result = run_deploy(
+        plan, env.game, method="copy", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "Alpha Armor" in msg, msg
+    assert "Beta Armor" in msg, msg
+
+
+def test_conflict_message_keeps_the_source_paths(env):
+    """Naming the mods must not drop the paths that place the files.
+
+    The paths are what let a user find the file in the staging tree; the
+    names are what let them know which mods to talk about. Both belong.
+    """
+    from nexus_collection_dl.deploy import classify_files
+
+    collide = """
+    <config>
+      <installSteps><installStep name="Options"><optionalFileGroups>
+        <group name="Pack" type="SelectExactlyOne">
+          <plugins>
+            <plugin name="Only">
+              <files><file source="content/payload.nif"
+                           destination="meshes/actors/x.nif"/></files>
+              <typeDescriptor><type name="Optional"/></typeDescriptor>
+            </plugin>
+          </plugins>
+        </group>
+      </optionalFileGroups></installStep></installSteps>
+    </config>
+    """
+    for mod in ("alpha", "beta"):
+        (env.staging / mod / "content").mkdir(parents=True)
+        (env.staging / mod / "content" / "payload.nif").write_bytes(mod.encode())
+
+    plan = classify_files(
+        env.staging,
+        "skyrimspecialedition",
+        fomod_picks={
+            1: [{"step": "Options", "group": "Pack", "option": "Only"}],
+            2: [{"step": "Options", "group": "Pack", "option": "Only"}],
+        },
+        fomod_configs={
+            1: {"member": "alpha/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 1},
+            2: {"member": "beta/fomod/ModuleConfig.xml", "xml": collide, "mod_id": 2},
+        },
+    )
+    result = run_deploy(
+        plan, env.game, method="copy", dry_run=False,
+        backups=env.backups, journal=env.journal, ownership=env.ownership,
+    )
+    (msg,) = result.conflicts
+    assert "alpha/content/payload.nif" in msg, msg
+    assert "beta/content/payload.nif" in msg, msg

@@ -294,7 +294,11 @@ class LoadOrderGenerator:
 
         if self.manifest.plugins:
             for plugin in self.manifest.plugins:
-                filename = plugin.get("filename", "")
+                # Manifest entries have carried `name` in the wild and
+                # `filename` in older shapes. Reading only one silently
+                # empties the list, and the deploy-time fallback then
+                # writes the mod order instead of the author's.
+                filename = plugin.get("filename") or plugin.get("name") or ""
                 enabled = plugin.get("enabled", True)
                 if not filename:
                     continue

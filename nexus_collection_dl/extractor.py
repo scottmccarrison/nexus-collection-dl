@@ -13,6 +13,11 @@ import rarfile
 
 from .errmsg import exception_reason
 
+# Marks an in-flight publish: written before the first file lands,
+# removed when every file has. A marker that is still there means the
+# publish did not finish, and recover_pending_publish can pick it up.
+PENDING_PUBLISH_MARKER = ".nexus-publish-pending"
+
 
 class ExtractionError(Exception):
     """Raised when archive extraction fails."""
@@ -80,6 +85,46 @@ class FomodUnreadableError(ExtractionError):
             f"{archive_path}. Use --no-extract and extract it yourself if "
             f"you know what it should install."
         )
+
+
+# Extraction ceiling. Mod archives run large (a big modpack can be tens of
+# GB) but a small archive must not expand without bound: the input is a
+# third-party download. 4GiB is far above any single mod and far below a
+# disk. Tests raise the cap by monkeypatching, which is why it is a module
+# global and not an argument threaded through every extractor.
+MAX_EXTRACTED_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def _enforce_size_budget(declared_total: int, archive_name: str) -> None:
+    """Refuse an archive whose declared uncompressed size exceeds the cap.
+
+    Header-declared sizes are cheap and catch the ordinary bomb before a
+    byte is written. Lying headers are caught by _check_staging_size after
+    the fact.
+    """
+    if declared_total > MAX_EXTRACTED_BYTES:
+        raise ExtractionError(
+            f"{archive_name} declares {declared_total} uncompressed bytes, "
+            f"over the {MAX_EXTRACTED_BYTES} byte extraction limit; refusing"
+        )
+
+
+def _check_staging_size(staging_dir: Path, archive_name: str) -> None:
+    """Refuse when what landed in staging exceeds the cap.
+
+    The backstop for every path, including the system-tool fallbacks
+    (``7z x``, ``unar``, ``unrar``) where writes cannot be intercepted,
+    and for archives whose headers understate the real size.
+    """
+    total = 0
+    for path in staging_dir.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            total += path.stat().st_size
+            if total > MAX_EXTRACTED_BYTES:
+                raise ExtractionError(
+                    f"{archive_name} expanded past the {MAX_EXTRACTED_BYTES} "
+                    f"byte extraction limit; refusing"
+                )
 
 
 def sniff_archive_magic(filepath: Path) -> str | None:
@@ -255,8 +300,18 @@ def _reject_writes_outside_staging(
 
 
 def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
-    """Move all files from staging directory to target, preserving structure."""
-    moved_files = []
+    """Publish staging into the target as one unit, or leave a marker.
+
+    A failure halfway used to leave a partial set in the target with no
+    record that the publish was incomplete, and the caller's ``finally``
+    deleted staging either way so there was nothing to repair from. Now
+    a marker names the in-flight publish before the first move and is
+    removed only when every file has landed. On failure the marker and
+    the staging dir both survive, so :func:`recover_pending_publish` can
+    finish the job instead of the next run guessing.
+    """
+    moves: list[tuple[Path, Path]] = []
+    rels: list[str] = []
     for src in staging_dir.rglob("*"):
         if not src.is_file():
             continue
@@ -269,10 +324,61 @@ def _move_staging_contents(staging_dir: Path, target_dir: Path) -> list[Path]:
                 f"staging file {rel} collides with an existing directory "
                 f"in the target; refusing to merge it"
             )
+        moves.append((src, dest))
+        rels.append(rel.as_posix())
+
+    # The marker is what says "this publish is not done". It is removed
+    # only when every file has landed; on failure it stays, and so does
+    # staging (see extract_archive's finally), so the next run can
+    # finish the job instead of guessing.
+    marker = target_dir / PENDING_PUBLISH_MARKER
+    marker.write_text("\n".join(rels))
+    moved_files = []
+    for src, dest in moves:
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dest))
         moved_files.append(dest)
+    marker.unlink()
     return moved_files
+
+
+def recover_pending_publish(target_dir: Path) -> list[Path]:
+    """Finish a publish a previous run left half-done. Returns what landed.
+
+    The marker names the files that were in flight; the staging dir that
+    was left behind holds the ones that had not moved yet. Nothing is
+    guessed: if the staging dir is gone there is nothing to repair from
+    and the marker is cleared with nothing done.
+    """
+    marker = target_dir / PENDING_PUBLISH_MARKER
+    if not marker.exists():
+        return []
+    try:
+        wanted = [line for line in marker.read_text().splitlines() if line]
+    except OSError:
+        return []
+
+    staging_dirs = [
+        p for p in target_dir.iterdir()
+        if p.is_dir() and p.name.startswith(".nexus-extract-")
+    ]
+    moved: list[Path] = []
+    for staging in staging_dirs:
+        for src in staging.rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(staging)
+            if rel.as_posix() not in wanted:
+                continue
+            dest = target_dir / rel
+            if dest.exists() and dest.is_file():
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+            moved.append(dest)
+        shutil.rmtree(staging, ignore_errors=True)
+    marker.unlink()
+    return moved
 
 
 def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
@@ -322,6 +428,10 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
         else:
             pass
 
+        # Backstop for every path: the system-tool fallbacks cannot
+        # intercept writes, and headers can understate the real size.
+        _check_staging_size(staging_dir, archive_path.name)
+
         # Whatever wrote into staging, nothing unsafe reaches the tree.
         _validate_extracted_tree(staging_dir)
         _reject_writes_outside_staging(target_dir, staging_dir, target_names_before)
@@ -335,7 +445,10 @@ def extract_archive(archive_path: Path, target_dir: Path) -> list[Path]:
     except Exception as e:
         raise ExtractionError(f"Failed to extract {archive_path}: {exception_reason(e)}")
     finally:
-        if staging_dir is not None:
+        # Staging is normally cleaned up here. When a publish marker is
+        # still present the publish did not finish: keeping staging is
+        # what lets the next run repair instead of guess.
+        if staging_dir is not None and not (target_dir / PENDING_PUBLISH_MARKER).exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
 
 
@@ -343,6 +456,7 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
     """Extract a ZIP archive, preserving directory structure."""
     extracted = []
     with zipfile.ZipFile(archive_path, "r") as zf:
+        declared = 0
         for info in zf.infolist():
             if info.is_dir():
                 continue
@@ -351,6 +465,12 @@ def _extract_zip(archive_path: Path, target_dir: Path) -> list[Path]:
                     f"{archive_path.name} contains a symlink member "
                     f"({info.filename}); refusing to extract it"
                 )
+            _validate_member_name(archive_path.name, info.filename)
+            declared += info.file_size
+        _enforce_size_budget(declared, archive_path.name)
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
             dest = target_dir / _validate_member_name(archive_path.name, info.filename)
             dest.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(info) as src, open(dest, "wb") as out:
@@ -364,6 +484,7 @@ def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with py7zr.SevenZipFile(archive_path, "r") as szf:
+            declared = 0
             for entry in szf.list():
                 if getattr(entry, "is_symlink", False):
                     raise ExtractionError(
@@ -371,6 +492,8 @@ def _extract_7z(archive_path: Path, target_dir: Path) -> list[Path]:
                         f"({entry.filename}); refusing to extract it"
                     )
                 _validate_member_name(archive_path.name, entry.filename)
+                declared += int(getattr(entry, "uncompressed", 0) or 0)
+            _enforce_size_budget(declared, archive_path.name)
             szf.extractall(target_dir)
             for name in szf.getnames():
                 path = target_dir / name
@@ -391,6 +514,23 @@ def _extract_7z_system(archive_path: Path, target_dir: Path) -> list[Path]:
             f"py7zr cannot extract {archive_path.name} (unsupported compression). "
             "Install p7zip-full (apt install p7zip-full / dnf install p7zip-plugins)."
         )
+
+    # Pre-validate member names before extraction: the system tool does
+    # not strip .. or absolute paths, so a malicious archive could write
+    # outside the staging directory.
+    listing = subprocess.run(
+        [sz_bin, "l", "-ba", str(archive_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listing.returncode == 0:
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 6:
+                member = " ".join(parts[5:])
+                if member and not member.endswith("/"):
+                    _validate_member_name(archive_path.name, member)
 
     # Use -o with the staging path directly; argv passing keeps any
     # characters in the path safe.
@@ -419,6 +559,7 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
     try:
         extracted = []
         with rarfile.RarFile(archive_path, "r") as rf:
+            declared = 0
             for info in rf.infolist():
                 if info.is_symlink() or getattr(info, "file_redir", None):
                     raise ExtractionError(
@@ -426,6 +567,8 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
                         f"({info.filename}); refusing to extract it"
                     )
                 _validate_member_name(archive_path.name, info.filename)
+                declared += int(getattr(info, "file_size", 0) or 0)
+            _enforce_size_budget(declared, archive_path.name)
             rf.extractall(target_dir)
             for member in rf.namelist():
                 path = target_dir / member
@@ -474,7 +617,13 @@ def _extract_rar(archive_path: Path, target_dir: Path) -> list[Path]:
 # ship only `fomod/header.png`, which is not an installer and must not be
 # refused. Requiring a known filename means an exotic installer can slip
 # through, and that is the cheaper error of the two.
-_FOMOD_MARKER_NAMES = frozenset({"moduleconfig.xml", "script.lua", "info.xml"})
+_FOMOD_MARKER_NAMES = frozenset(
+    {"moduleconfig.xml", "script.lua", "script.cs", "info.xml"}
+)
+# Script installers live under ``fomod/``. At the archive root a name
+# like ``script.cs`` is too generic to call, so only the header names
+# below are accepted without a ``fomod`` parent vouching for them.
+_FOMOD_ROOT_LEVEL_NAMES = frozenset({"moduleconfig.xml", "info.xml"})
 
 
 def find_fomod_installer(archive_path: Path) -> str | None:
@@ -602,18 +751,34 @@ def _read_7z_member_system(archive_path: Path, member: str) -> bytes | None:
 def _fomod_marker_from_name(name: str) -> str | None:
     """Return ``name`` when it is a FOMOD installer member, else None.
 
-    A member counts when its path has a ``fomod`` segment (any case, any
-    depth) and its basename is one of ``ModuleConfig.xml``, ``script.lua``,
-    or ``info.xml`` (any case). Separators may be ``/`` or ``\\``; real
-    FOMOD configs use backslashes in their own ``source`` paths and
-    archives carry both.
+    The single rule, shared by the archive marker check and the deploy
+    tree scan. Two callers answering the same question differently is
+    how a user gets behavior that depends on which command they ran.
+
+    A member counts when its basename is one of ``ModuleConfig.xml``,
+    ``script.lua``, ``script.cs``, or ``info.xml`` (any case) and either
+
+    - its parent directory is ``fomod`` (any case, any depth), or
+    - it sits at the archive root and is a header name
+      (``ModuleConfig.xml`` or ``info.xml``).
+
+    Separators may be ``/`` or ``\\``: real FOMOD configs use backslashes
+    in their own ``source`` paths and archives carry both.
+
+    A wrapper directory with no ``fomod`` in sight (``SomeMod/ModuleConfig.xml``)
+    is deliberately not a marker. Missing an exotic installer is the
+    cheaper error of the two: a false "this is a FOMOD" refuses a normal
+    mod, while a false "this is not" falls back to the folder heuristic.
     """
     parts = [p for p in name.replace("\\", "/").split("/") if p]
-    if len(parts) < 2:
+    if not parts:
         return None
-    if parts[-2].lower() != "fomod":
+    base = parts[-1].lower()
+    if base not in _FOMOD_MARKER_NAMES:
         return None
-    if parts[-1].lower() in _FOMOD_MARKER_NAMES:
+    if len(parts) >= 2 and parts[-2].lower() == "fomod":
+        return name
+    if len(parts) == 1 and base in _FOMOD_ROOT_LEVEL_NAMES:
         return name
     return None
 

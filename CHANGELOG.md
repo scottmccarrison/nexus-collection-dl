@@ -4,6 +4,118 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-25
+
+The front door and hardening release. `nexus-dl setup` configures the tool
+in one pass, bare `nexus-dl` opens the shell over your collections, and the
+download manager now keeps extracted archives so `gc` can reclaim the disk.
+The trust model was rebuilt: a root that comes from state alone never
+silently authorizes a write or delete. Every command was walked through a
+five-lens surface pass and the full release gate (Phases 0-5) passed on a
+fresh install.
+
+### Added
+
+- **`setup` wizard.** `nexus-dl setup` detects Steam roots, asks for the
+  collections root, and offers to install the nxm:// click handler.
+  `--non-interactive --collections-root <dir>` takes flags only and never
+  prompts.
+
+- **Shell opens from bare `nexus-dl`.** With a configured collections root,
+  running `nexus-dl` with no arguments opens the interactive shell. The
+  shell gained `/config` (show or change the collections root) and
+  `/update` (check for a newer version).
+
+- **Download manager: extraction keeps archives, `gc` reclaims disk.**
+  Extracted archives are kept on disk after extraction. `nexus-dl gc`
+  detects them by content sniffing (magic bytes) and reclaims space with
+  `--apply`. The visibility principle: the tool tells you the disk is
+  reclaimable, you decide when to reclaim it.
+
+- **`enable`/`disable`.** Turn a mod off without removing it. Its files
+  are skipped at deploy; the state entry and files on disk stay.
+
+- **`--json` on every command.** Machine-readable JSON envelopes on stdout
+  for `status`, `mods`, `deploy`, `gc`, `add`, `import`, `remove`,
+  `undeploy`. Prose goes to stderr.
+
+- **5 new CLI commands.** `add-local`, `enable`, `disable`, `gc`,
+  `track-sync`.
+
+- **`COOKBOOK.md`.** Task-oriented recipes for common workflows.
+
+- **Shell visuals.** Splash banner, consistent spacing between commands,
+  ANSI-colored prompts.
+
+- **Upgrade/downgrade instructions** in README, with what survives a
+  downgrade.
+
+### Changed
+
+- **Trust model: roots resolve by priority.** Explicit flag > user config >
+  Steam detection > state-with-confirmation. A root from state alone never
+  silently authorizes a write or delete. A bad explicit flag is an error,
+  not a fallback.
+
+- **State is untrusted input.** Values read back from `.nexus-state.json`
+  are revalidated at the point of use, especially when they become
+  filesystem paths, roots, or delete targets. Path fields reject wrong
+  types; display fields coerce.
+
+- **Deploy generates `Plugins.txt` from the manifest's plugin order.**
+  Previously the generated file ignored the manifest and a master could
+  land after its dependents. Now `HSResources.esl` sorts first.
+
+- **`case-collides` fires before the case fixup.** Previously the fixup
+  erased the collision it was meant to report.
+
+- **Duplicate plan warnings removed.** `deploy` reported every plan warning
+  twice (once from the planner, once from the result). Now one owner.
+
+- **nxm:// routing is no longer inert.** `sync` offers to map the game to
+  the collection, and `setup` tells you how. Previously the mapping was
+  never written.
+
+- **Handler mappings follow moved collections.** A mapping stores the
+  collection name; when the path goes stale, the parent directory is
+  searched for a match.
+
+- **`--prefix` and `--game-dir` reject nonexistent paths.** Previously
+  they silently fell back to detection.
+
+- **7z system-tool extraction pre-validates member names** before writing.
+
+- **Installer XML stored in a sidecar file** (`.nexus-fomod/`) instead of
+  inline in the state file.
+
+- **Enderal and Enderal SE have libloot GameType names** for LOOT sorting.
+
+- **`add --no-extract` no longer says "Extracting..."** when nothing is
+  extracted.
+
+- **`setup` refuses a bad collections root cleanly** instead of crashing
+  with a traceback.
+
+### Removed
+
+- **The web UI** (`serve`, `nexus-dl-web`, flask dependency). Use
+  `nexus-dl shell` instead.
+
+- **`add` refuses FOMOD archives** that need option choices. Use
+  `import --fomod-option` or the click path.
+
+### Known gaps
+
+- The `add` dependency warning needs GraphQL requirements data; the REST
+  mod endpoint carries none. A standalone `add` is always silent (#174).
+- Enderal LOOT sorting depends on the installed libloot version
+  supporting the `Enderal`/`EnderalSE` GameType names (#129).
+- `unar`/`unrar` RAR fallbacks do not pre-validate member names (the
+  after-the-fact snapshot guard still covers those).
+- Extraction publishes staged files one-by-one, not atomically (#121).
+- Windows, free-account downloads, and `unar`/`unrar` extraction are not
+  field-tested (#131).
+
 ## [0.4.0] - 2026-11-21
 
 The FOMOD release. A browser click on a mod with an installer can now end with
@@ -282,8 +394,7 @@ deliberately not in this release.
   no size cap before parsing and archive extraction has no decompression size
   cap; name pre-validation for the system-tool extraction fallbacks; error-text scrubbing has no diagnostic escape for
   a maintainer reading a bug report; the removed `serve` command reports
-  "command not found" rather than a deprecation stub; the staging/game-dir
-  overlap guard compares path strings rather than resolved paths; the legacy
+  "command not found" rather than a deprecation stub; the legacy
   tree scan and the archive marker check disagree on how deep a
   `ModuleConfig.xml` may live.
 - Upgrading from 0.3.0: state files load unchanged. Installers extracted

@@ -132,7 +132,8 @@ def test_install_fomod_picks_extracts_and_stores_them(tmp_path):
 
     assert "1 option choice" in report
     assert (mods / "b" / "thing.esp").exists()
-    assert not (mods / "TestMod-1.0.zip").exists()
+    # Download-manager behaviour: the verified archive is kept for gc.
+    assert (mods / "TestMod-1.0.zip").exists()
     state = CollectionState(mods)
     state.load()
     entry = state.mods[11]

@@ -22,16 +22,20 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+from .extractor import is_archive
+
 if TYPE_CHECKING:
-    from .fomod_plan import InstallPlan, ModuleConfig
+    from .fomod_plan import GameState, InstallPlan, ModuleConfig
 
 from .errmsg import exception_reason
+from .extractor import _fomod_marker_from_name
 
 # Bethesda plugin/archive extensions
 BETHESDA_EXTENSIONS = {".esm", ".esp", ".esl", ".ba2"}
@@ -202,6 +206,12 @@ class DeploymentPlan:
     skipped: list[tuple[Path, str]] = field(default_factory=list)
     source_root: Path | None = None
     warnings: list[str] = field(default_factory=list)
+    # Source path (as str) to the mod that produced it, so a conflict can
+    # name the two mods rather than two paths nobody can attribute. The
+    # label is the display name when one is known and the source's
+    # top-level folder otherwise: that folder is the mod's own directory
+    # in the merged staging tree.
+    source_owners: dict[str, str] = field(default_factory=dict)
 
     @property
     def root_destinations(self) -> int:
@@ -371,7 +381,8 @@ def _fomod_plans(
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
     mod_names: dict[int, str] | None = None,
-) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...]]], list[str]]:
+    game: "GameState | None" = None,
+) -> tuple[list[tuple[Path, "InstallPlan | None", tuple[str, ...], str]], list[str]]:
     """Install plans for every readable ModuleConfig of this tree.
 
     Each plan carries the directory its sources are relative to (the
@@ -527,9 +538,13 @@ def _fomod_plans(
         return {}
 
     def plan_entry(
-        source_root: Path, config: "ModuleConfig", selections: dict, where: str
-    ) -> tuple[Path, "InstallPlan | None", tuple[str, ...]]:
-        resolved = resolve_install_plan(config, selections)
+        source_root: Path,
+        config: "ModuleConfig",
+        selections: dict,
+        where: str,
+        label: str,
+    ) -> tuple[Path, "InstallPlan | None", tuple[str, ...], str]:
+        resolved = resolve_install_plan(config, selections, game=game)
         owned = tuple(entry.source.lower() for entry in config.all_entries())
         if resolved.indeterminate:
             message = (
@@ -540,9 +555,9 @@ def _fomod_plans(
             if detail:
                 message = f"{message} ({detail})"
             warnings.append(message)
-        return (source_root, None if resolved.indeterminate else resolved, owned)
+        return (source_root, None if resolved.indeterminate else resolved, owned, label)
 
-    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...]]] = []
+    plans: list[tuple[Path, InstallPlan | None, tuple[str, ...], str]] = []
 
     recorded: set[str] = set()
     for file_id, rec in (fomod_configs or {}).items():
@@ -562,14 +577,18 @@ def _fomod_plans(
                 config,
                 selections_for(config, file_id, rec.get("mod_id"), member),
                 member,
+                _label(file_id, member),
             )
         )
 
     for config_path in sorted(mods_dir.rglob("*")):
-        if not config_path.is_file() or config_path.name.lower() != "moduleconfig.xml":
+        if not config_path.is_file():
             continue
         rel = config_path.relative_to(mods_dir)
-        if len(rel.parts) > 3:
+        # The same rule the archive marker check uses. Two callers
+        # answering "is this a FOMOD installer?" differently is how a
+        # user gets behavior that depends on which command they ran.
+        if _fomod_marker_from_name(rel.as_posix()) is None:
             continue
         if rel.as_posix().replace("\\", "/").lower() in recorded:
             continue
@@ -583,6 +602,7 @@ def _fomod_plans(
                 config,
                 selections_guessing(config, where),
                 where,
+                where,
             )
         )
     return plans, warnings
@@ -590,22 +610,23 @@ def _fomod_plans(
 
 def _plan_lookup(
     file_path: Path,
-    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...]]],
-) -> tuple["InstallPlan | None", str] | None:
+    plans: list[tuple[Path, "InstallPlan | None", tuple[str, ...], str]],
+) -> tuple["InstallPlan | None", str, str] | None:
     """Locate the plan that owns ``file_path``, if any.
 
-    Returns ``(plan, path under the source root)`` for the config whose
-    entry sources claim the file. A config must not claim another mod's
-    files, so a path under some config's source root but under none of
-    its entries is owned by nobody and gets no plan. When several configs
-    share a source root (two FOMOD mods in one collection), the one that
-    owns the file wins rather than whichever came first.
+    Returns ``(plan, path under the source root, owner label)`` for the
+    config whose entry sources claim the file. A config must not claim
+    another mod's files, so a path under some config's source root but
+    under none of its entries is owned by nobody and gets no plan. When
+    several configs share a source root (two FOMOD mods in one
+    collection), the one that owns the file wins rather than whichever
+    came first.
 
     ``file_path`` must be absolute: source roots come from the config's
     own location and are absolute too, and a relative path silently
     matches nothing.
     """
-    for source_root, plan, owned_prefixes in plans:
+    for source_root, plan, owned_prefixes, label in plans:
         try:
             under = file_path.relative_to(source_root)
         except ValueError:
@@ -615,7 +636,7 @@ def _plan_lookup(
             under_s.lower() == prefix or under_s.lower().startswith(prefix + "/")
             for prefix in owned_prefixes
         ):
-            return plan, under_s
+            return plan, under_s, label
     return None
 
 
@@ -626,6 +647,7 @@ def classify_files(
     fomod_picks: dict[int, list[dict]] | None = None,
     fomod_configs: dict[int, dict] | None = None,
     mod_names: dict[int, str] | None = None,
+    game: "GameState | None" = None,
 ) -> DeploymentPlan:
     """Walk the staging directory and classify all files for deployment.
 
@@ -643,7 +665,7 @@ def classify_files(
     from .fomod import build_fomod_skip_set
     fomod_skip = build_fomod_skip_set(mods_dir, mod_choices or {})
     fomod_plans, plan_warnings = _fomod_plans(
-        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names
+        mods_dir, mod_choices or {}, fomod_picks, fomod_configs, mod_names, game=game
     )
 
     plan = DeploymentPlan(source_root=mods_dir, warnings=plan_warnings)
@@ -663,7 +685,7 @@ def classify_files(
         # Files a readable FOMOD config claims follow its install plan.
         hit = _plan_lookup(file_path, fomod_plans)
         if hit is not None:
-            fomod_plan, under = hit
+            fomod_plan, under, owner = hit
             if fomod_plan is not None:
                 found = fomod_plan.lookup(under)
                 if found is None:
@@ -673,6 +695,7 @@ def classify_files(
                 if not plan_dest:
                     plan.skipped.append((rel, "empty FOMOD destination"))
                     continue
+                plan.source_owners[str(file_path)] = owner
                 plan.data_files.append((file_path, Path(plan_dest)))
                 continue
 
@@ -693,6 +716,14 @@ def classify_files(
             plan.skipped.append((rel, "empty after stripping option folders"))
             continue
 
+        # A download container is never game content. Archives are kept
+        # after extraction so gc can buy the disk back, and they must
+        # not land in the game directory. Content sniffing also catches
+        # the extension-less names sync gives them.
+        if is_archive(file_path):
+            plan.skipped.append((rel, "download archive"))
+            continue
+
         effective_rel = Path(*effective_parts)
         result = classify_file(effective_rel, game_domain)
 
@@ -701,6 +732,11 @@ def classify_files(
             continue
 
         target_base, dest_rel = result
+
+        # The top-level folder is the mod's own directory in the merged
+        # staging tree: the closest thing to a mod identity the folder
+        # heuristic has.
+        plan.source_owners[str(file_path)] = parts[0]
 
         if target_base == "staging":
             # For BG3 paks: they stay in place, deploy will symlink them to Data/
@@ -1926,6 +1962,8 @@ def deploy(
     backups: BackupStore | None = None,
     journal: DeployJournal | None = None,
     ownership: dict[str, dict] | None = None,
+    on_progress: "Callable[[int, int, str], None] | None" = None,
+    expected_plugins: "list[str] | None" = None,
 ) -> DeployResult:
     """Execute a deployment plan.
 
@@ -1935,6 +1973,20 @@ def deploy(
     holds exactly one effective record per destination: when mods conflict,
     the last file in deterministic (sorted) plan order wins, the original is
     backed up once, and the conflict is reported.
+
+    ``on_progress(done, total, detail)`` fires once per plan entry as the
+    write loop advances. The loop is the long silent phase of a deploy
+    (hundreds of files in copy mode), so without this the caller can only
+    say "deploying N files" and then go quiet. ``total`` is
+    ``plan.total_files`` and ``detail`` is the destination being written.
+
+    ``expected_plugins`` are the plugin names the load order knows. On a
+    case-sensitive filesystem a mod shipping ``Foo.esp`` where the load
+    order says ``foo.esp`` is two different files. When the expectation
+    is known the deployed name is fixed up to it (and the rename is
+    reported); when it is not, a collision is warned and nothing is
+    renamed. Never silently rename: a rename the game does not expect is
+    its own bug.
     """
     if not dry_run and (backups is None or journal is None or ownership is None):
         raise ValueError(
@@ -1942,9 +1994,71 @@ def deploy(
             "non-dry-run deployments"
         )
 
-    result = DeployResult(warnings=list(plan.warnings))
+    # plan.warnings is the caller's to merge: it owns them, and this
+    # function's own additions (case fixups and collisions) are the ones
+    # that belong on the result. Seeding with plan.warnings as well is
+    # what reported every plan warning twice.
+    result = DeployResult()
     game_dir = Path(game_dir)
     data_dir = game_dir / "Data"
+
+    # Case mismatches, surfaced here rather than in game. Linux
+    # filesystems are case-sensitive and mods are authored on
+    # case-insensitive ones; we shipped this bug class ourselves with
+    # plugins.txt vs Plugins.txt. Never silently rename: a rename the
+    # game does not expect is its own bug.
+    # Two destinations whose names differ only in case: on ext4 only one
+    # of them is real and nothing says which. Checked BEFORE the case
+    # fixup, which would otherwise collapse the pair into one name and
+    # leave the check with nothing to see. The message names what the
+    # mods shipped, which is what the user has to reconcile.
+    seen_lower: dict[str, Path] = {}
+    for _src, dest_rel in list(plan.game_root_files) + list(plan.data_files):
+        low = dest_rel.as_posix().lower()
+        prior = seen_lower.get(low)
+        if prior is not None and prior != dest_rel:
+            result.warnings.append(
+                f"{dest_rel}: case-collides with {prior}; on a "
+                "case-sensitive filesystem only one of these is real"
+            )
+        else:
+            seen_lower[low] = dest_rel
+
+    if expected_plugins:
+        by_lower = {p.lower(): p for p in expected_plugins}
+
+        def _fix_case(dest_rel: Path) -> Path:
+            want = by_lower.get(dest_rel.name.lower())
+            if want and want != dest_rel.name:
+                result.warnings.append(
+                    f"{dest_rel}: renamed to {want} to match the load order "
+                    f"(the mod shipped {dest_rel.name})"
+                )
+                return dest_rel.with_name(want)
+            return dest_rel
+
+        plan.game_root_files = [(s, _fix_case(d)) for s, d in plan.game_root_files]
+        plan.data_files = [(s, _fix_case(d)) for s, d in plan.data_files]
+
+    entries_total = len(plan.game_root_files) + len(plan.data_files)
+    entries_done = 0
+
+    def _advance(dest_rel: Path) -> None:
+        nonlocal entries_done
+        entries_done += 1
+        if on_progress is not None:
+            on_progress(entries_done, entries_total, dest_rel.as_posix())
+
+    def _owner(src: Path) -> str:
+        return plan.source_owners.get(str(src), "")
+
+    def _conflict(dest_rel: Path, winner: Path, loser: Path) -> str:
+        owner_new, owner_old = _owner(winner), _owner(loser)
+        if owner_new and owner_old and owner_new != owner_old:
+            head = f"{dest_rel}: {owner_new} overwrites {owner_old}"
+        else:
+            head = f"{dest_rel}: overwritten by {_source_label(winner, plan.source_root)}"
+        return f"{head} ({_source_label(winner, plan.source_root)} over {_source_label(loser, plan.source_root)})"
 
     def _deploy_one(src: Path, dest: Path, dest_rel: Path) -> None:
         if dry_run:
@@ -1980,23 +2094,19 @@ def deploy(
     for src, dest_rel in plan.game_root_files:
         dest = game_dir / dest_rel
         if dest in seen_dests:
-            result.conflicts.append(
-                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
-                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
-            )
+            result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+        _advance(dest_rel)
 
     # Data/ files (includes BG3 .pak symlinks)
     for src, dest_rel in plan.data_files:
         dest = data_dir / dest_rel
         if dest in seen_dests:
-            result.conflicts.append(
-                f"{dest_rel}: overwritten by {_source_label(src, plan.source_root)} "
-                f"(was {_source_label(seen_dests[dest], plan.source_root)})"
-            )
+            result.conflicts.append(_conflict(dest_rel, src, seen_dests[dest]))
         seen_dests[dest] = src
         _deploy_one(src, dest, dest_rel)
+        _advance(dest_rel)
 
     # One entry per destination: the write that won is the file that is
     # there. The overwrites themselves are already in `conflicts`.

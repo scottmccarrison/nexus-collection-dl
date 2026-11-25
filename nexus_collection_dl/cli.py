@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 from rich.console import Console
@@ -14,6 +14,7 @@ from .api import NexusAPIError
 from .collection import CollectionParseError, ModParseError
 from .deploy import DeployError, UndeployError
 from .downloader import DownloadError
+from .errmsg import exception_reason
 from .extractor import ExtractionError
 from .fomod_select import PickError
 from .handler import (
@@ -62,7 +63,7 @@ console = Console()
 _QUIET_SUBCOMMANDS = frozenset({"nxm", "handler", "shell"})
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option(
     "--api-key",
     envvar="NEXUS_API_KEY",
@@ -166,9 +167,159 @@ def main(
         from .updater import check_and_prompt_update
         check_and_prompt_update(console)
 
+    if ctx.invoked_subcommand is None:
+        _handle_bare_invocation(ctx, json_mode)
+
+
+def _settle_root(
+    ctx: click.Context,
+    resolved,
+    kind: str,
+) -> Path | None:
+    """Turn a resolved root into one the service may act on.
+
+    A root that came from the state file alone cannot be verified, so a
+    person at a terminal is asked before it is used. A script or --json
+    run gets a refusal instead: there is nobody to ask, and the state
+    file cannot vouch for itself. Returns None when the caller should
+    stop.
+    """
+    if not resolved.needs_confirmation:
+        return resolved.path
+    if not _is_interactive() or _is_json(ctx):
+        return None
+    if not click.confirm(
+        f"Use {escape(str(resolved.path))} as the {kind}? It came "
+        "from this collection's state file and cannot be verified.",
+        default=False,
+    ):
+        return None
+    return resolved.path
+
+
+def _resolve_root_for_removal(
+    ctx: click.Context,
+    mods_dir: Path,
+    game_dir: Path | None,
+    prefix: Path | None,
+) -> tuple[Path | None, Path | None] | None:
+    """Resolve both roots for an undeploy, confirming what needs it.
+
+    Returns the (game_dir, prefix) pair to pass to the service, or None
+    when the run should stop.
+    """
+    from .service import resolve_game_root, resolve_proton_prefix
+    from .state import CollectionState
+
+    try:
+        state = CollectionState(mods_dir)
+        state.load()
+    except StateError as e:
+        _fail(ctx, e)
+
+    g = resolve_game_root(game_dir, state.game_dir, state.game_domain)
+    for w in g.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    settled = _settle_root(ctx, g, "game directory")
+    if g.needs_confirmation and settled is None:
+        console.print(
+            "[yellow]Aborted:[/yellow] the only game directory on record "
+            f"({escape(str(g.path))}) came from this collection's "
+            "state file and could not be verified. Pass --game-dir to "
+            "name the directory yourself."
+        )
+        return None
+
+    pr = resolve_proton_prefix(prefix, state.proton_prefix, state.game_domain)
+    for w in pr.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    settled_prefix = _settle_root(ctx, pr, "Proton prefix")
+    if pr.needs_confirmation and settled_prefix is None:
+        console.print(
+            "[yellow]Aborted:[/yellow] the only Proton prefix on record "
+            f"({escape(str(pr.path))}) came from this collection's "
+            "state file and could not be verified. Pass --prefix to name "
+            "it yourself."
+        )
+        return None
+
+    return settled, settled_prefix
+
+
+def _is_interactive() -> bool:
+    """Can this run a REPL?
+
+    Both streams have to be terminals. A pipe on either side means this
+    is a script, a capture, or CI, not a person typing, and a REPL is
+    not a thing to drop into any of those.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _handle_bare_invocation(ctx: click.Context, json_mode: bool) -> None:
+    """What bare `nexus-dl` does. The front door.
+
+    Three shapes. The middle one is why this is careful:
+
+    - Interactive and configured: the shell is the default seat now.
+    - Not interactive: usage and out. Never a REPL, never a prompt.
+    - Interactive but unconfigured: the setup wizard, which detects what
+      it can and writes the config the shell needs.
+    """
+    from .config import UserConfig
+
+    if json_mode:
+        # stdout is parsed output; an interactive shell cannot be the
+        # answer to it. Same reason `--json` refuses `shell` and `nxm`.
+        raise click.UsageError(
+            "--json needs a command: bare invocation is interactive and "
+            "this output is meant to be parsed"
+        )
+    if not _is_interactive():
+        # The guard. A script calling bare nexus-dl gets usage, not a REPL.
+        console.print(ctx.get_help())
+        return
+
+    cfg = UserConfig.load()
+    if not cfg.is_configured():
+        # First run. The wizard is the front door: detect what it can,
+        # ask for the rest, write the config that makes the shell useful.
+        ctx.invoke(
+            setup,
+            non_interactive=False,
+            collections_root=None,
+            game=(),
+            install_handler=False,
+        )
+        return
+
+    from .shell import run_shell
+
+    svc = ctx.obj["service"]
+    sys.exit(run_shell(svc, Path(cfg.collections_root), console=console))
+
 
 def _is_json(ctx: click.Context) -> bool:
     return bool(ctx.obj and ctx.obj.get("json_mode"))
+
+
+def _maybe_gc_nudge(ctx: click.Context, mods_dir: Path) -> None:
+    """Point at reclaimable archive disk after a work command.
+
+    The user owns whether to run gc; the tool owns making sure the disk
+    is visible while they are working. Silent in --json mode so stdout
+    stays parseable (machines read 'gc --json' for the number).
+    """
+    if _is_json(ctx):
+        return
+    from .gc import NUDGE_THRESHOLD_BYTES, nudge_message
+
+    msg = nudge_message(mods_dir, NUDGE_THRESHOLD_BYTES)
+    if msg:
+        console.print(f"\n[yellow]{escape(msg)}[/yellow]")
 
 
 def _fail(
@@ -177,7 +328,7 @@ def _fail(
     hint: str | None = None,
     result: Any = None,
     code: str | None = None,
-) -> None:
+) -> NoReturn:
     """Report a failure and exit 1.
 
     In JSON mode this is the only thing written to stdout: an error envelope
@@ -269,6 +420,14 @@ def sync(
     COLLECTION_URL: URL of the Nexus Mods collection
     MODS_DIR: Directory to download mods to
     """
+    # This path is about to be created. One that is already a file is a
+    # typo, and the mkdir() underneath would throw at the user instead.
+    if mods_dir.exists() and not mods_dir.is_dir():
+        _fail(
+            ctx,
+            ValueError(f"{mods_dir} is not a directory"),
+            hint="Point MODS_DIR at a folder; sync creates it if needed.",
+        )
     svc = ctx.obj["service"]
     try:
         result = svc.sync(
@@ -317,6 +476,79 @@ def sync(
             console.print(f"  [dim]{c.file_path}:[/dim] [bold]{c.winner}[/bold] overwrote {c.loser}")
         if len(result.conflicts) > 20:
             console.print(f"  [dim]... and {len(result.conflicts) - 20} more[/dim]")
+
+    _offer_nxm_mapping(ctx, result.collection_dir)
+    _maybe_gc_nudge(ctx, result.collection_dir or mods_dir)
+
+
+def _offer_nxm_mapping(ctx: click.Context, collection_dir: Path | None) -> None:
+    """Offer to route nxm:// clicks for this game to this collection.
+
+    `sync` is what creates the directory and the state that a handler
+    mapping validates against, so it is the one moment the mapping can
+    be made without the user going looking for a command. A person at a
+    terminal is asked; a script is told the command, because it cannot
+    be asked and must not be left guessing.
+
+    Already-mapped games are left alone: the user picked a destination
+    once and re-syncing is not a reason to ask again.
+    """
+    from .handler import HandlerConfig, add_mapping
+    from .state import CollectionState
+
+    if collection_dir is None:
+        return
+    collection_dir = Path(collection_dir)
+    if not (collection_dir / ".nexus-state.json").exists():
+        return
+    try:
+        state = CollectionState(collection_dir)
+        state.load()
+    except StateError:
+        return
+    game_domain = (state.game_domain or "").strip().lower()
+    if not game_domain:
+        return
+
+    existing = HandlerConfig.load().mappings.get(game_domain, [])
+    if any(
+        (e.get("path") if isinstance(e, dict) else e) == str(collection_dir.resolve())
+        for e in existing
+    ):
+        return
+
+    command = (
+        f"nexus-dl handler map {game_domain} "
+        f"'{collection_dir.resolve()}'"
+    )
+    if not _is_interactive() or _is_json(ctx):
+        console.print(
+            f"[dim]Route 'Mod manager download' clicks for "
+            f"{escape(game_domain)} to this collection with:[/dim]\n"
+            f"  [cyan]{escape(command)}[/cyan]"
+        )
+        return
+
+    if not click.confirm(
+        f"Map {escape(game_domain)} to this collection so nxm:// clicks "
+        "land here?",
+        default=True,
+    ):
+        console.print(f"[dim]Skipped. Do it later with:[/dim] {escape(command)}")
+        return
+    try:
+        add_mapping(game_domain, collection_dir)
+    except Exception as e:
+        console.print(
+            f"[yellow]Could not map {escape(game_domain)}:[/yellow] "
+            f"{escape(exception_reason(e))}"
+        )
+        console.print(f"[dim]Try it by hand:[/dim] {escape(command)}")
+        return
+    console.print(
+        f"[green]nxm:// clicks for {escape(game_domain)} now land in "
+        f"{escape(str(collection_dir.resolve()))}.[/green]"
+    )
 
 
 @main.command()
@@ -417,6 +649,8 @@ def update(
                 console.print(f"[red]Error:[/red] {err}")
         console.print("\n[green]Update complete![/green]")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
@@ -496,12 +730,12 @@ def load_order(ctx: click.Context, mods_dir: Path) -> None:
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--game-dir",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     help="Game install directory (auto-detected from Steam if not specified)",
 )
 @click.option(
     "--prefix",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     help="Proton/Wine prefix path (auto-detected if not specified)",
 )
 @click.option("--copy", "use_copy", is_flag=True, help="Copy files instead of symlinking")
@@ -524,7 +758,6 @@ def deploy(
         # For dry-run, use deploy module directly
         from .deploy import classify_files
         from .state import CollectionState
-        from .steam import find_game_dir
 
         state = CollectionState(mods_dir)
         try:
@@ -532,10 +765,22 @@ def deploy(
         except StateError as e:
             _fail(ctx, e)
 
-        if game_dir is None and state.game_dir:
-            game_dir = Path(state.game_dir)
-        if game_dir is None:
-            game_dir = find_game_dir(state.game_domain)
+        from .service import resolve_game_root
+
+        root = resolve_game_root(game_dir, state.game_dir, state.game_domain)
+        for w in root.warnings:
+            console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+        if root.problem:
+            _fail(ctx, FileNotFoundError(root.problem))
+        game_dir = _settle_root(ctx, root, "game directory")
+        if root.needs_confirmation and game_dir is None:
+            _fail(
+                ctx,
+                FileNotFoundError(
+                    "Could not verify a game directory. Pass --game-dir "
+                    "to name the directory yourself."
+                ),
+            )
         if game_dir is None:
             _fail(ctx, FileNotFoundError("Could not find game directory."))
 
@@ -583,16 +828,83 @@ def deploy(
         return
 
     svc = ctx.obj["service"]
+    from .progress import ProgressLine
+
+    json_mode = _is_json(ctx)
+    # The write loop is the long silent phase of a deploy. One moving
+    # line, suppressed entirely under --json where the output is parsed.
+    line = ProgressLine(total=0, label="Deploying", enabled=not json_mode)
+
+    def on_file_progress(done: int, total: int, detail: str) -> None:
+        line.total = total
+        line.update(done, detail)
+
+    def on_progress(event: str, pct: float, msg: str) -> None:
+        if event == "deploy":
+            # The per-file calls drive the line, so a coarse deploy
+            # message would fight it for the same row. The line says what
+            # the banner said and more: where the loop is right now.
+            return
+        line.close()
+        _cli_progress(event, pct, msg)
+
+    # Settle the root here rather than in the service: this is the layer
+    # that can ask a person. The service refuses an unverified root.
+    from .service import resolve_game_root, resolve_proton_prefix
+    from .state import CollectionState as _CS
+
+    try:
+        _st = _CS(mods_dir)
+        _st.load()
+    except StateError as e:
+        line.close()
+        _fail(ctx, e)
+    _root = resolve_game_root(game_dir, _st.game_dir, _st.game_domain)
+    for w in _root.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    if _root.problem:
+        line.close()
+        _fail(ctx, FileNotFoundError(_root.problem))
+    game_dir = _settle_root(ctx, _root, "game directory")
+    if _root.needs_confirmation and game_dir is None:
+        line.close()
+        _fail(
+            ctx,
+            FileNotFoundError(
+                "Could not verify a game directory. Pass --game-dir to "
+                "name the directory yourself."
+            ),
+        )
+    _pfx = resolve_proton_prefix(prefix, _st.proton_prefix, _st.game_domain)
+    for w in _pfx.warnings:
+        console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    if _pfx.problem:
+        line.close()
+        _fail(ctx, FileNotFoundError(_pfx.problem))
+    prefix = _settle_root(ctx, _pfx, "Proton prefix")
+    if _pfx.needs_confirmation and prefix is None:
+        line.close()
+        _fail(
+            ctx,
+            FileNotFoundError(
+                "Could not verify a Proton prefix. Pass --prefix to name "
+                "it yourself."
+            ),
+        )
+
     try:
         result = svc.deploy(
             mods_dir,
             game_dir=game_dir,
             prefix=prefix,
             use_copy=use_copy,
-            on_progress=_cli_progress,
+            on_progress=on_progress,
+            on_file_progress=on_file_progress,
         )
     except (StateError, NexusAPIError, DeployError) as e:
+        line.close()
         _fail(ctx, e)
+    line.close()
 
     if _emit_result(ctx, result):
         return
@@ -632,19 +944,46 @@ def deploy(
         console.print("  To launch with mods, set your Steam shortcut TARGET to:")
         console.print(f"  [cyan]{sfse_path}[/cyan]")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.command()
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--game-dir",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Game directory to contain the removal (usually not needed)",
+)
+@click.option(
+    "--prefix",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Proton/Wine prefix path (auto-detected if not specified)",
+)
 @click.pass_context
-def undeploy(ctx: click.Context, mods_dir: Path) -> None:
+def undeploy(
+    ctx: click.Context,
+    mods_dir: Path,
+    game_dir: Path | None,
+    prefix: Path | None,
+) -> None:
     """
     Remove all deployed mod files from game directory.
 
     MODS_DIR: Directory containing previously synced mods
+
+    The removal is contained to a game directory resolved from
+    --game-dir, the user config, or game detection. A directory that is
+    only in the collection's state file is asked about first.
     """
     svc = ctx.obj["service"]
+    resolved = _resolve_root_for_removal(ctx, mods_dir, game_dir, prefix)
+    if resolved is None:
+        return
+    game_dir, prefix = resolved
     try:
-        removed = svc.undeploy(mods_dir)
+        removed = svc.undeploy(mods_dir, game_dir=game_dir, prefix=prefix)
     except UndeployError as e:
         # Partial undeploy: show exactly what was refused/failed. State keeps
         # those entries, so undeploy can be re-run after fixing them.
@@ -837,6 +1176,8 @@ def add(
     else:
         console.print(f"[green]Added '{result.mod_name}' as manual mod (phase 999).[/green]")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.command(name="add-local")
 @click.argument("name")
@@ -950,6 +1291,8 @@ def import_cmd(
             for f in result.load_order_files:
                 console.print(f"  [green]Wrote[/green] {f}")
 
+    _maybe_gc_nudge(ctx, mods_dir)
+
 
 @main.group(name="track-sync")
 def track_sync_group():
@@ -1011,6 +1354,7 @@ def push(ctx: click.Context, mods_dir: Path) -> None:
 @click.option("--mod-id", type=int, default=None, help="Remove by Nexus mod id")
 @click.option("--no-load-order", is_flag=True, help="Skip load order regeneration")
 @click.option("--dry-run", is_flag=True, help="Show what would be removed, change nothing")
+@click.option("--force", is_flag=True, help="Remove even if another mod requires it")
 @click.pass_context
 def remove(
     ctx: click.Context,
@@ -1019,13 +1363,16 @@ def remove(
     mod_id: int | None,
     no_load_order: bool,
     dry_run: bool,
+    force: bool,
 ) -> None:
     """
-    Remove a mod from the collection state.
+    Remove a mod from the collection state and from disk.
 
     Exactly one of --file-id or --mod-id is required. Look ids up with
-    'nexus-dl mods MODS_DIR' rather than guessing. Removal is state-only:
-    it does not delete files from disk, and re-adding the mod restores it.
+    'nexus-dl mods MODS_DIR' rather than guessing. Gone means gone: the
+    state entry, the files the mod contributed, and its retained archive
+    are all deleted. Re-adding the mod downloads it again. A mod another
+    one requires is refused unless --force.
     """
     from .service import list_mods
 
@@ -1035,6 +1382,12 @@ def remove(
         _fail(
             ctx,
             ValueError("exactly one of --file-id or --mod-id is required"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+    if mod_id == 0:
+        _fail(
+            ctx,
+            ValueError("0 is not a real mod id"),
             hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
         )
 
@@ -1060,9 +1413,20 @@ def remove(
             console.print(f"  {m.name} (file_id={m.file_id}, mod_id={m.mod_id})")
         return
 
+    # Gone means gone, so a person at a terminal gets asked first. A
+    # script or --json run is already explicit: it named the id.
+    if _is_interactive() and not _is_json(ctx):
+        target = f"mod {mod_id}" if mod_id is not None else f"file {file_id}"
+        if not click.confirm(
+            f"Remove {target} and the files it contributed?", default=False
+        ):
+            console.print("Aborted. Nothing was removed.")
+            return
+
     try:
         result = svc.remove_mod(
-            mods_dir, file_id=file_id, mod_id=mod_id, no_load_order=no_load_order
+            mods_dir, file_id=file_id, mod_id=mod_id,
+            no_load_order=no_load_order, force=force,
         )
     except (StateError, ValueError) as e:
         _fail(ctx, e)
@@ -1077,6 +1441,151 @@ def remove(
         console.print(f"[green]Removed {removed} mod(s).[/green]")
     for w in result.warnings:
         console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+
+
+def _set_mod_enabled(
+    ctx: click.Context,
+    mods_dir: Path,
+    file_id: int | None,
+    mod_id: int | None,
+    enabled: bool,
+) -> None:
+    """Shared body of `enable` and `disable`. State-only; nothing deploys."""
+    from .state import CollectionState, StateError
+
+    if (file_id is None) == (mod_id is None):
+        _fail(
+            ctx,
+            ValueError("exactly one of --file-id or --mod-id is required"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+    if mod_id == 0:
+        # 0 is the "unknown" marker from_dict leaves behind, not a Nexus
+        # mod page. Matching it would turn one flag into a bulk change on
+        # exactly the entries that predate mod ids.
+        _fail(
+            ctx,
+            ValueError("0 is not a real mod id"),
+            hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+        )
+    try:
+        state = CollectionState(mods_dir)
+        state.load()
+        hits = [
+            ms
+            for ms in state.mods.values()
+            if (file_id is not None and ms.file_id == file_id)
+            or (mod_id is not None and ms.mod_id == mod_id)
+        ]
+        if not hits:
+            _fail(
+                ctx,
+                ValueError("no matching mod found"),
+                hint="Use 'nexus-dl mods MODS_DIR' to look up the id.",
+            )
+        for ms in hits:
+            ms.enabled = enabled
+        state.save()
+    except StateError as e:
+        _fail(ctx, e)
+
+    verb = "Enabled" if enabled else "Disabled"
+    if _emit_result(
+        ctx, {"enabled": enabled, "mods": [{"file_id": h.file_id, "name": h.name} for h in hits]}
+    ):
+        return
+    console.print(f"[green]{verb} {len(hits)} mod(s).[/green]")
+    if not enabled:
+        console.print(
+            "[dim]Off means temporarily not installed: the state entry and "
+            "the files on disk stay. Run 'deploy' to apply.[/dim]"
+        )
+
+
+@main.command(name="disable")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--file-id", type=int, default=None, help="Disable by Nexus file id")
+@click.option("--mod-id", type=int, default=None, help="Disable by Nexus mod id")
+@click.pass_context
+def disable_mod(
+    ctx: click.Context, mods_dir: Path, file_id: int | None, mod_id: int | None
+) -> None:
+    """Turn a mod off without removing it.
+
+    The mod keeps its state entry, its FOMOD picks, and its files on
+    disk; its files just stop landing at deploy. Run 'deploy' to apply.
+    Exactly one of --file-id or --mod-id is required.
+    """
+    _set_mod_enabled(ctx, mods_dir, file_id, mod_id, enabled=False)
+
+
+@main.command(name="enable")
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--file-id", type=int, default=None, help="Enable by Nexus file id")
+@click.option("--mod-id", type=int, default=None, help="Enable by Nexus mod id")
+@click.pass_context
+def enable_mod(
+    ctx: click.Context, mods_dir: Path, file_id: int | None, mod_id: int | None
+) -> None:
+    """Turn a mod back on. Run 'deploy' to apply.
+
+    Exactly one of --file-id or --mod-id is required.
+    """
+    _set_mod_enabled(ctx, mods_dir, file_id, mod_id, enabled=True)
+
+
+@main.command()
+@click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
+@click.option("--apply", is_flag=True, help="Actually delete. Without this it is a dry run.")
+@click.pass_context
+def gc(ctx: click.Context, mods_dir: Path, apply: bool) -> None:
+    """Reclaim disk from archives whose job is done.
+
+    Dry-run by default: it reports what is reclaimable and touches
+    nothing until --apply. Never deletes the backup store, and never
+    deletes an archive that is the only copy of its mod.
+    """
+    from .gc import apply_gc, human_bytes, plan_gc
+
+    plan = plan_gc(mods_dir)
+    if _emit_result(
+        ctx,
+        {
+            "dry_run": not apply,
+            "reclaimable": [str(p) for p in plan.reclaimable],
+            "bytes_reclaimable": plan.bytes_reclaimable,
+            "kept": [{"path": str(p), "reason": r} for p, r in plan.kept],
+        },
+    ):
+        return
+
+    if not plan.reclaimable and not plan.kept:
+        console.print(
+            "[dim]No archives to reclaim here. Downloads keep their "
+            "archive so this command can buy the disk back once the "
+            "files are extracted.[/dim]"
+        )
+        return
+    if plan.reclaimable:
+        for p in plan.reclaimable:
+            console.print(f"  [dim]{escape(str(p))}[/dim]")
+        console.print(
+            f"[green]{len(plan.reclaimable)} archive(s), "
+            f"{human_bytes(plan.bytes_reclaimable)} reclaimable.[/green]"
+        )
+    for p, reason in plan.kept:
+        console.print(f"  [yellow]kept[/yellow] {escape(str(p.name))}: {reason}")
+    if not apply:
+        if plan.reclaimable:
+            console.print("[dim]Dry run. Nothing was deleted. Re-run with --apply.[/dim]")
+        else:
+            console.print(
+                "[dim]Nothing to reclaim yet: every archive is still "
+                "the only copy of its mod.[/dim]"
+            )
+    else:
+        freed = apply_gc(plan)
+        console.print(f"[green]Freed {human_bytes(freed)}.[/green]")
 
 
 @main.command()
@@ -1175,9 +1684,262 @@ def mods(ctx: click.Context, mods_dir: Path) -> None:
     table.add_column("file_id", justify="right")
     table.add_column("mod_id", justify="right")
     table.add_column("Status", style="dim")
+    table.add_column("Picks", style="dim")
     for m in found:
-        table.add_row(m.name, m.version or "-", str(m.file_id), str(m.mod_id), m.download_status)
+        table.add_row(
+            m.name,
+            m.version or "-",
+            str(m.file_id),
+            str(m.mod_id),
+            m.download_status,
+            _format_picks(m.fomod_picks),
+        )
     console.print(table)
+
+
+def _format_picks(picks: list, limit: int = 3) -> str:
+    """Option names from stored FOMOD picks, truncated with a count.
+
+    A mod with a dozen options reads as the first few plus how many are
+    hidden, not as one endless cell. Empty means no picks recorded.
+    """
+    names = [str(p.get("option", "")) for p in picks if isinstance(p, dict)]
+    names = [n for n in names if n]
+    if not names:
+        return "-"
+    if len(names) <= limit:
+        return ", ".join(names)
+    shown = ", ".join(names[:limit])
+    return f"{shown} (+{len(names) - limit} more)"
+
+
+def _ensure_collections_root(raw: Path, *, create: bool) -> Path:
+    """Resolve a collections root, refusing anything that is not a directory.
+
+    A path that exists but is not a directory is always refused: writing
+    config for one is how a typo becomes a broken install. A missing
+    directory is only created when the caller says so, which is what the
+    interactive prompt confirms and what an explicit flag means.
+    """
+    if raw.is_dir():
+        return raw
+    if raw.exists():
+        raise ValueError(f"{raw} is not a directory")
+    if not create:
+        raise ValueError(f"{raw} does not exist")
+    try:
+        raw.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        from .errmsg import exception_reason
+        raise ValueError(f"Cannot create directory {raw}: {exception_reason(e)}") from e
+    return raw
+
+
+@main.command()
+@click.option(
+    "--non-interactive",
+    is_flag=True,
+    help="No prompts. Requires --collections-root.",
+)
+@click.option(
+    "--collections-root",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory collection folders live under.",
+)
+@click.option(
+    "--game",
+    multiple=True,
+    help="A known game as domain=path (repeatable).",
+)
+@click.option(
+    "--install-handler",
+    is_flag=True,
+    help=(
+        "Also install the user desktop entry so nxm:// links open nexus-dl. "
+        "Opt-in: it writes a .desktop file and registers a MIME default."
+    ),
+)
+@click.pass_context
+def setup(
+    ctx: click.Context,
+    non_interactive: bool,
+    collections_root: Path | None,
+    game: tuple[str, ...],
+    install_handler: bool,
+) -> None:
+    """Configure nexus-dl: where collections live and what games you have.
+
+    Interactive by default: it detects your Steam root and installed
+    games, asks for what it cannot detect, and writes the config. With
+    --non-interactive it takes flags only and never prompts, which is
+    what a script or a harness needs.
+
+    It can also install the nxm:// desktop handler, which is the 0.4.0
+    headline feature and used to live in the docs as a checklist item
+    nobody reached. Interactive setup offers it; --install-handler asks
+    for it explicitly. Both are opt-in, because installing a desktop
+    entry and flipping a MIME default is a change to the system.
+
+    This writes ~/.config/nexus-dl/config.json. Bare `nexus-dl` reads it
+    to open the shell, so getting it set up is what turns the first run
+    into the workbench.
+    """
+    from .config import UserConfig
+    from .steam import list_installed_games
+
+    def _install_handler() -> bool:
+        """Offer and perform the desktop-handler install. True if done."""
+        from .handler import DesktopInstaller
+
+        try:
+            entry = DesktopInstaller().install()
+        except Exception as e:
+            # A failed install must not undo a successful setup.
+            console.print(
+                f"[yellow]Handler not installed:[/yellow] {escape(exception_reason(e))}"
+            )
+            return False
+        console.print(f"[green]NXM handler installed:[/green] {escape(str(entry))}")
+        console.print(
+            "[dim]'Mod manager download' links now open nexus-dl. The first "
+            "time you sync a collection it will offer to route that game's "
+            "clicks to it.[/dim]"
+        )
+        return True
+
+    if non_interactive:
+        if collections_root is None:
+            _fail(
+                ctx,
+                click.UsageError(
+                    "--non-interactive needs --collections-root: with no "
+                    "prompts there is nothing to guess from"
+                ),
+            )
+        try:
+            # An explicit flag is explicit intent: create what was named.
+            collections_root = _ensure_collections_root(
+                collections_root, create=True
+            )
+        except ValueError as e:
+            _fail(ctx, e)
+        games: list[dict] = []
+        for spec in game:
+            if "=" not in spec:
+                _fail(
+                    ctx,
+                    click.UsageError(f"--game needs domain=path, got {spec!r}"),
+                )
+            domain, _, game_dir = spec.partition("=")
+            games.append({"domain": domain.strip(), "game_dir": game_dir.strip()})
+        cfg = UserConfig(collections_root=str(collections_root), games=games)
+        cfg.save()
+        handler_installed = _install_handler() if install_handler else False
+        if _emit_result(
+            ctx,
+            {
+                "collections_root": cfg.collections_root,
+                "games": cfg.games,
+                "handler_installed": handler_installed,
+            },
+        ):
+            return
+        console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
+        return
+
+    if not _is_interactive():
+        _fail(
+            ctx,
+            click.UsageError(
+                "setup prompts, and this is not a terminal. Use "
+                "--non-interactive with --collections-root."
+            ),
+        )
+
+    console.print("[bold]nexus-dl setup[/bold]")
+    detected = list_installed_games()
+    if detected:
+        console.print(f"Found {len(detected)} installed game(s) this tool can manage:")
+        for g in detected:
+            console.print(f"  [cyan]{g['domain']}[/cyan]  {g['game_dir']}")
+    else:
+        console.print("[dim]No managed games detected from Steam.[/dim]")
+
+    root = collections_root
+    if root is None:
+        suggested = Path.home() / "nexus-collections"
+        while True:
+            answer = click.prompt(
+                "Collections root", default=str(suggested), show_default=True
+            )
+            candidate = Path(answer)
+            if candidate.is_dir():
+                root = candidate
+                break
+            if candidate.exists():
+                console.print(
+                    f"[red]Error:[/red] {escape(str(candidate))} is not a "
+                    "directory. Enter a directory."
+                )
+                continue
+            if click.confirm(
+                f"{escape(str(candidate))} does not exist. Create it?",
+                default=True,
+            ):
+                try:
+                    root = _ensure_collections_root(candidate, create=True)
+                    break
+                except OSError as e:
+                    console.print(
+                        f"[red]Error:[/red] could not create "
+                        f"{escape(str(candidate))}: {escape(exception_reason(e))}"
+                    )
+                    continue
+            # Declined: ask again rather than writing a root that is not
+            # there.
+
+    games = []
+    for g in detected:
+        if click.confirm(f"Add {g['name']} ({g['domain']})?", default=True):
+            games.append({"domain": g["domain"], "game_dir": g["game_dir"]})
+
+    cfg = UserConfig(collections_root=str(root), games=games)
+    cfg.save()
+    console.print(f"[green]Configured.[/green] Collections root: {cfg.collections_root}")
+    if cfg.games:
+        console.print(f"Games: {', '.join(g['domain'] for g in cfg.games)}")
+
+    if install_handler:
+        _install_handler()
+    else:
+        console.print(
+            "\n[bold]nxm:// link handler[/bold] (optional, the 0.4.0 "
+            "headline feature): lets a 'Mod manager download' click on "
+            "the Nexus website land in nexus-dl."
+        )
+        if click.confirm("Install it now?", default=True):
+            _install_handler()
+        else:
+            console.print(
+                "[dim]Skipped. Install later with 'nexus-dl handler install'.[/dim]"
+            )
+
+
+@main.command()
+def serve() -> None:
+    """The web UI was removed in 0.4.0. Use `nexus-dl shell` instead.
+
+    A stub, not a command: it names the replacement and exits non-zero.
+    A bare "no such command" told an upgrading user nothing about what
+    happened to the thing they used to type.
+    """
+    console.print(
+        "[yellow]The web UI was removed in 0.4.0.[/yellow] "
+        "Use [bold]nexus-dl shell[/bold] instead: it covers the same "
+        "workflows and is where the tool is heading."
+    )
+    raise SystemExit(2)
 
 
 @main.command()
@@ -1708,9 +2470,13 @@ def handler_status(ctx: click.Context) -> None:
         table = Table(title="Game mappings")
         table.add_column("Game", style="cyan")
         table.add_column("Collection directory", style="green")
+        table.add_column("Name", style="dim")
         for game, dirs in sorted(info["mappings"].items()):
-            for directory in dirs:
-                table.add_row(game, directory)
+            for entry in dirs:
+                if isinstance(entry, dict):
+                    table.add_row(game, entry.get("path", ""), entry.get("name", ""))
+                else:
+                    table.add_row(game, entry, "")
         console.print(table)
     else:
         console.print(
