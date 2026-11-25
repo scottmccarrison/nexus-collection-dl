@@ -11,6 +11,13 @@ is fake and asserted absent from all output.
 import io
 import json
 import re
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI color codes so tests can match on text content."""
+    return _ANSI_RE.sub("", text)
 from pathlib import Path
 from typing import ClassVar
 
@@ -1660,7 +1667,7 @@ def test_prompt_shows_the_current_collection_and_auto_selects_one(
     assert code == 0
     # Exactly one collection: selected at startup with a note.
     assert "Using 'Solo Pack' (only collection here)." in out
-    assert prompts[0] == "nexus-dl [Solo Pack]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Solo Pack]> "
 
 
 def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
@@ -1670,8 +1677,8 @@ def test_prompt_is_plain_until_a_collection_is_selected(shell_env, tmp_path):
     )
     assert code == 0
     # Two collections: no auto-select, plain prompt until /use.
-    assert prompts[0] == "nexus-dl> "
-    assert prompts[1] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
+    assert _strip_ansi(prompts[1]) == "nexus-dl [Beta]> "
 
 
 def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
@@ -1683,7 +1690,7 @@ def test_prompt_sanitizes_a_weird_collection_name(shell_env, tmp_path):
     assert code == 0
     # Control characters collapse to spaces; brackets are plain text.
     assert "\n" not in prompts[0]
-    assert prompts[0] == "nexus-dl [Weird Name] [x]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Weird Name] [x]> "
 
 
 def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
@@ -1706,8 +1713,8 @@ def test_bare_use_reports_the_selection_and_the_list(shell_env, tmp_path):
     assert "Collections under" in out
     assert "Alpha" in out and "Beta" in out
     # Bare /use changed nothing: prompts before and after match.
-    assert prompts[0] == "nexus-dl> "
-    assert prompts[1] == prompts[2] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
+    assert _strip_ansi(prompts[1]) == _strip_ansi(prompts[2]) == "nexus-dl [Beta]> "
 
 
 def test_explicit_use_remembers_the_selection(shell_env, tmp_path):
@@ -1735,7 +1742,7 @@ def test_startup_restores_the_remembered_selection(shell_env, tmp_path):
     before = memory.read_bytes()
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl [Beta]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Beta]> "
     assert "Using 'Beta'" in out
     # Restore never rewrites the memory file: bytes are identical.
     assert memory.read_bytes() == before
@@ -1748,7 +1755,7 @@ def test_startup_restores_a_root_level_collection(shell_env, tmp_path):
     memory.write_text(json.dumps({"current": "root"}))
     code, _out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl [Root Collection]> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl [Root Collection]> "
 
 
 def test_stale_remembered_selection_is_ignored_silently(shell_env, tmp_path):
@@ -1756,7 +1763,7 @@ def test_stale_remembered_selection_is_ignored_silently(shell_env, tmp_path):
     (root / ".nexus-shell.json").write_text(json.dumps({"current": "gone"}))
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -1765,7 +1772,7 @@ def test_corrupt_remembered_selection_is_ignored_silently(shell_env, tmp_path):
     (root / ".nexus-shell.json").write_text("{ not json")
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -1970,13 +1977,14 @@ def test_control_characters_never_reach_the_terminal(shell_env, tmp_path):
     )
     assert code == 0
     # Raw control bytes never reach the terminal: not in output, not in
-    # any prompt (including the /remove confirm prompt).
-    assert "\x1b" not in out
+    # any prompt (including the /remove confirm prompt). Our own ANSI
+    # styling is intentional, so strip it before checking for leaks.
     assert "\x07" not in out
+    assert "\x1b" not in _strip_ansi(out)
     for p in prompts:
-        assert "\x1b" not in p
-        assert "\x07" not in p
-        assert "\n" not in p
+        assert "\x1b" not in _strip_ansi(p)
+        assert "\x07" not in _strip_ansi(p)
+        assert "\n" not in _strip_ansi(p)
     # The name renders collapsed to one plain line everywhere.
     assert "Evil [2JName X Y" in out
     # Hostile typed input is collapsed in the unknown-command echoes
@@ -2160,7 +2168,7 @@ def test_traversal_shaped_memory_values_are_ignored(
     (root / ".nexus-shell.json").write_text(json.dumps({"current": value}))
     code, out, prompts = run_capture_prompts(FakeShellService(), root, ["/quit"])
     assert code == 0
-    assert prompts[0] == "nexus-dl> "
+    assert _strip_ansi(prompts[0]) == "nexus-dl> "
     assert "Error:" not in out and "Warning:" not in out
 
 
@@ -2602,7 +2610,7 @@ def test_live_drain_redraws_the_prompt_after_an_idle_report(shell_env, tmp_path)
     )
     assert code == 0
     # Drawn once up front and once again after the tick's report.
-    assert out.count("nexus-dl [Clean Visuals]>") >= 2
+    assert _strip_ansi(out).count("nexus-dl [Clean Visuals]>") >= 2
 
 
 def test_ctrl_c_at_fomod_picker_aborts_the_walk(shell_env, tmp_path):

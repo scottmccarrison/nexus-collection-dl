@@ -111,6 +111,52 @@ Planning to use "Mod manager download" click-through? Also store the key with `n
 
 The tool checks GitHub for newer versions on every command and prints an upgrade notice if one is available.
 
+## Upgrading and downgrading
+
+The tool checks GitHub for newer versions on every command and prints an
+upgrade notice when one exists. In the shell, `/update` shows the current
+version and the upgrade command.
+
+### Upgrading
+
+If you installed with `uv tool`:
+
+```bash
+uv tool install --from git+https://github.com/scottmccarrison/nexus-collection-dl@main nexus-collection-dl --force
+```
+
+If you installed with `pip`:
+
+```bash
+pip install --upgrade nexus-collection-dl
+```
+
+Your config (`~/.config/nexus-dl/config.json`), handler mappings, and
+collection state files are all preserved across upgrades.
+
+### Downgrading
+
+To move back to an older version, install it explicitly:
+
+```bash
+uv tool install --from git+https://github.com/scottmccarrison/nexus-collection-dl@v0.4.0 nexus-collection-dl --force
+```
+
+Or with pip:
+
+```bash
+pip install nexus-collection-dl==0.4.0
+```
+
+**What survives a downgrade:** config, handler mappings, and collection
+state files load in older versions (unknown keys are preserved or
+ignored). What does not: features added in the newer version (new
+commands, new state fields) are unavailable, and a state file written by
+a newer version may carry fields an older version does not understand.
+
+If you are unsure, stay on the version you have until you know you need
+the upgrade.
+
 ## CLI Usage
 
 All operations are also available from the command line.
