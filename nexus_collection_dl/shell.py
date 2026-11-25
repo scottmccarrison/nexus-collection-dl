@@ -226,6 +226,12 @@ _COMMAND_HELP = (
             "(needs network)"),
         ),
     ),
+    _CommandHelp(
+        "/config", "show or change the collections root", (
+            "/config",
+            "/config root /path/to/collections",
+        ),
+    ),
     _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
     _CommandHelp(
         "/exit", "leave the shell (alias of /quit)", ("/exit",), in_table=False
@@ -1740,6 +1746,33 @@ class _ShellSession:
             )
         self.console.print(table)
 
+    def _cmd_config(self, rest: str) -> None:
+        """Show or change the collections root.
+
+        /config          show the current collections root
+        /config root <path>  change the collections root
+        """
+        from .config import UserConfig
+        parts = rest.split(None, 1)
+        if not parts:
+            cfg = UserConfig.load()
+            self.console.print(f"Collections root: {cfg.collections_root or '(not set)'}")
+            return
+        if parts[0].lower() == "root" and len(parts) == 2:
+            new_root = Path(parts[1]).expanduser()
+            if not new_root.is_dir():
+                self.console.print(
+                    f"[red]Error:[/red] {new_root} is not an existing directory."
+                )
+                return
+            cfg = UserConfig.load()
+            cfg.collections_root = str(new_root.resolve())
+            cfg.save()
+            self.root = new_root.resolve()
+            self.console.print(f"Collections root set to {self.root}")
+            return
+        self.console.print("Usage: /config  or  /config root <path>")
+
     _COMMANDS: ClassVar[dict[str, Any]] = {
         "/help": _cmd_help,
         "/quit": _cmd_quit,
@@ -1753,6 +1786,7 @@ class _ShellSession:
         "/remove": _cmd_remove,
         "/deploy": _cmd_deploy,
         "/status": _cmd_status,
+        "/config": _cmd_config,
     }
 
 

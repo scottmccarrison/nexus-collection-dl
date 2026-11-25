@@ -22,10 +22,8 @@ LOOT_GAME_MAP: dict[str, dict[str, str]] = {
     "morrowind": {"game_type": "Morrowind", "repo": "morrowind"},
     "fallout4vr": {"game_type": "Fallout4VR", "repo": "fallout4vr"},
     "skyrimvr": {"game_type": "SkyrimVR", "repo": "skyrimvr"},
-    # Enderal has no libloot GameType, so it keeps its masterlist repo but
-    # cannot be sorted: sorting falls back to collection order.
-    "enderal": {"game_type": "", "repo": "enderal"},
-    "enderalspecialedition": {"game_type": "", "repo": "enderalse"},
+    "enderal": {"game_type": "Enderal", "repo": "enderal"},
+    "enderalspecialedition": {"game_type": "EnderalSE", "repo": "enderalse"},
 }
 
 MASTERLIST_CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "nexus-dl" / "masterlists"

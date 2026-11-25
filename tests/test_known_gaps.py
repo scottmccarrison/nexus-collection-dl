@@ -170,11 +170,11 @@ def test_known_gap_file_dependency_is_decidable_with_a_game_state(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_full_installer_xml_stored_in_state(tmp_path):
-    """The whole ModuleConfig.xml is serialized into .nexus-state.json.
+def test_installer_xml_stored_in_sidecar_not_inline(tmp_path):
+    """The ModuleConfig.xml goes to a sidecar file, not the state file.
 
-    CHANGELOG: a few KB to about 60KB per FOMOD mod, rewritten on each
-    save.
+    The state stores only the member path and a file reference; the
+    full XML lives in .nexus-fomod/<file_id>.xml.
     """
     mods = tmp_path / "mods"
     state = _state_with(mods)
@@ -185,9 +185,15 @@ def test_known_gap_full_installer_xml_stored_in_state(tmp_path):
     state.save()
 
     data = json.loads((mods / CollectionState(mods).state_file.name).read_text())
-    stored = data["mods"]["11"]["fomod_config"]["xml"]
-    assert stored == SIMPLE_CONFIG
-    assert len(stored) > 100
+    cfg = data["mods"]["11"]["fomod_config"]
+    assert "xml" not in cfg, "full XML must not be inline in the state file"
+    assert cfg["member"] == "fomod/ModuleConfig.xml"
+    assert "xml_file" in cfg, "a sidecar reference must be present"
+
+    # The sidecar file carries the full XML
+    sidecar = mods / cfg["xml_file"]
+    assert sidecar.is_file(), f"sidecar missing: {sidecar}"
+    assert sidecar.read_text() == SIMPLE_CONFIG
 
 
 # ---------------------------------------------------------------------------

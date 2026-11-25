@@ -17,6 +17,7 @@ except ImportError:  # non-POSIX platforms: locking degrades to a no-op
     fcntl = None  # type: ignore[assignment]
 
 STATE_FILENAME = ".nexus-state.json"
+FOMOD_XML_DIR = ".nexus-fomod"
 LOCK_FILENAME = ".nexus-state.lock"
 
 
@@ -322,6 +323,13 @@ class CollectionState:
                     "integer"
                 ) from None
             self.mods[file_id] = ModState.from_dict(file_id, mod_data)
+            # Restore installer XML from its sidecar file if the state
+            # stores only a reference (newer format).
+            cfg = self.mods[file_id].fomod_config
+            if isinstance(cfg, dict) and "xml_file" in cfg and "xml" not in cfg:
+                xml_path = self.mods_dir / cfg["xml_file"]
+                if xml_path.is_file():
+                    cfg["xml"] = xml_path.read_text()
 
         # Tombstones restore with int keys exactly like the mods dict above.
         # The key is missing from older states: they load unchanged with no
@@ -344,6 +352,27 @@ class CollectionState:
                         "is not an integer"
                     ) from None
 
+    def _mod_to_dict_with_sidecar(self, file_id: int, mod: "ModState") -> dict[str, Any]:
+        """Serialize a mod, moving installer XML to a sidecar file.
+
+        The full ModuleConfig.xml can be 60KB and is rewritten on every
+        save. The sidecar keeps the state file small while the metadata
+        (member path) stays inline for the deploy planner.
+        """
+        d = mod.to_dict()
+        cfg = d.get("fomod_config")
+        if isinstance(cfg, dict) and "xml" in cfg:
+            # Copy the dict so we do not mutate the in-memory state
+            cfg = dict(cfg)
+            d["fomod_config"] = cfg
+            xml_text = cfg.pop("xml")
+            sidecar_dir = self.mods_dir / FOMOD_XML_DIR
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = sidecar_dir / f"{file_id}.xml"
+            sidecar.write_text(xml_text)
+            cfg["xml_file"] = f"{FOMOD_XML_DIR}/{file_id}.xml"
+        return d
+
     def save(self) -> None:
         """Save state atomically: unique temp file, fsync, then rename.
 
@@ -361,7 +390,10 @@ class CollectionState:
             "mod_rules": self.mod_rules,
             "manifest_data": self.manifest_data,
             # Key by file_id so each file from a multi-file mod is tracked
-            "mods": {str(file_id): mod.to_dict() for file_id, mod in self.mods.items()},
+            "mods": {
+                str(file_id): self._mod_to_dict_with_sidecar(file_id, mod)
+                for file_id, mod in self.mods.items()
+            },
             # Tombstones persist as "removed_mods" keyed by mod_id (see
             # __init__). JSON object keys are strings; load() converts
             # them back to int the same way the mods dict is restored.
