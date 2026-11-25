@@ -1453,7 +1453,60 @@ class _ShellSession:
             )
         for f in result.load_order_files:
             self._emit(f"Wrote {_safe_text(f)}")
+        self._offer_nxm_mapping(result.collection_dir)
         self._maybe_nudge_gc(result.collection_dir or self.root)
+
+    def _offer_nxm_mapping(self, collection_dir: Path | None) -> None:
+        """Offer to route this game's nxm:// clicks to the collection just synced.
+
+        Same rule as the CLI sync: the collection directory and its state
+        exist now, which is the one moment the mapping can be made without
+        the user going looking for a command. Already-mapped games are left
+        alone - syncing again is not a reason to ask again.
+        """
+        from .handler import HandlerConfig, add_mapping
+        from .state import CollectionState
+
+        if collection_dir is None:
+            return
+        collection_dir = Path(collection_dir)
+        if not (collection_dir / ".nexus-state.json").exists():
+            return
+        try:
+            state = CollectionState(collection_dir)
+            state.load()
+        except StateError:
+            return
+        game_domain = (state.game_domain or "").strip().lower()
+        if not game_domain:
+            return
+        existing = HandlerConfig.load().mappings.get(game_domain, [])
+        if str(collection_dir.resolve()) in existing:
+            return
+
+        command = (
+            f"nexus-dl handler map {game_domain} "
+            f"'{collection_dir.resolve()}'"
+        )
+        answer = self._confirm(
+            f"Map {_safe_text(game_domain)} to this collection so nxm:// "
+            f"clicks land here? [{_CONFIRM_YES}/no]: "
+        )
+        if answer != _CONFIRM_YES:
+            self._emit(f"Skipped. Do it later with: {_safe_text(command)}")
+            return
+        try:
+            add_mapping(game_domain, collection_dir)
+        except Exception as e:
+            self._emit_error(
+                f"Could not map {_safe_text(game_domain)}: {_safe_text(str(e))}"
+            )
+            self._emit(f"Try it by hand: {_safe_text(command)}")
+            return
+        self._emit(
+            f"nxm:// clicks for {_safe_text(game_domain)} now land in "
+            f"{_safe_text(str(collection_dir.resolve()))}."
+        )
 
     def _cmd_remove(self, rest: str) -> None:
         current = self._require_current()

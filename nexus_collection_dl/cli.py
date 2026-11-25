@@ -477,7 +477,75 @@ def sync(
         if len(result.conflicts) > 20:
             console.print(f"  [dim]... and {len(result.conflicts) - 20} more[/dim]")
 
+    _offer_nxm_mapping(ctx, result.collection_dir)
     _maybe_gc_nudge(ctx, result.collection_dir or mods_dir)
+
+
+def _offer_nxm_mapping(ctx: click.Context, collection_dir: Path | None) -> None:
+    """Offer to route nxm:// clicks for this game to this collection.
+
+    `sync` is what creates the directory and the state that a handler
+    mapping validates against, so it is the one moment the mapping can
+    be made without the user going looking for a command. A person at a
+    terminal is asked; a script is told the command, because it cannot
+    be asked and must not be left guessing.
+
+    Already-mapped games are left alone: the user picked a destination
+    once and re-syncing is not a reason to ask again.
+    """
+    from .handler import HandlerConfig, add_mapping
+    from .state import CollectionState
+
+    if collection_dir is None:
+        return
+    collection_dir = Path(collection_dir)
+    if not (collection_dir / ".nexus-state.json").exists():
+        return
+    try:
+        state = CollectionState(collection_dir)
+        state.load()
+    except StateError:
+        return
+    game_domain = (state.game_domain or "").strip().lower()
+    if not game_domain:
+        return
+
+    existing = HandlerConfig.load().mappings.get(game_domain, [])
+    if str(collection_dir.resolve()) in existing:
+        return
+
+    command = (
+        f"nexus-dl handler map {game_domain} "
+        f"'{collection_dir.resolve()}'"
+    )
+    if not _is_interactive() or _is_json(ctx):
+        console.print(
+            f"[dim]Route 'Mod manager download' clicks for "
+            f"{escape(game_domain)} to this collection with:[/dim]\n"
+            f"  [cyan]{escape(command)}[/cyan]"
+        )
+        return
+
+    if not click.confirm(
+        f"Map {escape(game_domain)} to this collection so nxm:// clicks "
+        "land here?",
+        default=True,
+    ):
+        console.print(f"[dim]Skipped. Do it later with:[/dim] {escape(command)}")
+        return
+    try:
+        add_mapping(game_domain, collection_dir)
+    except Exception as e:
+        console.print(
+            f"[yellow]Could not map {escape(game_domain)}:[/yellow] "
+            f"{escape(exception_reason(e))}"
+        )
+        console.print(f"[dim]Try it by hand:[/dim] {escape(command)}")
+        return
+    console.print(
+        f"[green]nxm:// clicks for {escape(game_domain)} now land in "
+        f"{escape(str(collection_dir.resolve()))}.[/green]"
+    )
 
 
 @main.command()
@@ -1719,8 +1787,9 @@ def setup(
             return False
         console.print(f"[green]NXM handler installed:[/green] {escape(str(entry))}")
         console.print(
-            "[dim]'Mod manager download' links now open nexus-dl. Map each "
-            "game with 'nexus-dl handler map GAME COLLECTION_DIR'.[/dim]"
+            "[dim]'Mod manager download' links now open nexus-dl. The first "
+            "time you sync a collection it will offer to route that game's "
+            "clicks to it.[/dim]"
         )
         return True
 
