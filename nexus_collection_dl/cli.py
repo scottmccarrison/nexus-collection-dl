@@ -730,12 +730,12 @@ def load_order(ctx: click.Context, mods_dir: Path) -> None:
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--game-dir",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     help="Game install directory (auto-detected from Steam if not specified)",
 )
 @click.option(
     "--prefix",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     help="Proton/Wine prefix path (auto-detected if not specified)",
 )
 @click.option("--copy", "use_copy", is_flag=True, help="Copy files instead of symlinking")
@@ -951,13 +951,13 @@ def deploy(
 @click.argument("mods_dir", type=click.Path(exists=True, path_type=Path))
 @click.option(
     "--game-dir",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     default=None,
     help="Game directory to contain the removal (usually not needed)",
 )
 @click.option(
     "--prefix",
-    type=click.Path(path_type=Path),
+    type=click.Path(path_type=Path, exists=True),
     default=None,
     help="Proton/Wine prefix path (auto-detected if not specified)",
 )

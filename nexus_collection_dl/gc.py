@@ -87,14 +87,16 @@ def plan_gc(mods_dir: Path) -> GcPlan:
             continue
         # The mod has attribution. If any of its files are still on the
         # disk the archive is redundant; if none are, the archive is the
-        # only copy. The archive itself does not count as payload: a
+        # complete copy. ALL payload files must be on disk: if extraction
+        # was interrupted, the archive is the only complete copy. The
+        # archive itself does not count as payload: a
         # retained archive whose attribution is just its own name is
         # still the only copy.
         payload_names = [
             f for f in mod.contributed_files
             if f != mod.filename and _is_safe_relative(f)
         ]
-        if not any((mods_dir / f).is_file() for f in payload_names):
+        if not payload_names or not all((mods_dir / f).is_file() for f in payload_names):
             plan.kept.append((path, "the archive is the only copy of this mod"))
             continue
 
