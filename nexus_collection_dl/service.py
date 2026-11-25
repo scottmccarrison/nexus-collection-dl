@@ -2049,7 +2049,8 @@ class ModManagerService:
                     success=False, error="Download failed"
                 )
 
-            progress("extract", 0.85, "Extracting...")
+            if not no_extract:
+                progress("extract", 0.85, "Extracting...")
             # Read the FOMOD installer (if any) and settle the option
             # choices BEFORE extracting anything, so a multi-file add
             # extracts nothing when one file's choices cannot be
