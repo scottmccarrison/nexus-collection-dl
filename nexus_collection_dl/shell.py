@@ -1481,7 +1481,10 @@ class _ShellSession:
         if not game_domain:
             return
         existing = HandlerConfig.load().mappings.get(game_domain, [])
-        if str(collection_dir.resolve()) in existing:
+        if any(
+            (e.get("path") if isinstance(e, dict) else e) == str(collection_dir.resolve())
+            for e in existing
+        ):
             return
 
         command = (

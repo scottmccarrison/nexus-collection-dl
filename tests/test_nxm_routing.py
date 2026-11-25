@@ -92,7 +92,7 @@ def test_sync_offers_to_map_and_yes_registers_it(tmp_path, monkeypatch):
     r = _run_sync(tmp_path, monkeypatch, coll, interactive=True, answers=("y",))
     assert r.exit_code == 0, r.output
     assert "handler map" in r.output or "map" in r.output.lower(), r.output
-    assert _mappings().get(DOMAIN) == [str(coll.resolve())], _mappings()
+    assert [e["path"] for e in _mappings().get(DOMAIN, [])] == [str(coll.resolve())], _mappings()
 
 
 def test_sync_declining_leaves_no_mapping(tmp_path, monkeypatch):
@@ -118,7 +118,7 @@ def test_sync_does_not_reoffer_when_already_mapped(tmp_path, monkeypatch):
     _run_sync(tmp_path, monkeypatch, coll, interactive=True, answers=("y",))
     r = _run_sync(tmp_path, monkeypatch, coll, interactive=True, answers=())
     assert r.exit_code == 0, r.output
-    assert _mappings().get(DOMAIN) == [str(coll.resolve())]
+    assert [e["path"] for e in _mappings().get(DOMAIN, [])] == [str(coll.resolve())]
     # and it does not ask again
     assert "?" not in r.output.split("Successfully synced")[-1][:200], r.output
 

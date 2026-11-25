@@ -835,7 +835,7 @@ def test_sync_offers_to_map_the_game_for_nxm_clicks(shell_env, tmp_path, monkeyp
     )
     assert result.exit_code == 0
     assert "nxm://" in result.output, result.output
-    assert HandlerConfig.load().mappings.get(GAME) == [str(coll.resolve())], \
+    assert [e["path"] for e in HandlerConfig.load().mappings.get(GAME, [])] == [str(coll.resolve())], \
         HandlerConfig.load().mappings
 
 
