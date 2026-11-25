@@ -500,10 +500,15 @@ class _ShellSession:
         """Prompt text: the current collection when one is selected.
 
         ANSI-colored so the tool name, collection, and bracket read as
-        different kinds of thing at a glance. The name is sanitized so
-        control characters in a hand-edited collection name cannot garble
-        the prompt.
+        different kinds of thing at a glance. Honors NO_COLOR. The name
+        is sanitized so control characters in a hand-edited collection
+        name cannot garble the prompt.
         """
+        import os
+        if os.environ.get("NO_COLOR"):
+            if self.current is None:
+                return "nexus-dl> "
+            return f"nexus-dl [{_prompt_name(self.current.name)}]> "
         c, g, d, r = self._CYAN, self._GREEN, self._DIM, self._RESET
         if self.current is None:
             return f"{c}nexus-dl{r}{d}>{r} "
