@@ -803,6 +803,42 @@ def test_sync_lists_per_mod_errors_before_success_text(
     ]
 
 
+def test_sync_offers_to_map_the_game_for_nxm_clicks(shell_env, tmp_path, monkeypatch):
+    """The shell is the product; a shell sync must offer the routing too.
+
+    `sync` is what creates the collection directory and state that a
+    handler mapping validates against, so it is the moment the mapping
+    can be made without the user going looking for a command.
+    """
+    from nexus_collection_dl.handler import HandlerConfig
+
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    coll = root / "Synced Collection"
+    coll.mkdir()
+    (coll / ".nexus-state.json").write_text(json.dumps({
+        "collection_url": "u", "collection_name": "Synced Collection",
+        "collection_revision": 1,
+        "game_domain": GAME,
+        "mods": {"11": {"mod_id": 1, "name": "M", "file_id": 11,
+                        "filename": "a.zip", "version": "1",
+                        "download_status": "downloaded"}},
+    }))
+    FakeShellService.sync_result = SyncResult(
+        mods_downloaded=1, mods_extracted=1, errors=[],
+        load_order_files=["load-order.txt"], collection_dir=coll,
+    )
+
+    url = "https://next.nexusmods.com/skyrimspecialedition/collections/abc"
+    result = run_cli(
+        root, f"/sync {url}\nyes\n/quit\n",
+        monkeypatch=monkeypatch, service_cls=FakeShellService,
+    )
+    assert result.exit_code == 0
+    assert "nxm://" in result.output, result.output
+    assert HandlerConfig.load().mappings.get(GAME) == [str(coll.resolve())], \
+        HandlerConfig.load().mappings
+
+
 # ---------------------------------------------------------------------------
 # /sync targets: URL, index/name, and resync of the current collection
 # ---------------------------------------------------------------------------
