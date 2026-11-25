@@ -515,6 +515,23 @@ def _extract_7z_system(archive_path: Path, target_dir: Path) -> list[Path]:
             "Install p7zip-full (apt install p7zip-full / dnf install p7zip-plugins)."
         )
 
+    # Pre-validate member names before extraction: the system tool does
+    # not strip .. or absolute paths, so a malicious archive could write
+    # outside the staging directory.
+    listing = subprocess.run(
+        [sz_bin, "l", "-ba", str(archive_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listing.returncode == 0:
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 6:
+                member = " ".join(parts[5:])
+                if member and not member.endswith("/"):
+                    _validate_member_name(archive_path.name, member)
+
     # Use -o with the staging path directly; argv passing keeps any
     # characters in the path safe.
     result = subprocess.run(

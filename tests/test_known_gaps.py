@@ -195,15 +195,14 @@ def test_known_gap_full_installer_xml_stored_in_state(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_known_gap_system_tool_extraction_does_not_pre_list_members(
+def test_system_tool_extraction_pre_lists_members_for_validation(
     tmp_path, monkeypatch
 ):
-    """The `7z` fallback extracts without listing members first.
+    """The `7z` fallback lists members before extracting to validate names.
 
-    CHANGELOG: name pre-validation for the system-tool extraction
-    fallbacks. The library paths validate names before extracting; the
-    subprocess fallbacks do not, and rely on the after-the-fact snapshot
-    guard instead.
+    The library paths validate names before extracting; the subprocess
+    fallbacks now do too (7z l -ba runs first and each member is checked
+    before 7z x writes anything).
     """
     from nexus_collection_dl import extractor
 
@@ -214,10 +213,11 @@ def test_known_gap_system_tool_extraction_does_not_pre_list_members(
 
     def spy(cmd, *args, **kwargs):
         calls.append(list(cmd))
-        # Answer the extraction call as if 7z succeeded and wrote nothing.
+
         class R:
             returncode = 0
             stderr = ""
+            stdout = ""
 
         return R()
 
@@ -226,7 +226,6 @@ def test_known_gap_system_tool_extraction_does_not_pre_list_members(
 
     target = tmp_path / "out"
     target.mkdir()
-    # Force the system-tool path by making py7zr refuse the archive.
     monkeypatch.setattr(
         extractor,
         "py7zr",
@@ -247,12 +246,10 @@ def test_known_gap_system_tool_extraction_does_not_pre_list_members(
     except Exception:  # noqa: S110 - the call is what is under test, not its result
         pass
 
-    # Every invocation is `7z x ...`. Nothing asks `7z l -slt` for the
-    # member list first, which is what pre-validation would need.
     assert calls, "the system tool should have been invoked"
-    for cmd in calls:
-        assert cmd[1] == "x", f"expected extraction, got {cmd}"
-        assert "l" not in cmd and "-slt" not in cmd
+    # First call lists members for pre-validation, second extracts.
+    assert calls[0][1] == "l", f"expected listing first, got {calls[0]}"
+    assert calls[1][1] == "x", f"expected extraction second, got {calls[1]}"
 
 
 # ---------------------------------------------------------------------------
