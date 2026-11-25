@@ -1727,7 +1727,11 @@ def _ensure_collections_root(raw: Path, *, create: bool) -> Path:
         raise ValueError(f"{raw} is not a directory")
     if not create:
         raise ValueError(f"{raw} does not exist")
-    raw.mkdir(parents=True, exist_ok=True)
+    try:
+        raw.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        from .errmsg import exception_reason
+        raise ValueError(f"Cannot create directory {raw}: {exception_reason(e)}") from e
     return raw
 
 
