@@ -770,6 +770,8 @@ def deploy(
         root = resolve_game_root(game_dir, state.game_dir, state.game_domain)
         for w in root.warnings:
             console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+        if root.problem:
+            _fail(ctx, FileNotFoundError(root.problem))
         game_dir = _settle_root(ctx, root, "game directory")
         if root.needs_confirmation and game_dir is None:
             _fail(
@@ -860,6 +862,9 @@ def deploy(
     _root = resolve_game_root(game_dir, _st.game_dir, _st.game_domain)
     for w in _root.warnings:
         console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    if _root.problem:
+        line.close()
+        _fail(ctx, FileNotFoundError(_root.problem))
     game_dir = _settle_root(ctx, _root, "game directory")
     if _root.needs_confirmation and game_dir is None:
         line.close()
@@ -873,6 +878,9 @@ def deploy(
     _pfx = resolve_proton_prefix(prefix, _st.proton_prefix, _st.game_domain)
     for w in _pfx.warnings:
         console.print(f"[yellow]Warning:[/yellow] {escape(w)}")
+    if _pfx.problem:
+        line.close()
+        _fail(ctx, FileNotFoundError(_pfx.problem))
     prefix = _settle_root(ctx, _pfx, "Proton prefix")
     if _pfx.needs_confirmation and prefix is None:
         line.close()

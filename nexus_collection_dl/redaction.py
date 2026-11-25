@@ -164,7 +164,8 @@ def boundary_redact(
         out = redact_encoded_secret_forms(out, short_secrets)
         out = redact_secrets_in_uri_queries(out, short_secrets)
     safe = sanitize_message(out) if strip_uris else out
-    if diagnostic:
+    import os
+    if diagnostic or os.environ.get("NEXUS_DL_DIAGNOSTIC", "").strip() not in ("", "0", "false", "False"):
         return (
             f"{safe}\n"
             "--- diagnostic, do not share (contains live secrets) ---\n"
