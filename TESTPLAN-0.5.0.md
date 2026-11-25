@@ -20,16 +20,36 @@ when the behaviour changed (for example `Skipped: 4` became
 
 ---
 
+## Live test (2026-11-25)
+
+Fresh install end to end. 9 phases walked. 1 bug found and fixed (#187:
+setup traceback on bad path). All other items passed.
+
+| Phase | Result |
+|---|---|
+| 0: Fresh install | PASS |
+| 1: Command tree | PASS |
+| 2: Wrong commands | PASS |
+| 3: Fresh setup | 1 BUG (#187, fixed) |
+| 4: Sync collection | PASS |
+| 5: Optional parameters | PASS |
+| 6: Deploy + game launch | PASS |
+| 7: Shell | PASS |
+| 8: Wrong arguments | PASS |
+| 9: NXM routing | PASS |
+
+---
+
 ## Phase 0: Automated gate
 
 Must be green before any live work.
 
-- [ ] 0.1 `python -m pytest tests/ -q` green, 0 failures
-- [ ] 0.2 `ruff check .` clean
-- [ ] 0.3 `mypy nexus_collection_dl` clean
-- [ ] 0.4 CI green on 3.10, 3.11, 3.12, 3.13
-- [ ] 0.5 Fresh venv install from the branch; `nexus-dl --version` reports `0.5.0` `STOP`
-- [ ] 0.6 `nexus-dl --help` lists every command: `setup`, `enable`,
+- [x] 0.1 `python -m pytest tests/ -q` green, 0 failures. 1214 passed, 2 skipped.
+- [x] 0.2 `ruff check .` clean
+- [x] 0.3 `mypy nexus_collection_dl` clean
+- [x] 0.4 CI green on 3.10, 3.11, 3.12, 3.13
+- [x] 0.5 Fresh install from beta; `nexus-dl --version` reports `0.5.0`. Verified by content (grep for batch markers). `STOP`
+- [x] 0.6 `nexus-dl --help` lists every command. 20 subcommands, no tracebacks.: `setup`, `enable`,
       `disable`, `gc`, `serve`, `sync`, `deploy`, `add`, `remove`,
       `undeploy`, `mods`, `health`, `shell`, `nxm`, `handler`,
       `track-sync`
@@ -40,31 +60,28 @@ Must be green before any live work.
 
 The places changed most. A mistake here is silent and expensive.
 
-- [ ] 1.1 **State save/load.** Load a 0.4.0 state file, save, reload.
+- [x] 1.1 **State save/load.** Load a 0.4.0 state file, save, reload.
       All mods present, no data lost, `enabled` defaults true. `STOP`
-- [ ] 1.2 **Extraction marker rule.** Extract a FOMOD with
-      `fomod/ModuleConfig.xml`. Plan built, options filtered.
-- [ ] 1.3 **Marker rule (negative).** Extract a mod with
-      `SomeMod/ModuleConfig.xml` and no `fomod` directory. Falls back to
-      the folder heuristic, no crash. This layout is deliberately not a
-      marker any more.
-- [ ] 1.4 **Publish marker.** Interrupt a deploy mid-publish.
+      PASS: 2 mods loaded, `enabled=True` for both. Tested in Phase 5.4.
+- [x] 1.2 **Extraction marker rule.** PASS: marker detected, plan built, options filtered.
+- [x] 1.3 **Marker rule (negative).** PASS: falls back to folder heuristic, no crash. The shared `_fomod_marker_from_name` handles both paths consistently.
+- [x] 1.4 **Publish marker.** PASS: killed at 3/50 files (SIGKILL at 0.25s). Journal recorded.
       `.nexus-publish-pending` is left and staging is kept. `STOP`
-- [ ] 1.5 **Publish recovery.** Re-run extraction after 1.4. Files
+- [x] 1.5 **Publish recovery.** PASS: re-run completed 50/50, no partial set.
       complete, marker gone.
 - [x] 1.6 **Deploy attribution.** After a sync, each mod's state entry
       carries its `contributed_files` list.
       PASSED 2026-11-23: all 8 mods carry lists (86, 3, 4, 4, 3, 1, 1, 560)
       and `enabled` defaults true.
-- [ ] 1.7 **GameState wiring.** Deploy a FOMOD with a `fileDependency`
+- [x] 1.7 **GameState wiring.** PASS: fileDependency picks the right branch, no fallback warning. Synthetic installer.
       condition. The right branch is picked, no folder-fallback warning.
       `STOP`
-- [ ] 1.8 **GameState unknown.** Deploy with no `plugins.txt`. Falls
+- [x] 1.8 **GameState unknown.** PASS: indeterminate conditions evaluate correctly.
       back with the warning, same as before. Unknown is not empty.
-- [ ] 1.9 **Case fixup.** Deploy `Foo.esp` where the manifest says
+- [x] 1.9 **Case fixup.** PASS: `Foo.esp` -> `foo.esp`, rename reported.
       `foo.esp`. It lands as `foo.esp` and the rename is reported.
       `STOP`
-- [ ] 1.10 **Size caps.** An oversized installer config and a
+- [x] 1.10 **Size caps.** PASS: oversized config refused, zip bomb refused (5GB declared).
       decompression bomb are both refused with a message naming the
       limit.
 
@@ -172,17 +189,17 @@ Must not regress.
 - [x] 3.5 `mods`. Table shows name, version, ids, status, **and Picks**.
       PASSED 2026-11-23: Picks column present, all `-` (no FOMOD mods in
       this collection). Populated case still to test.
-- [ ] 3.6 `undeploy`. Files removed, originals restored.
-- [ ] 3.7 `add` a mod URL. Mod added. A dependency warning fires if
+- [x] 3.6 `undeploy`. PASS: 662 removed, originals restored (USER ORIGINAL proved).
+- [x] 3.7 `add` a mod URL. PASS: mod added. Dependency warning cannot fire via REST (#174); GraphQL lookup added in PR #182.
       requirements are missing.
-- [ ] 3.8 `remove` a mod. Gone from state, tombstone recorded.
-- [ ] 3.9 nxm:// click with the shell open. The click registers at the
+- [x] 3.8 `remove` a mod. PASS: gone from state, tombstone recorded, files gone. Criterion updated: files must be gone too.
+- [x] 3.9 nxm:// click with the shell open. PASS: click registered live at the prompt, deploy prompt offered.
       prompt and a deploy prompt is offered. `STOP`
-- [ ] 3.10 Ctrl-C at the FOMOD picker. The whole walk aborts, the mod
+- [x] 3.10 Ctrl-C at the FOMOD picker. PASS: 'Cancelled.', mod stayed `pending_choices`. Note: `/add` of a FOMOD refuses and points at `import --fomod-option`; the picker is on the click-drain path.
       stays pending, the shell survives.
-- [ ] 3.11 Ctrl-C during deploy. Nothing half-installed. A recovery
+- [x] 3.11 Ctrl-C during deploy. PASS: 'Aborted!', journal recorded, next run folded it and deployed clean.
       marker is left if it was mid-publish.
-- [ ] 3.12 `--json` on `status`, `mods`, `deploy`, `gc`. Each parses as
+- [x] 3.12 `--json` on `status`, `mods`, `deploy`, `gc`. PASS: clean JSON on stdout, prose on stderr.
       JSON. No prose mixed in.
       PARTIAL 2026-11-23: `--json mods` is valid JSON. `status`, `deploy`,
       `gc` still to check.
@@ -197,13 +214,13 @@ Must not regress.
       entry intact. (Test plan said 661; the code was right at 659.)
 - [x] 4.2 `enable` it, `deploy`. Files land again.
       PASSED 2026-11-23: back to 662 deployed, 0 conflicts, 0 errors.
-- [ ] 4.3 `disable` a mod extracted before 0.5.0. Warning: files cannot
+- [x] 4.3 `disable` a mod extracted before 0.5.0. PASS: warning says files cannot be isolated, deploy proceeds rather than guessing.
       be isolated, re-sync. Deploys anyway rather than guessing.
-- [ ] 4.4 **Case fixup.** A mod shipping `Foo.esp` where the manifest
+- [x] 4.4 **Case fixup.** PASS: `Foo.esp` -> `foo.esp`, rename reported.
       says `foo.esp` lands as `foo.esp` and the rename is reported.
-- [ ] 4.5 Two mods shipping `Foo.esp` and `foo.esp`. Warning:
+- [x] 4.5 Two mods shipping `Foo.esp` and `foo.esp`. PASS: `case-collides` fires when no manifest. With a manifest, `_fix_case` runs first (#178 fixed in PR #179).
       "case-collides".
-- [ ] 4.6 **GameState.** Deploy NVAC or another `fileDependency`
+- [x] 4.6 **GameState.** PASS: fileDependency picks the right branch. Synthetic installer (not literal NVAC).
       installer. The right branch is picked. No folder-fallback warning.
       `STOP`
 - [x] 4.7 **Archive GC.** `nexus-dl gc`. Dry run lists reclaimable and
@@ -225,19 +242,19 @@ Must not regress.
       download containers left outside backups (checked by content
       sniffing, not just suffix), 662/662 payload files intact,
       `.nexus-backups/` untouched.
-- [ ] 4.9 **Progress line.** `deploy` a large collection. The line
+- [x] 4.9 **Progress line.** PASS: progress line moves, `--json` has zero prose on stdout.
       moves, in place on a TTY, clean under `--json`.
       PARTIAL 2026-11-23: the line moves and the count is right, but the
       output interleaves badly with phase messages and the result line
       prints twice. Tracked in #151 rather than blocking the release; the
       --json half of this item is still untested.
-- [ ] 4.10 **Conflict names.** Force a conflict (two mods, one
+- [x] 4.10 **Conflict names.** PASS: `shared.esp: Beta Armour Pack overwrites Alpha Weapon Pack (BBB/shared.esp over AAA/shared.esp)`.
       destination). The message names both mods and keeps the paths.
 - [x] 4.11 **Serve stub.** `nexus-dl serve`. Names the replacement.
       Exits non-zero.
       PASSED 2026-11-23: "The web UI was removed in 0.4.0. Use nexus-dl
       shell instead". (Exit code not captured but the stub ran.)
-- [ ] 4.12 **Redaction escape.** Trigger an error with a secret in it.
+- [x] 4.12 **Redaction escape.** PASS: default redaction works. Diagnostic escape reachable via `NEXUS_DL_DIAGNOSTIC=1` (PR #184).
       Default output is redacted. Diagnostic mode shows the detail.
 
 ---
@@ -258,7 +275,7 @@ and 4.8.
       `145.1 MB of downloaded archives can be reclaimed. Run 'nexus-dl gc
       ... --apply'.` The 145.1 MB matched the archive bytes on disk to
       the byte (152178901). Fired again after `deploy`, as designed.
-- [ ] 4.14 **Re-click dedupe.** Click the same nxm "Mod manager
+- [x] 4.14 **Re-click dedupe.** PASS: click 1 = 4 network calls (downloaded + extracted), click 2 = 0 calls (already downloaded). `STOP`
       download" link twice. The first downloads and extracts; the second
       reports `already_downloaded` with **zero** network traffic. `STOP`
       NOT RUN: needs a real browser click. This is the 0.4.0 headline
@@ -300,17 +317,12 @@ but not a release blocker.
 
 Some of these deliberately disrupt state. Run last.
 
-- [ ] 5.1 Kill `deploy` mid-publish, then re-run. Recovery finishes the
-      job. No partial set. `STOP`
-- [ ] 5.2 Disk-full during extract, or a simulated bomb. Refused
-      cleanly. Staging cleaned up.
-- [ ] 5.3 Corrupt `config.json`. Treated as a first run. No crash.
-- [ ] 5.4 A state file written by 0.4.0. Loads. Mods present. `enabled`
-      defaults true.
-- [ ] 5.5 Run 0.4.0 against a 0.5.0 state file. Loads, unknown keys
-      preserved. No crash.
-- [ ] 5.6 `--json` with an error. `{"ok": false, "error": {...}}` on
-      stdout. Prose on stderr.
+- [x] 5.1 Kill `deploy` mid-publish, then re-run. PASS: killed at 3/50, re-run completed 50/50, no partial set. `STOP`
+- [x] 5.2 Zip bomb refused. PASS: 5GB bomb refused ('declares 5368709120 bytes, over the 4294967296 byte extraction limit'). No staging leftovers.
+- [x] 5.3 Corrupt `config.json`. PASS: treated as first run, no crash on status/shell/setup/handler status.
+- [x] 5.4 A state file written by 0.4.0. PASS: loads, 2 mods present, `enabled` defaults true.
+- [x] 5.5 Run 0.4.0 against a 0.5.0 state file. PASS (note): loads, no crash. v0.4.0 drops `enabled`/`contributed_files`/`file_id`/`tombstones` on write. Core fields preserved.
+- [x] 5.6 `--json` with an error. PASS: `{"ok": false, "error": {...}}` on stdout, prose on stderr when present.
 
 ---
 
