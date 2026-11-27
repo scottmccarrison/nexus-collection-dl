@@ -235,6 +235,17 @@ _COMMAND_HELP = (
     _CommandHelp(
         "/update", "check for a newer version of nexus-dl", ("/update",),
     ),
+    _CommandHelp(
+        "/profile", "switch between mod sets (profiles)", (
+            "/profile",
+            "/profile create my-profile",
+            "/profile add 1 \"HS Player Homes\"",
+            "/profile add 1 12345",
+            "/profile use 1",
+            "/profile duplicate 1 my-copy",
+            "/profile delete 1",
+        ),
+    ),
     _CommandHelp("/quit", "leave the shell (also /exit, or Ctrl-D)"),
     _CommandHelp(
         "/exit", "leave the shell (alias of /quit)", ("/exit",), in_table=False
@@ -1775,6 +1786,102 @@ class _ShellSession:
             )
         self.console.print(table)
 
+    def _cmd_profile(self, rest: str) -> None:
+        """Profile switching: named sets of collections and mods.
+
+        /profile                              list profiles
+        /profile create <name>                create an empty profile
+        /profile add <id> <collection-or-mod>  add a collection or mod
+        /profile remove <id> <collection-or-mod>  remove one
+        /profile use <id>                     deploy this profile
+        /profile duplicate <id> <new-name>    copy a profile
+        /profile delete <id>                  delete a profile
+        """
+        from .profiles import (
+            ProfileError,
+            add_to_profile,
+            create_profile,
+            delete_profile,
+            detect_ref,
+            duplicate_profile,
+            remove_from_profile,
+            resolve_profile,
+        )
+        parts = rest.split(None, 1)
+        if not parts:
+            self._profile_list()
+            return
+        action = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        try:
+            if action == "create":
+                if not args:
+                    self.console.print("Usage: /profile create <name>")
+                    return
+                pid = create_profile(args, game="")
+                self.console.print(f"[green]Profile {pid} created:[/green] {escape(args)}")
+            elif action == "add":
+                a = args.split(None, 1)
+                if len(a) < 2:
+                    self.console.print("Usage: /profile add <id> <collection-or-mod>")
+                    return
+                pid = resolve_profile(a[0])
+                kind, ref = detect_ref(a[1])
+                add_to_profile(pid, kind, ref)
+                self.console.print(f"[green]Added {kind} {escape(str(ref))} to profile {pid}.[/green]")
+            elif action == "remove":
+                a = args.split(None, 1)
+                if len(a) < 2:
+                    self.console.print("Usage: /profile remove <id> <collection-or-mod>")
+                    return
+                pid = resolve_profile(a[0])
+                kind, ref = detect_ref(a[1])
+                remove_from_profile(pid, kind, ref)
+                self.console.print(f"[green]Removed {kind} {escape(str(ref))} from profile {pid}.[/green]")
+            elif action == "use":
+                pid = resolve_profile(args)
+                self._profile_use(pid)
+            elif action == "duplicate":
+                a = args.split(None, 1)
+                if len(a) < 2:
+                    self.console.print("Usage: /profile duplicate <id> <new-name>")
+                    return
+                src = resolve_profile(a[0])
+                new_id = duplicate_profile(src, a[1])
+                self.console.print(f"[green]Profile {new_id} created:[/green] {escape(a[1])} (copy of {src})")
+            elif action == "delete":
+                pid = resolve_profile(args)
+                delete_profile(pid)
+                self.console.print(f"[green]Profile {pid} deleted.[/green]")
+            else:
+                self.console.print(f"Unknown action {escape(action)}. Try /help /profile")
+        except ProfileError as e:
+            self._emit_error(str(e))
+
+    def _profile_list(self) -> None:
+        from rich.table import Table
+
+        from .profiles import list_profiles
+        profiles = list_profiles()
+        if not profiles:
+            self.console.print("No profiles. Create one with /profile create <name>")
+            return
+        table = Table(title="Profiles")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name", style="bold")
+        table.add_column("Game", style="dim")
+        table.add_column("Contents", style="dim")
+        for p in profiles:
+            contents = f"{len(p.get('collections', []))} collections, {len(p.get('mods', []))} mods"
+            table.add_row(str(p["id"]), p.get("name", ""), p.get("game", ""), contents)
+        self.console.print(table)
+
+    def _profile_use(self, pid: int) -> None:
+        from .profiles import get_profile
+        p = get_profile(pid)
+        self.console.print(f"Switching to profile {pid} ([bold]{escape(p.get('name', ''))}[/bold])...")
+        self.console.print("[dim]Deploy is not yet wired to profiles. This is coming in 0.6.0.[/dim]")
+
     def _cmd_update(self, rest: str) -> None:
         """Check for a newer version of nexus-dl and show how to get it."""
         from . import __version__
@@ -1828,6 +1935,7 @@ class _ShellSession:
         "/status": _cmd_status,
         "/config": _cmd_config,
         "/update": _cmd_update,
+        "/profile": _cmd_profile,
     }
 
 
