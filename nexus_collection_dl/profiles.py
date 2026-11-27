@@ -17,6 +17,7 @@ flags needed.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from .config import UserConfig
@@ -198,3 +199,112 @@ def delete_profile(profile: int | str) -> None:
     profiles, next_id = _load_profiles()
     profiles.pop(pid, None)
     _save_profiles(profiles, next_id)
+
+
+# ---------------------------------------------------------------------------
+# Deploy integration
+# ---------------------------------------------------------------------------
+
+
+def use_profile(
+    profile: int | str,
+    collections_root: Path | None = None,
+    game_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Deploy a profile: undeploy the current set, deploy the new one.
+
+    Returns {"deployed": <count>, "undeployed": <count>, "errors": [...]}.
+    """
+    from pathlib import Path as P
+
+    from .config import UserConfig
+    from .service import ModManagerService, scan_collections
+
+    prof = get_profile(profile)
+    cfg = UserConfig.load()
+    root = P(collections_root or cfg.collections_root)
+
+    # Resolve game dir: explicit > profile > config
+    resolved_game = game_dir
+    if resolved_game is None:
+        gd = prof.get("game_dir")
+        if gd:
+            resolved_game = P(gd)
+    if resolved_game is None:
+        for g in cfg.games:
+            if g.get("domain") == prof.get("game"):
+                gd = g.get("game_dir")
+                if gd:
+                    resolved_game = P(gd)
+                    break
+    if resolved_game is None:
+        raise ProfileError(
+            "No game directory. Pass one explicitly or set it on the profile."
+        )
+
+    svc = ModManagerService()
+    errors: list[str] = []
+    deployed = 0
+    undeployed = 0
+
+    # 1. Undeploy whatever is currently deployed across all collections
+    scan = scan_collections(root)
+    for s in scan.collections:
+        if not hasattr(s, "dir"):
+            continue
+        coll_dir = root / s.name
+        state_file = coll_dir / ".nexus-state.json"
+        if not state_file.exists():
+            continue
+        try:
+            state = _load_state(coll_dir)
+            if state.deployed_files:
+                r = svc.undeploy(coll_dir, game_dir=resolved_game)
+                undeployed += getattr(r, "removed_count", 0) or len(state.deployed_files)
+        except Exception as e:
+            from .errmsg import exception_reason
+            errors.append(f"undeploy {s.name}: {exception_reason(e)}")
+
+    # 2. Deploy each collection in the profile
+    for coll_name in prof.get("collections", []):
+        coll_dir = root / coll_name
+        if not (coll_dir / ".nexus-state.json").exists():
+            errors.append(f"collection {coll_name!r} not found under {root}")
+            continue
+        try:
+            result = svc.deploy(coll_dir, game_dir=resolved_game)
+            deployed += int(getattr(result, "deployed_count", 0) or 0)
+            for msg in (getattr(result, "errors", None) or []):
+                errors.append(f"{coll_name}: {msg}")
+        except Exception as e:
+            from .errmsg import exception_reason
+            errors.append(f"deploy {coll_name}: {exception_reason(e)}")
+
+    # 3. Individual mods (from any collection)
+    for mod_id in prof.get("mods", []):
+        # Find which collection has this mod
+        found = False
+        for s in scan.collections:
+            coll_dir = root / s.name
+            if not (coll_dir / ".nexus-state.json").exists():
+                continue
+            try:
+                state = _load_state(coll_dir)
+                if any(m.mod_id == mod_id for m in state.mods.values()):
+                    result = svc.deploy(coll_dir, game_dir=resolved_game)
+                    deployed += int(getattr(result, "deployed_count", 0) or 0)
+                    found = True
+                    break
+            except Exception:  # noqa: S112
+                continue
+        if not found:
+            errors.append(f"mod {mod_id} not found in any collection")
+
+    return {"deployed": deployed, "undeployed": undeployed, "errors": errors}
+
+
+def _load_state(coll_dir):
+    from .state import CollectionState
+    state = CollectionState(coll_dir)
+    state.load()
+    return state
