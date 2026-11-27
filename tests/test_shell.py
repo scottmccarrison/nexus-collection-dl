@@ -2650,3 +2650,57 @@ def test_ctrl_c_at_fomod_picker_aborts_the_walk(shell_env, tmp_path):
         assert not call.get("picks"), "abort must not install picks"
     # The shell is still usable
     assert "nexus-dl" in out
+
+
+# ---------------------------------------------------------------------------
+# /profile: profile switching
+# ---------------------------------------------------------------------------
+
+
+def test_profile_command_lists_and_creates(shell_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    result = run_cli(root, "/profile\n/quit\n")
+    assert result.exit_code == 0
+    assert "No profiles" in result.output
+
+    result = run_cli(root, "/profile create my-profile\n/quit\n")
+    assert result.exit_code == 0
+    assert "created" in result.output.lower()
+
+    result = run_cli(root, "/profile\n/quit\n")
+    assert result.exit_code == 0
+    assert "my-profile" in result.output
+
+
+def test_profile_add_and_remove(shell_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    run_cli(root, "/profile create test-profile\n/quit\n")
+
+    result = run_cli(root, "/profile add 1 \"Test Collection\"\n/quit\n")
+    assert result.exit_code == 0
+    assert "Added collection" in result.output
+
+    result = run_cli(root, "/profile add 1 12345\n/quit\n")
+    assert result.exit_code == 0
+    assert "Added mod" in result.output
+
+    result = run_cli(root, "/profile remove 1 \"Test Collection\"\n/quit\n")
+    assert result.exit_code == 0
+    assert "Removed collection" in result.output
+
+
+def test_profile_duplicate_and_delete(shell_env, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    root = make_root(tmp_path, ("Test Collection", [mod_entry()]))
+    run_cli(root, "/profile create original\n/quit\n")
+    run_cli(root, "/profile add 1 12345\n/quit\n")
+
+    result = run_cli(root, "/profile duplicate 1 my-copy\n/quit\n")
+    assert result.exit_code == 0
+    assert "created" in result.output.lower()
+
+    result = run_cli(root, "/profile delete 2\n/quit\n")
+    assert result.exit_code == 0
+    assert "deleted" in result.output.lower()

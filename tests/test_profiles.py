@@ -1,0 +1,168 @@
+"""Profile switching: data model and CRUD (0.6.0).
+
+A profile is a named set of collections and mods for one game.
+Switching undeploys the current set and deploys the new one.
+"""
+from __future__ import annotations
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Detection: what kind of thing did the user pass?
+# ---------------------------------------------------------------------------
+
+
+def test_detect_collection_url():
+    from nexus_collection_dl.profiles import detect_ref
+    kind, ref = detect_ref("https://next.nexusmods.com/skyrimspecialedition/collections/i9gfac")
+    assert kind == "collection"
+    assert ref == "i9gfac"
+
+
+def test_detect_mod_url():
+    from nexus_collection_dl.profiles import detect_ref
+    kind, ref = detect_ref("https://www.nexusmods.com/skyrimspecialedition/mods/12345")
+    assert kind == "mod"
+    assert ref == 12345
+
+
+def test_detect_nxm_url():
+    from nexus_collection_dl.profiles import detect_ref
+    kind, ref = detect_ref("nxm://skyrimspecialedition/mods/12345/files/67890")
+    assert kind == "mod"
+    assert ref == 12345
+
+
+def test_detect_bare_number_is_mod_id():
+    from nexus_collection_dl.profiles import detect_ref
+    kind, ref = detect_ref("12345")
+    assert kind == "mod"
+    assert ref == 12345
+
+
+def test_detect_name_is_collection():
+    from nexus_collection_dl.profiles import detect_ref
+    kind, ref = detect_ref("HS Player Homes")
+    assert kind == "collection"
+    assert ref == "HS Player Homes"
+
+
+# ---------------------------------------------------------------------------
+# Profile CRUD
+# ---------------------------------------------------------------------------
+
+
+def test_create_empty_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import create_profile, list_profiles
+    pid = create_profile("vanilla-plus", game="skyrimspecialedition")
+    assert pid == 1
+    profiles = list_profiles()
+    assert len(profiles) == 1
+    assert profiles[0]["name"] == "vanilla-plus"
+    assert profiles[0]["collections"] == []
+    assert profiles[0]["mods"] == []
+
+
+def test_profile_ids_increment(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import create_profile
+    p1 = create_profile("first", game="skyrimspecialedition")
+    p2 = create_profile("second", game="skyrimspecialedition")
+    assert p1 == 1
+    assert p2 == 2
+
+
+def test_add_collection_to_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import add_to_profile, create_profile, get_profile
+    pid = create_profile("test", game="skyrimspecialedition")
+    add_to_profile(pid, "collection", "HS Player Homes")
+    p = get_profile(pid)
+    assert p["collections"] == ["HS Player Homes"]
+
+
+def test_add_mod_to_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import add_to_profile, create_profile, get_profile
+    pid = create_profile("test", game="skyrimspecialedition")
+    add_to_profile(pid, "mod", 12345)
+    p = get_profile(pid)
+    assert p["mods"] == [12345]
+
+
+def test_remove_from_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import (
+        add_to_profile,
+        create_profile,
+        get_profile,
+        remove_from_profile,
+    )
+    pid = create_profile("test", game="skyrimspecialedition")
+    add_to_profile(pid, "collection", "HS Player Homes")
+    add_to_profile(pid, "mod", 12345)
+    remove_from_profile(pid, "collection", "HS Player Homes")
+    p = get_profile(pid)
+    assert p["collections"] == []
+    assert p["mods"] == [12345]
+
+
+def test_duplicate_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import (
+        add_to_profile,
+        create_profile,
+        duplicate_profile,
+        get_profile,
+    )
+    pid = create_profile("original", game="skyrimspecialedition")
+    add_to_profile(pid, "collection", "HS Player Homes")
+    add_to_profile(pid, "mod", 12345)
+    new_id = duplicate_profile(pid, "copy")
+    p = get_profile(new_id)
+    assert p["name"] == "copy"
+    assert p["collections"] == ["HS Player Homes"]
+    assert p["mods"] == [12345]
+    # Original unchanged
+    orig = get_profile(pid)
+    assert orig["name"] == "original"
+
+
+def test_delete_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import (
+        create_profile,
+        delete_profile,
+        list_profiles,
+    )
+    pid = create_profile("doomed", game="skyrimspecialedition")
+    assert len(list_profiles()) == 1
+    delete_profile(pid)
+    assert len(list_profiles()) == 0
+
+
+def test_resolve_profile_by_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import create_profile, resolve_profile
+    pid = create_profile("my-profile", game="skyrimspecialedition")
+    assert resolve_profile("my-profile") == pid
+    assert resolve_profile(str(pid)) == pid
+    assert resolve_profile(pid) == pid
+
+
+def test_resolve_profile_unknown_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import ProfileError, resolve_profile
+    with pytest.raises(ProfileError):
+        resolve_profile("nope")
+
+
+def test_add_duplicate_collection_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import add_to_profile, create_profile, get_profile
+    pid = create_profile("test", game="skyrimspecialedition")
+    add_to_profile(pid, "collection", "A")
+    add_to_profile(pid, "collection", "A")
+    p = get_profile(pid)
+    assert p["collections"] == ["A"]
