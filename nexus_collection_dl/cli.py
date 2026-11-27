@@ -2596,3 +2596,149 @@ def handler_uninstall(ctx: click.Context) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# profiles: named sets of collections and mods
+# ---------------------------------------------------------------------------
+
+
+@main.group(name="profiles")
+def profiles_group():
+    """Switch between mod sets (profiles)."""
+
+
+@profiles_group.command(name="list")
+@click.pass_context
+def profiles_list(ctx: click.Context) -> None:
+    """List all profiles."""
+    from .profiles import list_profiles
+    profiles = list_profiles()
+    if _emit_result(ctx, {"profiles": profiles}):
+        return
+    if not profiles:
+        console.print("No profiles. Create one with 'nexus-dl profiles create <name>'.")
+        return
+    table = Table(title="Profiles")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Game", style="dim")
+    table.add_column("Contents", style="dim")
+    for p in profiles:
+        contents = f"{len(p.get('collections', []))} collections, {len(p.get('mods', []))} mods"
+        table.add_row(str(p["id"]), p.get("name", ""), p.get("game", ""), contents)
+    console.print(table)
+
+
+@profiles_group.command(name="create")
+@click.argument("name")
+@click.option("--game", default="", help="Game domain for this profile.")
+@click.option("--game-dir", type=click.Path(path_type=Path), default=None, help="Game directory.")
+@click.pass_context
+def profiles_create(ctx: click.Context, name: str, game: str, game_dir: Path | None) -> None:
+    """Create an empty profile."""
+    from .profiles import ProfileError, create_profile
+    try:
+        pid = create_profile(name, game=game, game_dir=str(game_dir) if game_dir else "")
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"id": pid, "name": name}):
+        return
+    console.print(f"[green]Profile {pid} created:[/green] {name}")
+
+
+@profiles_group.command(name="add")
+@click.argument("profile_id")
+@click.argument("collection_or_mod")
+@click.pass_context
+def profiles_add(ctx: click.Context, profile_id: str, collection_or_mod: str) -> None:
+    """Add a collection or mod to a profile."""
+    from .profiles import ProfileError, add_to_profile, detect_ref, resolve_profile
+    try:
+        pid = resolve_profile(profile_id)
+        kind, ref = detect_ref(collection_or_mod)
+        add_to_profile(pid, kind, ref)
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"profile": pid, "added": {"kind": kind, "ref": ref}}):
+        return
+    console.print(f"[green]Added {kind} {ref} to profile {pid}.[/green]")
+
+
+@profiles_group.command(name="remove")
+@click.argument("profile_id")
+@click.argument("collection_or_mod")
+@click.pass_context
+def profiles_remove(ctx: click.Context, profile_id: str, collection_or_mod: str) -> None:
+    """Remove a collection or mod from a profile."""
+    from .profiles import ProfileError, detect_ref, remove_from_profile, resolve_profile
+    try:
+        pid = resolve_profile(profile_id)
+        kind, ref = detect_ref(collection_or_mod)
+        remove_from_profile(pid, kind, ref)
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"profile": pid, "removed": {"kind": kind, "ref": ref}}):
+        return
+    console.print(f"[green]Removed {kind} {ref} from profile {pid}.[/green]")
+
+
+@profiles_group.command(name="use")
+@click.argument("profile_id")
+@click.option("--game-dir", type=click.Path(path_type=Path), default=None, help="Game directory override.")
+@click.pass_context
+def profiles_use(ctx: click.Context, profile_id: str, game_dir: Path | None) -> None:
+    """Deploy a profile (undeploy the current set first)."""
+    from .config import UserConfig
+    from .profiles import ProfileError, resolve_profile, use_profile
+    try:
+        pid = resolve_profile(profile_id)
+        cfg = UserConfig.load()
+        result = use_profile(
+            pid,
+            collections_root=Path(cfg.collections_root) if cfg.collections_root else None,
+            game_dir=game_dir,
+        )
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"profile": pid, **result}):
+        return
+    for err in result.get("errors", []):
+        console.print(f"[yellow]Warning:[/yellow] {err}")
+    console.print(
+        f"[green]Deployed {result['deployed']} files"
+        f" (undeployed {result['undeployed']}).[/green]"
+    )
+
+
+@profiles_group.command(name="duplicate")
+@click.argument("profile_id")
+@click.argument("new_name")
+@click.pass_context
+def profiles_duplicate(ctx: click.Context, profile_id: str, new_name: str) -> None:
+    """Copy a profile to a new name."""
+    from .profiles import ProfileError, duplicate_profile, resolve_profile
+    try:
+        src = resolve_profile(profile_id)
+        new_id = duplicate_profile(src, new_name)
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"id": new_id, "name": new_name}):
+        return
+    console.print(f"[green]Profile {new_id} created:[/green] {new_name} (copy of {src})")
+
+
+@profiles_group.command(name="delete")
+@click.argument("profile_id")
+@click.pass_context
+def profiles_delete(ctx: click.Context, profile_id: str) -> None:
+    """Delete a profile."""
+    from .profiles import ProfileError, delete_profile, resolve_profile
+    try:
+        pid = resolve_profile(profile_id)
+        delete_profile(pid)
+    except ProfileError as e:
+        _fail(ctx, e)
+    if _emit_result(ctx, {"deleted": pid}):
+        return
+    console.print(f"[green]Profile {pid} deleted.[/green]")
