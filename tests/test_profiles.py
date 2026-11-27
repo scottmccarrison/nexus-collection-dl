@@ -212,3 +212,82 @@ def test_use_profile_deploys_collections(tmp_path, monkeypatch):
     result = use_profile(pid, collections_root=root, game_dir=game)
     assert result["deployed"] > 0, result
     assert (game / "Data" / "m.esp").exists()
+
+
+# ---------------------------------------------------------------------------
+# CLI commands
+# ---------------------------------------------------------------------------
+
+
+def test_cli_profiles_list_create_delete(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from click.testing import CliRunner
+
+    from nexus_collection_dl import cli as cli_module
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "list"])
+    assert r.exit_code == 0
+    assert "No profiles" in r.output
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "create", "my-profile"])
+    assert r.exit_code == 0
+    assert "created" in r.output.lower()
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "list"])
+    assert r.exit_code == 0
+    assert "my-profile" in r.output
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "delete", "1"])
+    assert r.exit_code == 0
+    assert "deleted" in r.output.lower()
+
+
+def test_cli_profiles_add_remove(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from click.testing import CliRunner
+
+    from nexus_collection_dl import cli as cli_module
+
+    CliRunner().invoke(cli_module.main, ["profiles", "create", "test"])
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "add", "1", "12345"])
+    assert r.exit_code == 0
+    assert "Added mod" in r.output
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "add", "1", "My Collection"])
+    assert r.exit_code == 0
+    assert "Added collection" in r.output
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "remove", "1", "12345"])
+    assert r.exit_code == 0
+    assert "Removed mod" in r.output
+
+
+def test_cli_profiles_duplicate(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from click.testing import CliRunner
+
+    from nexus_collection_dl import cli as cli_module
+
+    CliRunner().invoke(cli_module.main, ["profiles", "create", "original"])
+    CliRunner().invoke(cli_module.main, ["profiles", "add", "1", "12345"])
+
+    r = CliRunner().invoke(cli_module.main, ["profiles", "duplicate", "1", "my-copy"])
+    assert r.exit_code == 0
+    assert "created" in r.output.lower()
+
+
+def test_cli_profiles_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from click.testing import CliRunner
+
+    from nexus_collection_dl import cli as cli_module
+
+    CliRunner().invoke(cli_module.main, ["profiles", "create", "json-test"])
+
+    r = CliRunner().invoke(cli_module.main, ["--json", "profiles", "list"])
+    assert r.exit_code == 0
+    import json
+    data = json.loads(r.output)
+    assert data["ok"] is True
+    assert len(data["result"]["profiles"]) == 1
