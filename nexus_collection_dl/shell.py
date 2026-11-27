@@ -1877,10 +1877,22 @@ class _ShellSession:
         self.console.print(table)
 
     def _profile_use(self, pid: int) -> None:
-        from .profiles import get_profile
+        from .config import UserConfig
+        from .profiles import get_profile, use_profile
         p = get_profile(pid)
         self.console.print(f"Switching to profile {pid} ([bold]{escape(p.get('name', ''))}[/bold])...")
-        self.console.print("[dim]Deploy is not yet wired to profiles. This is coming in 0.6.0.[/dim]")
+        cfg = UserConfig.load()
+        result = use_profile(
+            pid,
+            collections_root=Path(cfg.collections_root) if cfg.collections_root else None,
+        )
+        if result.get("errors"):
+            for err in result["errors"]:
+                self.console.print(f"  [yellow]Warning:[/yellow] {escape(str(err))}")
+        self.console.print(
+            f"[green]Deployed {result.get('deployed', 0)} files"
+            f" (undeployed {result.get('undeployed', 0)}).[/green]"
+        )
 
     def _cmd_update(self, rest: str) -> None:
         """Check for a newer version of nexus-dl and show how to get it."""

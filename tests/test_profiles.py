@@ -5,6 +5,8 @@ Switching undeploys the current set and deploys the new one.
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -166,3 +168,47 @@ def test_add_duplicate_collection_is_noop(tmp_path, monkeypatch):
     add_to_profile(pid, "collection", "A")
     p = get_profile(pid)
     assert p["collections"] == ["A"]
+
+
+# ---------------------------------------------------------------------------
+# Profile deploy integration
+# ---------------------------------------------------------------------------
+
+
+def test_use_profile_deploys_collections(tmp_path, monkeypatch):
+    """Switching to a profile deploys its collections."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    from nexus_collection_dl.profiles import (
+        add_to_profile,
+        create_profile,
+        use_profile,
+    )
+
+    # Set up a collection with content
+    root = tmp_path / "collections"
+    root.mkdir()
+    coll = root / "My Collection"
+    coll.mkdir()
+    (coll / "Data").mkdir()
+    (coll / "Data" / "m.esp").write_text("x")
+    state_file = coll / ".nexus-state.json"
+    state_file.write_text(json.dumps({
+        "collection_url": "u", "collection_name": "My Collection",
+        "collection_revision": 1, "game_domain": "skyrimspecialedition",
+        "mods": {"1": {"mod_id": 1, "name": "M", "file_id": 1,
+                        "filename": "m.zip", "version": "1", "phase": 0,
+                        "enabled": True, "optional": False,
+                        "contributed_files": ["Data/m.esp"], "requirements": []}},
+        "tombstones": {},
+    }))
+
+    game = tmp_path / "game"
+    game.mkdir()
+    (game / "pfx" / "drive_c" / "users" / "steamuser").mkdir(parents=True)
+
+    pid = create_profile("test", game="skyrimspecialedition", game_dir=str(game))
+    add_to_profile(pid, "collection", "My Collection")
+
+    result = use_profile(pid, collections_root=root, game_dir=game)
+    assert result["deployed"] > 0, result
+    assert (game / "Data" / "m.esp").exists()
